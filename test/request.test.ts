@@ -4,9 +4,10 @@
  * 여기서 보는 것은 **게이트가 각 판정을 부르고 그 결과를 옳게 옮기는가**다.
  * `checkMethod`·`verifyWorkspaceToken`의 내부 동작은 그 모듈의 테스트가 이미 덮는다.
  *
- * 검사 **순서**를 고정하는 케이스는 2번(자격 없이 보낸 traversal)과 8번(스코프 안의
- * 유효한 토큰으로 보낸 `Accept` 위반)이다 — 앞의 것은 문법 검사가 자격보다 먼저임을,
- * 뒤의 것은 `Accept`가 자격·스코프보다 뒤임을 각각 관찰한다.
+ * 검사 **순서**를 고정하는 케이스는 2번(자격 없이 보낸 traversal), 8번(스코프 안의
+ * 유효한 토큰으로 보낸 `Accept` 위반), 16번(자격 없이 보낸 `limit` 위반)이다 — 2·16번은
+ * 문법 검사(`logId`·`limit`)가 자격보다 먼저임을, 8번은 `Accept`가 자격·스코프보다
+ * 뒤임을 각각 관찰한다.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -30,8 +31,11 @@ function request(overrides: Partial<RawRequest> = {}): RawRequest {
   }
 }
 
-function verify(overrides: Partial<RawRequest> = {}): TransportRequestResult {
-  return verifyTransportRequest(request(overrides), keys, { now: NOW })
+function verify(
+  overrides: Partial<RawRequest> = {},
+  options: { maxLimit?: number } = {},
+): TransportRequestResult {
+  return verifyTransportRequest(request(overrides), keys, { now: NOW, ...options })
 }
 
 /** 실패한 판정의 상태코드와 code. 통과했으면 그 자리에서 깨져야 한다. */
@@ -185,6 +189,77 @@ describe('verifyTransportRequest', () => {
       status: 400,
       code: 'invalid_cursor_format',
     })
+  })
+
+  // 12 — §3.1 L284-287·L304. 서버 상한(100)을 주입한 채 세 경우를 본다.
+  it('resolves pull limit: as-given, clamped to the server cap, or absent', () => {
+    const cases = [
+      { label: 'within the cap', url: `/v1/logs/${LOG_ID}/events?limit=10`, limit: 10 },
+      { label: 'above the cap — clamped', url: `/v1/logs/${LOG_ID}/events?limit=1000`, limit: 100 },
+      { label: 'absent', url: `/v1/logs/${LOG_ID}/events`, limit: undefined },
+    ] as const
+
+    for (const { label, url, limit } of cases) {
+      const resolved = acceptedOrThrow(verify({ url }, { maxLimit: 100 }))
+      expect(resolved.route === 'pull' ? resolved.limit : null, label).toBe(limit)
+    }
+  })
+
+  // 13 — 형식 위반 다섯 가지를 하나의 처리로 합류시킨다: 비숫자·음수·소수·`0`(§3.1 L303의
+  //      MUST와 충돌하므로 형식 위반으로 다룬다)·반복 쿼리. 새 code를 만들지 않고
+  //      `malformed_request`로 합류한다 (`§1.5`에 `invalid_limit`이 없다 — 스펙 갭).
+  it('rejects every malformed limit the same way', () => {
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ['non-numeric', `/v1/logs/${LOG_ID}/events?limit=abc`],
+      ['negative', `/v1/logs/${LOG_ID}/events?limit=-1`],
+      ['decimal', `/v1/logs/${LOG_ID}/events?limit=1.5`],
+      ['zero', `/v1/logs/${LOG_ID}/events?limit=0`],
+      ['repeated query', `/v1/logs/${LOG_ID}/events?limit=1&limit=2`],
+    ]
+
+    for (const [label, url] of cases) {
+      expect(rejectionOf(verify({ url }, { maxLimit: 100 })), label).toEqual({
+        status: 400,
+        code: 'malformed_request',
+      })
+    }
+  })
+
+  // 14 — `§3.1`의 표는 pull의 것이다. subscribe는 `limit` 쿼리를 읽지 않으므로 결과에
+  //      그 필드가 (값이 아니라) **키 자체가** 없다 — 무시가 아니라 부재.
+  it('does not read limit on subscribe — the field is absent, not ignored', () => {
+    const resolved = acceptedOrThrow(
+      verify(
+        {
+          url: `/v1/logs/${LOG_ID}/subscribe?limit=5`,
+          headers: { ...AUTHORIZED, accept: 'text/event-stream' },
+        },
+        { maxLimit: 100 },
+      ),
+    )
+
+    expect(resolved.route).toBe('subscribe')
+    expect('limit' in resolved).toBe(false)
+  })
+
+  // 15 — fail-closed: 서버 상한을 주지 않으면 명시적 `limit`은 거부되지만, `limit`을
+  //      보내지 않은 요청은 상한 부재의 영향을 받지 않는다.
+  it('fails closed when no server cap is configured', () => {
+    expect(rejectionOf(verify({ url: `/v1/logs/${LOG_ID}/events?limit=10` }))).toEqual({
+      status: 400,
+      code: 'malformed_request',
+    })
+
+    const resolved = acceptedOrThrow(verify({ url: `/v1/logs/${LOG_ID}/events` }))
+    expect(resolved.route === 'pull' ? resolved.limit : null).toBe(undefined)
+  })
+
+  // 16 — 순서 고정: 위반 `limit`을 `Authorization` 없이 보낸다. `401`이 아니라 `400`이
+  //      나오는 것이 `limit` 형식 검사(5)가 자격 검사(6)보다 먼저라는 증거다.
+  it('rejects a malformed limit before checking credentials', () => {
+    expect(
+      rejectionOf(verify({ url: `/v1/logs/${LOG_ID}/events?limit=abc`, headers: {} }, { maxLimit: 100 })),
+    ).toEqual({ status: 400, code: 'malformed_request' })
   })
 })
 
