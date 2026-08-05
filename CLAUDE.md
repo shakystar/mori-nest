@@ -52,7 +52,4 @@ pnpm build       # tsc -> dist/
 pnpm test        # vitest run
 ```
 
-CI의 `build-and-test` job(`.github/workflows/ci.yml`)이 위 셋을 그대로 돌리기로 돼 있다.
-**그 워크플로우 파일은 아직 리포에 없다** — 에이전트 토큰에 `workflow` 스코프가 없어
-push가 거부됐다 ([#7](https://github.com/shakystar/mori-nest/issues/7)). 파일이 들어오면
-이 문단의 뒷줄을 지운다.
+CI의 `build-and-test` job(`.github/workflows/ci.yml`)이 위 셋을 그대로 돌린다.

@@ -42,9 +42,7 @@ pnpm build       # tsc -> dist/
 pnpm test        # vitest run
 ```
 
-CI는 `.github/workflows/ci.yml`의 `build-and-test` job이 위 셋을 그대로 돌리기로 돼 있다.
-**그 워크플로우 파일은 아직 없다** — 에이전트 토큰에 `workflow` 스코프가 없어 push가
-거부됐다 ([#7](https://github.com/shakystar/mori-nest/issues/7)).
+CI는 `.github/workflows/ci.yml`의 `build-and-test` job이 위 셋을 그대로 돌린다.
 
 ## 관련 리포
 

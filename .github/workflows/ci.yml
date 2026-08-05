@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 이 job은 체크아웃과 의존성 설치밖에 하지 않는데, `pnpm install`은 서드파티 코드를
+# 실행할 수 있는 자리다. 기본 토큰 권한을 물려받는 대신 읽기로 좁힌다.
+permissions:
+  contents: read
+
+# job 이름 `build-and-test`는 mori와 같은 관례이고, 머지 후 branch protection의 required
+# status check로 등록될 이름이다 (#2). 바꾸면 등록된 게이트가 조용히 떨어져 나간다.
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pnpm을 setup-node보다 먼저 깐다 — 아래 `cache: pnpm`이 스토어 경로를 물어보려면
+      # 이 시점에 pnpm이 있어야 한다. 버전은 package.json의 `packageManager`와 같은 핀이다.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      # `vitest run`은 `passWithNoTests` 기본값이 false라 테스트 0건이면 exit 1이다 —
+      # 즉 이 스텝은 대상이 사라져도 false-green이 되지 않는다.
+      - name: Test
+        run: pnpm test
