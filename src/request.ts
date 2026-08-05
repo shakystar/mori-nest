@@ -1,6 +1,6 @@
 /**
  * 전송 평면의 **공통 요청 게이트** — `0002 §0`의 라우트 해석 + 세 라우트가 전부 요구하는
- * 사전 판정들 (`§1.1`·`§1.2`·`§4.2`).
+ * 사전 판정들 (`§1.1`·`§1.2`·`§4.2`) + pull에만 있는 `limit` 판정 (`§3.1`).
  *
  * 이 모듈은 `token.js`와 같은 형태다: **순수 함수 하나.** 서버도 저장소도 여기 없고, HTTP
  * 응답을 쓰지 않는다 — 판정 결과(해석된 요청, 또는 `§1.5`의 에러 봉투 + 상태코드)를
@@ -41,6 +41,18 @@ const BEARER_CREDENTIALS = /^Bearer (\S+)$/i
 
 /** `0002 §4.2`: subscribe가 요구하는 미디어 타입. */
 const SSE_MEDIA_TYPE = 'text/event-stream'
+
+/**
+ * `0002 §3.1`의 `limit`. **양의 정수만** 통과한다 — 비숫자·음수·소수·`0`을 전부 걸러낸다.
+ *
+ * `0`을 여기서 같이 거르는 것은 `§3.1` L303의 MUST(`hasMore: true`면 `events`는 비어 있지
+ * 않다)와 `limit=0`이 정면으로 부딪히기 때문이다. `limit=0`을 그대로 통과시키면 더 읽을
+ * 이벤트가 있는데 빈 `events`를 돌려줘야 하는 자리가 생기고, 그건 그 MUST를 어기거나
+ * 클라이언트의 페이지 순회를 멈춰 세운다 — 어느 쪽도 정상 응답이 아니다. 그래서 `0`은
+ * "값은 유효한데 상한이 0"이 아니라 **형식 위반**으로 다룬다. 상한을 두는 것과 결과가
+ * 없는 것을 요청하는 것은 다른 일이다.
+ */
+const LIMIT_PATTERN = /^[1-9][0-9]*$/
 
 /** 전송 평면의 라우트 이름. `0002 §0`의 표에 있는 셋뿐이다. */
 export type TransportRoute = 'append' | 'pull' | 'subscribe'
@@ -101,6 +113,18 @@ export type TransportRequest =
       readonly logId: string
       readonly token: VerifiedWorkspaceToken
       readonly start: CursorStart
+      /**
+       * `0002 §3.1`의 페이지 크기 판정 결과. **필터가 아니다** — 잘려나간 이벤트는 다음
+       * 페이지에 그대로 있다 (`§3.1` L305-306). 이 값을 커서 해석·정렬 **전에** 적용하는
+       * 것(뒤에서 자르기 포함)은 `§3.1` L307-311의 MUST 위반이다 — 단 **그 적용은 이 게이트의
+       * 일이 아니다.** 여기서 하는 일은 값을 판정해서 싣는 것까지고, 시작점에서 앞에서부터
+       * 취해 `hasMore`를 정하는 것은 저장소를 읽는 쪽(pull 응답 조립, `§3.1` L292-296)의
+       * 몫이다.
+       *
+       * 부재(`undefined`)는 클라이언트가 `limit`을 보내지 않았다는 뜻이다 — 기본 페이지
+       * 크기를 적용할지, 무제한으로 읽을지는 마찬가지로 읽는 쪽이 정한다.
+       */
+      readonly limit?: number
     }
   | {
       readonly route: 'subscribe'
@@ -215,6 +239,71 @@ function startFrom(cursor: string | null): CursorStart {
   return cursor === null ? { kind: 'beginning' } : { kind: 'after', cursor }
 }
 
+type LimitFormatResult =
+  | { readonly ok: true; readonly value: number | undefined }
+  | { readonly ok: false }
+
+/**
+ * `limit` 쿼리의 **형식만** 판정한다 (문법 검사, 자격 무관). pull만 부른다 (`§3.1`의 표는
+ * pull의 것이다).
+ *
+ * 이 함수는 반복 쿼리·비숫자·음수·소수·`0`만 본다 — 서버 상한(`maxLimit`)은 여기서 보지
+ * 않는다. `maxLimit`은 배포 설정이라 자격 없는 요청자에게 그 존재 여부가 새면 안 되고
+ * ({@link applyLimitBound} doc), 형식 판정은 반대로 스펙이 공개한 정규식(`LIMIT_PATTERN`)
+ * 만으로 끝나므로 자격보다 앞에 둬도 새는 것이 없다 — 그래서 이 둘을 한 함수에 묶지 않고
+ * 게이트 안에서 자리를 갈라 부른다.
+ *
+ * 반복 쿼리는 형식 위반과 같은 결과(`ok: false`)로 합류한다 — {@link atMostOne}이 실패로
+ * 돌려주는 이유(2개 이상)나 형식이 정수가 아닌 이유나, 부르는 쪽(게이트)이 내는 응답은
+ * 하나로 같다.
+ */
+function parseLimitFormat(query: string): LimitFormatResult {
+  const raw = queryValue(query, 'limit')
+  if (!raw.ok) {
+    return { ok: false }
+  }
+  if (raw.value === null) {
+    return { ok: true, value: undefined }
+  }
+  if (!LIMIT_PATTERN.test(raw.value)) {
+    return { ok: false }
+  }
+  return { ok: true, value: Number(raw.value) }
+}
+
+type LimitBoundResult =
+  | { readonly ok: true; readonly value: number | undefined }
+  | { readonly ok: false }
+
+/**
+ * 형식이 유효한 `limit`에 서버 상한(`maxLimit`)을 적용한다. **자격·스코프를 통과한
+ * 요청에만 부른다** — 이 판정의 재료(`maxLimit`이 설정됐는가)는 스펙이 아니라 배포
+ * 설정이고, 자격 없는 요청자에게 그 존재 여부가 보이면 배포 상태가 새는 것이기 때문이다
+ * (`403 out_of_scope`를 `401` 뒤에 두는 것과 같은 논리 — {@link verifyTransportRequest}
+ * doc의 "7이 6보다 뒤인 이유"). 그래서 이 함수는 {@link parseLimitFormat}과 달리 게이트의
+ * 문법 검사군(1~5)이 아니라 자격·스코프(6·7) **뒤**에서 불린다.
+ *
+ * **거부와 clamp를 가르는 기준은 "클라이언트가 자기 실수를 아는가"다.** `maxLimit`이
+ * 주어지지 않았는데 클라이언트가 `limit`을 보낸 경우는 **거부**한다 (fail-closed) — 상한
+ * 없이는 클라이언트가 보낸 값이 배포가 감당할 수 있는 범위인지 판단할 방법이 없다.
+ * 검증 못 하는 값을 그대로 통과시키는 것은 `keys`가 비어 있을 때 토큰을 검증 없이
+ * 통과시키는 것과 같은 종류의 실수다 (`token.ts`·`0003 §3.3`). 반면 상한 초과는 클라이언트가
+ * 유효한 값을 보냈고 서버 사정으로 더 작게 깎는 것뿐이라 스펙이 이미 `§3.1` L304에서
+ * "서버가 상한을 둘 수 있다"로 정상 경로로 규정했다 — 그래서 **clamp**다.
+ *
+ * `limit`을 보내지 않은 요청(`rawValue === undefined`)은 판정할 값이 없으므로 `maxLimit`
+ * 부재와 무관하게 통과한다 — 상한 미설정이 "`limit` 없는 요청까지 막는다"로 번지지 않는다.
+ */
+function applyLimitBound(rawValue: number | undefined, maxLimit: number | undefined): LimitBoundResult {
+  if (rawValue === undefined) {
+    return { ok: true, value: undefined }
+  }
+  if (maxLimit === undefined) {
+    return { ok: false }
+  }
+  return { ok: true, value: Math.min(rawValue, maxLimit) }
+}
+
 /**
  * `Accept`가 `text/event-stream`을 요구하는가 (`§4.2` L370).
  *
@@ -252,21 +341,40 @@ function acceptsEventStream(values: readonly string[]): boolean {
  * 3. **메서드** — `checkMethod`. 아니면 `405` + `Allow`.
  * 4. **커서 형식** — `after`(그리고 subscribe의 `Last-Event-ID`)가 문자열 하나인가.
  *    아니면 `400 invalid_cursor_format`.
- * 5. **자격** — `Authorization: Bearer <token>`의 존재·형식·검증. 아니면 `401`.
- * 6. **스코프** — 경로의 `logId` ∈ 토큰 스코프. 아니면 `403 out_of_scope`.
- * 7. **`Accept`** — subscribe 한정. 아니면 `406 not_acceptable`.
+ * 5. **`limit` 형식** — pull 한정. 형식 위반(비숫자·음수·소수·`0`·반복 쿼리)이면
+ *    `400 malformed_request`. (`§3.1`) **서버 상한(`maxLimit`) 판정은 여기가 아니다** —
+ *    8번을 보라.
+ * 6. **자격** — `Authorization: Bearer <token>`의 존재·형식·검증. 아니면 `401`.
+ * 7. **스코프** — 경로의 `logId` ∈ 토큰 스코프. 아니면 `403 out_of_scope`.
+ * 8. **`limit` 상한** — pull 한정, 형식이 유효한 `limit`에 서버 상한을 적용한다.
+ *    `maxLimit`이 주입되지 않은 배포에서 명시적 `limit`이 오면 `400 malformed_request`
+ *    (fail-closed). (`§3.1` L304)
+ * 9. **`Accept`** — subscribe 한정. 아니면 `406 not_acceptable`.
  *
- * **1~4가 앞인 이유**: 이 넷은 요청의 **문법**만 본다. 판정에 쓰이는 재료(라우트 표,
- * `logId` 정규식, 허용 메서드)가 전부 스펙에 공개돼 있으므로, 응답이 알려주는 것은
- * 요청자가 스펙을 읽어 이미 아는 것뿐이다 — 서버의 상태도, 로그의 존재 여부도, 토큰에
- * 대한 어떤 것도 여기서 새지 않는다. 반대로 자격 검증을 앞세우면 URL이 잘못된 클라이언트가
- * 그 사실을 알기 위해 먼저 유효한 토큰을 구해야 한다.
+ * **1~5가 앞인 이유**: 이 다섯은 요청의 **문법**만 본다. 판정에 쓰이는 재료(라우트 표,
+ * `logId` 정규식, 허용 메서드, `limit`의 형식 규칙)가 전부 스펙에 공개돼 있으므로, 응답이
+ * 알려주는 것은 요청자가 스펙을 읽어 이미 아는 것뿐이다 — 서버의 상태도, 로그의 존재
+ * 여부도, 토큰에 대한 어떤 것도 여기서 새지 않는다. 반대로 자격 검증을 앞세우면 URL이나
+ * `limit`이 잘못된 클라이언트가 그 사실을 알기 위해 먼저 유효한 토큰을 구해야 한다.
+ * `limit`이 4(커서 형식) 바로 뒤인 것은 둘 다 같은 성질(문법 검사, 자격 무관)이라
+ * 순서 안에서 서로 앞뒤가 바뀌어도 이 근거는 달라지지 않기 때문이다 — 5로 둔 것은
+ * 코드에서 커서 해석 다음이 자연스러운 자리이기 때문이지, 4보다 반드시 앞서야 하는
+ * 의존 관계가 있어서가 아니다. **`maxLimit` 판정이 5에 없는 이유**는 그 판정의 재료가
+ * 스펙이 아니라 배포 설정이기 때문이다 — 5의 근거("응답이 알려주는 것은 요청자가 스펙을
+ * 읽어 이미 아는 것뿐")가 성립하려면 판정 재료가 공개돼 있어야 하는데, `maxLimit`의 설정
+ * 여부는 공개돼 있지 않다. 그래서 이 판정은 8로 미룬다.
  *
- * **6이 5보다 뒤인 이유**: `403 out_of_scope`는 *"당신의 토큰은 유효하지만 이 로그는
+ * **7이 6보다 뒤인 이유**: `403 out_of_scope`는 *"당신의 토큰은 유효하지만 이 로그는
  * 스코프 밖"*이라는 뜻이라 토큰의 유효성 자체를 알려준다. 그것이 `401`보다 먼저 나오면
  * 서명 없는 요청자가 스코프 판정을 볼 수 있게 된다.
  *
- * **7이 마지막인 이유**: `Accept`가 가르는 것은 **`200` SSE 스트림의 표현**이다. 게이트가
+ * **8이 7 뒤인 이유**: `maxLimit`이 설정됐는지는 배포 설정이지 스펙이 아니다. 이 판정을
+ * 자격·스코프보다 앞에 두면, 유효한 `limit`을 실어 자격 없이 보낸 요청의 응답이 오직
+ * `maxLimit` 설정 여부로 갈리게 되어(설정 없으면 `400`, 있으면 `401`) 자격 없는 요청자에게
+ * 배포 상태가 새어 나간다 — 7이 6 뒤인 것과 같은 논리를, 스코프 대신 배포 설정에 적용한
+ * 것이다.
+ *
+ * **9가 마지막인 이유**: `Accept`가 가르는 것은 **`200` SSE 스트림의 표현**이다. 게이트가
  * 내는 에러는 스트림을 열기 전의 JSON이므로(`§4.2` L384) `Accept` 협상의 대상이 아니고,
  * 그래서 이 검사는 성공 직전에 온다.
  *
@@ -277,16 +385,25 @@ function acceptsEventStream(values: readonly string[]): boolean {
  *   다음 사람이 "존재하면 404" 분기를 넣지 않기를 바란다. 애초에 `§1.5`의 상태코드 표에
  *   `404`가 없다.
  * - **커서를 해석하지 않는다.** `after`는 불투명 문자열로 실어 옮길 뿐이다 (`§3.2` L322).
+ * - **`limit`을 적용하지 않는다.** `§3.1` L307-311의 MUST(커서 해석·정렬 뒤에 앞에서부터
+ *   `limit`건을 취하고 `hasMore`를 정한다)는 이 게이트가 아니라 **pull 응답을 조립하는
+ *   쪽의 것**이다. 여기서 하는 일은 판정된 숫자(또는 부재)를 {@link TransportRequest}에
+ *   싣는 것까지다 — `limit`은 페이지 크기이지 필터가 아니므로({@link TransportRequest}의
+ *   `limit` 필드 doc), 이 값으로 이벤트를 골라내거나 잘라내는 코드는 이 파일에 없다.
  * - **본문을 읽지 않는다.** append의 이벤트 봉투 검증(`§1.3`·`§2.1`)은 라우트의 몫이다.
  *
  * @param request `IncomingMessage`와 모양이 같은 요청.
  * @param keys 주입된 검증 키 집합. 비어 있으면 모든 요청이 `401`이다 (`0003 §3.3`).
  * @param options.now 판정 기준 시각. `verifyWorkspaceToken`에 그대로 넘어간다.
+ * @param options.maxLimit `limit`의 서버 상한 (`§3.1` L304). 배포 파라미터이므로 상수로
+ *   박지 않고 주입받는다. **주지 않으면, 자격·스코프를 통과했고 `limit`을 보낸 pull
+ *   요청은 전부 `400`이다** (fail-closed — {@link applyLimitBound} doc). `limit`을
+ *   보내지 않은 요청은 영향받지 않는다.
  */
 export function verifyTransportRequest(
   request: RawRequest,
   keys: VerificationKeySet,
-  options: { readonly now?: Date } = {},
+  options: { readonly now?: Date; readonly maxLimit?: number } = {},
 ): TransportRequestResult {
   const { path, query } = splitTarget(request.url)
 
@@ -363,7 +480,22 @@ export function verifyTransportRequest(
     start = startFrom(after.value ?? lastEventId)
   }
 
-  // ── 5: 자격. 헤더가 정확히 하나여야 한다 — 0개도, 2개 이상도 `401`이다.
+  // ── 5: `limit` 형식. pull만 읽는다 — `§3.1`의 표는 pull의 것이고 subscribe·append에는
+  //    `limit`이 없다 (그 두 라우트에서 `limit` 쿼리를 읽는 코드가 아예 없다). 스펙 갭:
+  //    `§1.5`의 표에 `invalid_limit`이 없으므로 `malformed_request`로 합류한다 — "요청이
+  //    정의된 형태와 다르다"는 뜻이 라우트 해석 실패(1번)와 같고, 이 값도 요청 문법의
+  //    일부이지 새 의미역이 아니기 때문이다. **서버 상한(`maxLimit`) 판정은 여기가 아니다**
+  //    — 그 재료는 배포 설정이지 스펙이 아니므로 8번(자격·스코프 뒤)에서 한다.
+  let rawLimit: number | undefined
+  if (route === 'pull') {
+    const limitFormat = parseLimitFormat(query)
+    if (!limitFormat.ok) {
+      return reject(400, errorResponse(ErrorCodes.malformed_request, 'limit must be a positive integer'))
+    }
+    rawLimit = limitFormat.value
+  }
+
+  // ── 6: 자격. 헤더가 정확히 하나여야 한다 — 0개도, 2개 이상도 `401`이다.
   const authorization = atMostOne(headerValues(request.headers, 'authorization'))
   const credentials = authorization.ok && authorization.value !== null ? authorization.value : null
   const bearer = credentials === null ? null : BEARER_CREDENTIALS.exec(credentials)
@@ -376,13 +508,29 @@ export function verifyTransportRequest(
   }
   const token = verification.token
 
-  // ── 6: 스코프 (`0003 §3.3` 검사 5). 실패 본문은 로그의 존재 여부와 무관하게 같다.
+  // ── 7: 스코프 (`0003 §3.3` 검사 5). 실패 본문은 로그의 존재 여부와 무관하게 같다.
   const scopeCheck = checkLogScope(token, logId)
   if (!scopeCheck.ok) {
     return reject(403, scopeCheck.error)
   }
 
-  // ── 7: subscribe의 `Accept`.
+  // ── 8: `limit` 상한. 자격·스코프를 통과한 요청에만 적용한다 — `maxLimit`의 설정 여부는
+  //    배포 설정이라 자격 없는 요청자에게 새면 안 되기 때문이다 ({@link applyLimitBound}
+  //    doc). 형식이 유효한 `limit`을 상한으로 clamp하거나, `maxLimit` 미설정 상태의 명시적
+  //    요청이면 거부한다(fail-closed) — 새 code는 만들지 않는다.
+  let limit: number | undefined
+  if (route === 'pull') {
+    const bounded = applyLimitBound(rawLimit, options.maxLimit)
+    if (!bounded.ok) {
+      return reject(
+        400,
+        errorResponse(ErrorCodes.malformed_request, 'this deployment has not configured a limit cap'),
+      )
+    }
+    limit = bounded.value
+  }
+
+  // ── 9: subscribe의 `Accept`.
   if (route === 'subscribe') {
     if (!acceptsEventStream(headerValues(request.headers, 'accept'))) {
       return reject(
@@ -393,7 +541,11 @@ export function verifyTransportRequest(
     return { ok: true, request: { route, logId, token, start } }
   }
   if (route === 'pull') {
-    return { ok: true, request: { route, logId, token, start } }
+    return {
+      ok: true,
+      request:
+        limit === undefined ? { route, logId, token, start } : { route, logId, token, start, limit },
+    }
   }
   return { ok: true, request: { route, logId, token } }
 }
