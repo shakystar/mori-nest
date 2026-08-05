@@ -243,7 +243,9 @@ describe('verifyTransportRequest', () => {
   })
 
   // 15 — fail-closed: 서버 상한을 주지 않으면 명시적 `limit`은 거부되지만, `limit`을
-  //      보내지 않은 요청은 상한 부재의 영향을 받지 않는다.
+  //      보내지 않은 요청은 상한 부재의 영향을 받지 않는다. 그리고 그 거부는 자격·스코프
+  //      **뒤**에서만 일어난다 — 자격 없는 요청자가 받는 응답은 `maxLimit`이 설정됐는지와
+  //      무관하게 같아야 한다 (배포 설정이 자격 없는 쪽으로 새면 안 된다).
   it('fails closed when no server cap is configured', () => {
     expect(rejectionOf(verify({ url: `/v1/logs/${LOG_ID}/events?limit=10` }))).toEqual({
       status: 400,
@@ -252,6 +254,19 @@ describe('verifyTransportRequest', () => {
 
     const resolved = acceptedOrThrow(verify({ url: `/v1/logs/${LOG_ID}/events` }))
     expect(resolved.route === 'pull' ? resolved.limit : null).toBe(undefined)
+
+    // 자격 없는 요청자에게는 `maxLimit` 설정 여부가 보이지 않는다: 유효한 `limit`을 실어
+    // 보내도, 아예 보내지 않아도, 응답은 상한 설정과 무관하게 같은 401이다.
+    const unauthedWithLimit = verify({ url: `/v1/logs/${LOG_ID}/events?limit=10`, headers: {} })
+    const unauthedWithoutLimit = verify({ url: `/v1/logs/${LOG_ID}/events`, headers: {} })
+    expect(rejectionOf(unauthedWithLimit)).toEqual({ status: 401, code: 'unauthenticated' })
+    expect(rejectionOf(unauthedWithoutLimit)).toEqual({ status: 401, code: 'unauthenticated' })
+
+    const unauthedWithLimitCapped = verify(
+      { url: `/v1/logs/${LOG_ID}/events?limit=10`, headers: {} },
+      { maxLimit: 100 },
+    )
+    expect(rejectionOf(unauthedWithLimitCapped)).toEqual({ status: 401, code: 'unauthenticated' })
   })
 
   // 16 — 순서 고정: 위반 `limit`을 `Authorization` 없이 보낸다. `401`이 아니라 `400`이
