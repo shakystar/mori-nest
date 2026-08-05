@@ -12,7 +12,10 @@ mori 하네스의 공유 기억 서버. [`memorize_hub`](https://github.com/shak
 
 ## 지금 상태
 
-**코드 없음. 프로토콜 문서 단계.**
+**전송·제어 두 평면의 스펙이 머지됐고, 코드는 스캐폴드 단계다.** 9개 라우트
+(전송 3 + 제어 6) 중 구현된 것은 아직 하나도 없다. `src/`에 있는 것은 **어느 평면에도
+속하지 않는 공통 계약**뿐이다 — 에러 봉투와 `code` 상수(`0002 §1.5` · `0003 §1.3`),
+최상위 필드 검증, `405` 판정.
 
 mori는 개발자만이 아니라 **사람들이 협업에 쓰는 하네스**다. 그 전제가 서버 요구사항을
 바꾼다 — hub가 백업이 아니라 **유일한 공유 지점**이 되므로, 동료의 기억이 몇 분 뒤에
@@ -23,7 +26,25 @@ mori는 개발자만이 아니라 **사람들이 협업에 쓰는 하네스**다
 | 문서 | 내용 |
 |---|---|
 | `docs/design/0001-protocol-requirements.md` | 새 프로토콜이 만족해야 하는 것. **먼저 읽을 것** |
+| `docs/design/0002-transport-spec.md` | 전송 평면(dumb) 와이어 스펙 — append / pull / subscribe |
+| `docs/design/0003-control-plane-spec.md` | 제어 평면(smart) 스펙 — 식별자 발급 / 작업공간 토큰 / 생애 추적 |
 | `docs/inherited/` | 전신(`memorize`·`memorize_hub`)의 기록. **규격이 아니라 맥락** |
+
+## 빌드·테스트
+
+Node 22 · TypeScript · pnpm · vitest. **런타임 의존성(`dependencies`)은 0개다** —
+전송 평면을 `node:http` 수준으로 유지한다는 `0002 §4.1-3`의 방향이다.
+
+```bash
+pnpm install
+pnpm typecheck   # tsc --noEmit (src + test)
+pnpm build       # tsc -> dist/
+pnpm test        # vitest run
+```
+
+CI는 `.github/workflows/ci.yml`의 `build-and-test` job이 위 셋을 그대로 돌리기로 돼 있다.
+**그 워크플로우 파일은 아직 없다** — 에이전트 토큰에 `workflow` 스코프가 없어 push가
+거부됐다 ([#7](https://github.com/shakystar/mori-nest/issues/7)).
 
 ## 관련 리포
 

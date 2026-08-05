@@ -43,4 +43,16 @@ mori는 개발자 전용 도구가 아니라 **사람들이 협업에 쓰는 하
 
 ## 빌드·테스트
 
-아직 없다. 코드가 생기면 이 절을 채운다.
+Node 22 · TypeScript · pnpm · vitest. 런타임 의존성은 0개다 (`0002 §4.1-3`).
+
+```bash
+pnpm install
+pnpm typecheck   # tsc --noEmit (src + test)
+pnpm build       # tsc -> dist/
+pnpm test        # vitest run
+```
+
+CI의 `build-and-test` job(`.github/workflows/ci.yml`)이 위 셋을 그대로 돌리기로 돼 있다.
+**그 워크플로우 파일은 아직 리포에 없다** — 에이전트 토큰에 `workflow` 스코프가 없어
+push가 거부됐다 ([#7](https://github.com/shakystar/mori-nest/issues/7)). 파일이 들어오면
+이 문단의 뒷줄을 지운다.
