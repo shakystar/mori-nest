@@ -164,11 +164,18 @@ describe('SSE 프레임 직렬화 (0002 §4.3)', () => {
 
     // 같은 판정이 빈 원문 조각에서 통째로 꺼지지 않는다 — 빈 조각을 그대로 이으면
     // `{"id":…,"payload":,"cursor":…}`, 즉 줄 구조는 멀쩡한데 JSON이 아닌 프레임이 나간다.
-    const emptyResult = serializeAppendFrame({ id: 'e1', payload: '', cursor: 'c-1' })
+    // 공백만 든 조각(`" "`)도 같은 실패 모드다 — pull.ts의 trim 판정과 맞춘다.
+    const emptyPayloads = [
+      { what: '빈 문자열', payload: '' },
+      { what: '공백만', payload: ' ' },
+    ]
+    for (const { payload } of emptyPayloads) {
+      const emptyResult = serializeAppendFrame({ id: 'e1', payload, cursor: 'c-1' })
 
-    expect(emptyResult.ok).toBe(false)
-    if (emptyResult.ok) return
-    expect(emptyResult.reason).toBe('payload_not_representable')
+      expect(emptyResult.ok).toBe(false)
+      if (emptyResult.ok) continue
+      expect(emptyResult.reason).toBe('payload_not_representable')
+    }
 
     // 결정 2: `id:` 줄을 끊거나 조용히 무시되게 만드는 커서.
     const cursors = [
