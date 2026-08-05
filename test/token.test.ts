@@ -1,12 +1,11 @@
 /**
  * `0003 §3.2` 와이어 파서 + `§3.3` 검사 1~5.
  *
- * 유효 키쌍 생성과 서명은 **여기에만 있다.** `src/`는 검증만 하고 서명 능력을 갖지
- * 않는다 (`§3.2` — HMAC을 기각한 이유가 그것이다). 아래 헬퍼가 `src/`로 새어 나가면
- * 그 성질이 깨진다.
+ * 유효 키쌍 생성과 서명은 **`test/` 안에만 있다** — 발급자 흉내는 `./workspace-token.js`로
+ * 뺐다 (mori-nest #14가 같은 헬퍼를 쓴다). `src/`는 검증만 하고 서명 능력을 갖지 않는다
+ * (`§3.2` — HMAC을 기각한 이유가 그것이다). 그 헬퍼가 `src/`로 새어 나가면 그 성질이 깨진다.
  */
 
-import { generateKeyPairSync, sign } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { describe, expect, it } from 'vitest'
 
@@ -16,74 +15,16 @@ import {
   verifyWorkspaceToken,
   type VerifiedWorkspaceToken,
 } from '../src/token.js'
-
-// ── 테스트 헬퍼: 발급자 흉내 ─────────────────────────────────────────────────
-
-type Claims = {
-  tokenId: string
-  workspaceId: string
-  audience: string
-  issuedAt: string
-  expiresAt: string
-  scope: string[]
-}
-
-const KEY_ID = 'k-2026-08'
-const NOW = new Date('2026-08-05T12:00:00Z')
-
-function baseClaims(overrides: Partial<Claims> = {}): Claims {
-  return {
-    tokenId: 'tok_01HZZ',
-    workspaceId: 'ws_01HZZ',
-    audience: 'transport',
-    issuedAt: '2026-08-05T11:55:00Z',
-    expiresAt: '2026-08-05T12:05:00Z',
-    scope: ['agent/developer', 'agent/owner'],
-    ...overrides,
-  }
-}
-
-/** `0003 §3.2`의 클레임 블록 — 표의 순서 그대로, 이름 없이, 정수는 빅엔디언. */
-function encodeClaimBlock(claims: Claims): Buffer {
-  const lengthPrefixed = (value: string): Buffer => {
-    const bytes = Buffer.from(value, 'latin1')
-    return Buffer.concat([Buffer.from([bytes.length]), bytes])
-  }
-  const scopeCount = Buffer.alloc(2)
-  scopeCount.writeUInt16BE(claims.scope.length, 0)
-  return Buffer.concat([
-    lengthPrefixed(claims.tokenId),
-    lengthPrefixed(claims.workspaceId),
-    lengthPrefixed(claims.audience),
-    Buffer.from(claims.issuedAt, 'latin1'),
-    Buffer.from(claims.expiresAt, 'latin1'),
-    scopeCount,
-    ...claims.scope.map(lengthPrefixed),
-  ])
-}
-
-const issuer = generateKeyPairSync('ed25519')
-const otherIssuer = generateKeyPairSync('ed25519')
-
-type MintOptions = {
-  keyId?: string
-  privateKey?: typeof issuer.privateKey
-  claimBlock?: Buffer
-  version?: string
-}
-
-/** 서명된 `mnw1` 토큰 하나. 서명 메시지는 `mnw1.<keyId>.<claims>` (`§3.2`). */
-function mint(claims: Claims, options: MintOptions = {}): string {
-  const version = options.version ?? 'mnw1'
-  const keyId = options.keyId ?? KEY_ID
-  const claimBlock = options.claimBlock ?? encodeClaimBlock(claims)
-  const claimsSegment = claimBlock.toString('base64url')
-  const message = Buffer.from(`${version}.${keyId}.${claimsSegment}`, 'latin1')
-  const signature = sign(null, message, options.privateKey ?? issuer.privateKey)
-  return `${version}.${keyId}.${claimsSegment}.${signature.toString('base64url')}`
-}
-
-const keys = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
+import {
+  KEY_ID,
+  NOW,
+  baseClaims,
+  encodeClaimBlock,
+  issuer,
+  keys,
+  mint,
+  otherIssuer,
+} from './workspace-token.js'
 
 /** 실패 응답에서 code를 꺼낸다 — 통과했으면 테스트가 그 자리에서 깨져야 한다. */
 function rejectionOf(result: ReturnType<typeof verifyWorkspaceToken>): string {
