@@ -24,6 +24,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
+    "@types/node": "22.19.2",
     "typescript": "5.9.3",
     "vitest": "3.2.4"
   }

@@ -4,7 +4,12 @@
     "lib": ["ES2023"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "types": [],
+    // `node:crypto`의 Ed25519 검증(`0003 §3.2`)을 쓰려면 빌트인 모듈의 타입이 필요하다.
+    // 목록을 비워 두면 `tsconfig.build.json`(include: src)에서 `node:crypto`가 해석되지
+    // 않는다 — `tsconfig.json` 쪽은 `vitest.config.ts`가 우연히 같은 타입을 끌어와
+    // 통과하므로, 두 설정이 갈리지 않게 여기에 명시한다.
+    // `@types/node`는 devDependency이고, 런타임 의존성(`dependencies`)은 여전히 0이다.
+    "types": ["node"],
 
     "strict": true,
     "noUncheckedIndexedAccess": true,
