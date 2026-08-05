@@ -4,13 +4,15 @@
  * 여기 있는 것은 **어느 평면에도 속하지 않고 라우트를 하나도 모르는 것들뿐이다.**
  * 라우트 핸들러·서버 리슨·저장소는 이 패키지에 없다 (mori-nest #7).
  *
- * 예외는 `token.js`·`request.js`·`event.js`·`sse.js`다 — 전송 평면의 게이트와 직렬화
- * (0003 §3.3 · 0002 §1.2 · §1.3·§2.1 · §4.3)이므로 평면에 속하지만, 서버도 저장소도 모르는
- * 순수 함수라 여기서 함께 나간다 (mori-nest #11 · #14 · #17 · #21). `request.js`는 라우트
+ * 예외는 `token.js`·`request.js`·`event.js`·`sse.js`·`pull.js`다 — 전송 평면의 게이트와 직렬화
+ * (0003 §3.3 · 0002 §1.2 · §1.3·§2.1 · §4.3 · §3.1)이므로 평면에 속하지만, 서버도 저장소도 모르는
+ * 순수 함수라 여기서 함께 나간다 (mori-nest #11 · #14 · #17 · #21 · #23). `request.js`는 라우트
  * **표**를 갖지만 라우트 **핸들러**는 갖지 않는다 — 판정 결과를 반환할 뿐 HTTP 응답을 쓰지
  * 않는다. `event.js`는 append **본문**의 게이트이고, 그 둘을 잇는 것(요청 게이트 → 본문
  * 게이트)은 서버 조각의 몫이다. `sse.js`는 subscribe 스트림의 프레임을 **문자열로** 만들 뿐
- * 연결도 타이머도 갖지 않는다 — 언제 보낼지는 연결을 가진 조각이 안다.
+ * 연결도 타이머도 갖지 않는다 — 언제 보낼지는 연결을 가진 조각이 안다. `pull.js`도 같다:
+ * 저장소가 고른 페이지를 **JSON 텍스트로** 만들 뿐, 페이지를 고르는 일(커서 해석·정렬·`limit`·
+ * `hasMore` 판정)은 로그를 읽는 쪽의 것이다.
  */
 
 export { ErrorCodes, errorResponse, type ErrorCode, type ErrorResponse } from './errors.js'
@@ -51,3 +53,10 @@ export {
   type AppendFrameFailure,
   type AppendFrameResult,
 } from './sse.js'
+export {
+  serializePullResponse,
+  type PullEvent,
+  type PullPage,
+  type PullResponseFailure,
+  type PullResponseResult,
+} from './pull.js'
