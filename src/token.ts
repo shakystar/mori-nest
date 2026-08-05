@@ -104,8 +104,22 @@ export type WorkspaceTokenClaims = {
   readonly scope: readonly string[]
 }
 
+/**
+ * {@link VerifiedWorkspaceToken}의 브랜드. 값이 아니라 **타입만** 있는 필드이고,
+ * export되지 않으므로 이 모듈 밖에서는 이름을 부를 수도 없다.
+ *
+ * 이유는 하나다: `{ keyId, claims }` 모양의 객체 리터럴을 손으로 만들어
+ * {@link checkLogScope}에 넘기는 것이 **구조적 타입만으로는 막히지 않는다.** 검사 5는
+ * 검사 1~4를 통과한 토큰에 대해서만 의미가 있는데(서명이 덮지 않은 `scope`를 대조하는 것은
+ * 대조가 아니다), 그 전제가 타입에 적혀 있지 않으면 다음 라우트가 게이트를 우회하는 코드를
+ * 무심코 쓸 수 있다. 브랜드가 있으면 그 우회는 명시적인 `as` 캐스트로만 가능하고,
+ * 캐스트는 리뷰에서 눈에 띈다 (mori-nest #11 리뷰가 후속으로 넘긴 자리다).
+ */
+declare const verifiedWorkspaceToken: unique symbol
+
 /** 서명과 검사 2~4를 통과한 토큰. `keyId`는 서명 메시지에 덮인 세그먼트에서 온 것이다. */
 export type VerifiedWorkspaceToken = {
+  readonly [verifiedWorkspaceToken]: true
   readonly keyId: string
   readonly claims: WorkspaceTokenClaims
 }
@@ -376,7 +390,9 @@ export function verifyWorkspaceToken(
     return unauthenticated('scope')
   }
 
-  return { ok: true, token: { keyId, claims } }
+  // 브랜드를 붙이는 자리는 여기 한 곳뿐이다 — 이 `return`이 `VerifiedWorkspaceToken`을
+  // 만드는 유일한 경로이고, 그래서 그 타입이 곧 "검사 1~4를 통과했다"는 증거가 된다.
+  return { ok: true, token: { keyId, claims } as VerifiedWorkspaceToken }
 }
 
 /**
