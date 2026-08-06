@@ -4,13 +4,20 @@
  *
  * `POST /v1/logs/{logId}/events`(`0002 §2`) · `GET /v1/logs/{logId}/events`(`§3`) ·
  * `GET /v1/logs/{logId}/subscribe`(`§4`) 셋을 배선한다. 잇는 순서는 `request.ts` doc이 이미
- * 그어 둔 경계 그대로다: append는 `verifyTransportRequest`(요청 게이트) →
- * `parseAppendRequest`(본문 게이트) → `store.append` → 응답. pull은 `verifyTransportRequest`
- * → `store.readPage` → `serializePullResponse` → 응답. subscribe는 `verifyTransportRequest`
- * → (연결을 열고) `store.readPage`를 반복 호출하며 `sse.ts`로 프레임을 만들어 쓴다. 게이트
- * 판정은 이 파일에서 다시 구현하지 않고 기존 순수 함수를 그대로 부른다 — 커서 해석·정렬·
- * `limit` 적용·`hasMore`/`from` 판정은 전부 `store.readPage`가 이미 답한 `PullPage`를 그대로
- * 옮길 뿐이다 (mori-nest #29·#30 착수 시점 owner 코멘트).
+ * 그어 둔 경계 그대로다: append는 `verifyTransportRequest`(요청 게이트) → `readBody`(본문
+ * 크기 게이트, `§1.3` L103 — `maxRequestBytes`를 스트리밍 중에 검사한다) →
+ * `parseAppendRequest`(본문 게이트, 이벤트 하나당 `maxEventBytes`도 여기서 본다) →
+ * `store.append` → 응답. pull은 `verifyTransportRequest` → `store.readPage` →
+ * `serializePullResponse` → 응답. subscribe는 `verifyTransportRequest` → (연결을 열고)
+ * `store.readPage`를 반복 호출하며 `sse.ts`로 프레임을 만들어 쓴다. 게이트 판정은 이
+ * 파일에서 다시 구현하지 않고 기존 순수 함수를 그대로 부른다 — 커서 해석·정렬·`limit` 적용·
+ * `hasMore`/`from` 판정은 전부 `store.readPage`가 이미 답한 `PullPage`를 그대로 옮길 뿐이다
+ * (mori-nest #29·#30 착수 시점 owner 코멘트).
+ *
+ * **두 `413` 경로(본문 전체 `request_too_large`, 단일 이벤트 `event_too_large`) 어느 쪽도
+ * `store.append`에 닿지 않는다** — 둘 다 그 앞에서 응답을 끝낸다. 이 파일에 로깅 인프라가
+ * 없으므로(리포 전체에 `console.*` 호출이 없다) 두 경로 모두 아무것도 기록하지 않는다는
+ * 완료 조건이 구조로 성립한다.
  *
  * ## subscribe가 새 이벤트를 알아채는 방법 — `store.readPage`를 반복해서 부른다
  *
@@ -32,7 +39,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 
 import { ErrorCodes, errorResponse } from './errors.js'
-import { parseAppendRequest } from './event.js'
+import { MIN_MAX_EVENT_BYTES, parseAppendRequest } from './event.js'
 import { serializePullResponse, type PullPage } from './pull.js'
 import { verifyTransportRequest, type CursorStart, type RawRequest } from './request.js'
 import { serializeAppendFrame, serializeHeartbeatFrame, serializeOpenFrame, serializeResetFrame } from './sse.js'
@@ -56,6 +63,21 @@ export type TransportServerOptions = {
    * 기본값을 쓴다.
    */
   readonly subscribeBacklogLimitBytes?: number
+  /**
+   * append 단일 이벤트(원소 원문 구간 전체)의 바이트 상한 (`§1.3` L103 MUST —
+   * `maxEventBytes ≥ 1 MiB`). {@link createTransportServer}가 이 하한을 만족하지 않으면
+   * 서버를 만들지 않고 던진다. 부재면 계약 하한(`MIN_MAX_EVENT_BYTES`, 1 MiB)을 쓴다 —
+   * 배포용 값은 §8 미결 8이 아직 열려 있어 이 코드가 고르지 않는다.
+   */
+  readonly maxEventBytes?: number
+  /**
+   * append 요청 본문 전체의 바이트 상한 (`§1.3` L103 MUST — `maxRequestBytes ≥ maxEventBytes`).
+   * `readBody`가 스트리밍 중에 누적 바이트를 세다가 이 값을 넘는 순간 더 읽지 않고 끊는다 —
+   * `Content-Length`가 없거나(chunked) 거짓이어도 이 검사는 항상 돈다. 부재면
+   * `maxEventBytes`와 같은 값을 쓴다(둘 다 배포가 아직 정하지 않은 값이므로 계약 하한
+   * 하나를 공유한다 — 서로 다른 임의값을 지어내지 않는다).
+   */
+  readonly maxRequestBytes?: number
 }
 
 function toRawRequest(req: IncomingMessage): RawRequest {
@@ -66,16 +88,69 @@ function toRawRequest(req: IncomingMessage): RawRequest {
   }
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+type ReadBodyResult = { readonly ok: true; readonly body: string } | { readonly ok: false }
+
+/**
+ * 본문을 읽는다. `maxRequestBytes`를 넘으면 남은 본문을 마저 읽지 않고 `{ ok: false }`로
+ * 끝낸다 (`§1.3` L103 MUST — 다 모은 뒤 길이를 재면 메모리를 못 막는다).
+ *
+ * `Content-Length` 헤더가 있고 그 값만으로 이미 초과가 확정되면 청크를 하나도 읽지 않고
+ * 곧장 끝낸다 — 이건 최적화다. **진짜 판정은 그 아래 누적 카운터다**: 헤더가 없거나
+ * (chunked) 거짓이어도 똑같이 걸린다.
+ */
+function readBody(req: IncomingMessage, maxRequestBytes: number): Promise<ReadBodyResult> {
   return new Promise((resolve, reject) => {
+    const declaredLength = Number(req.headers['content-length'])
+    if (Number.isFinite(declaredLength) && declaredLength > maxRequestBytes) {
+      resolve({ ok: false })
+      return
+    }
+
     const chunks: Buffer[] = []
-    req.on('data', (chunk: Buffer) => {
+    let total = 0
+    let settled = false
+
+    const cleanup = (): void => {
+      req.off('data', onData)
+      req.off('end', onEnd)
+      req.off('error', onError)
+    }
+
+    const onData = (chunk: Buffer): void => {
+      if (settled) {
+        return
+      }
+      total += chunk.length
+      if (total > maxRequestBytes) {
+        settled = true
+        // 더 받지 않는다 — 이후 청크를 배열에 쌓지 않는 것뿐 아니라 스트림 자체를 멈춘다.
+        req.pause()
+        cleanup()
+        resolve({ ok: false })
+        return
+      }
       chunks.push(chunk)
-    })
-    req.on('end', () => {
-      resolve(Buffer.concat(chunks).toString('utf8'))
-    })
-    req.on('error', reject)
+    }
+    const onEnd = (): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      resolve({ ok: true, body: Buffer.concat(chunks).toString('utf8') })
+    }
+    const onError = (error: Error): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      cleanup()
+      reject(error)
+    }
+
+    req.on('data', onData)
+    req.on('end', onEnd)
+    req.on('error', onError)
   })
 }
 
@@ -120,9 +195,10 @@ async function handleAppend(
   broker: LogBroker,
   logId: string,
   rawBody: string,
+  maxEventBytes: number,
   res: ServerResponse,
 ): Promise<void> {
-  const parsed = parseAppendRequest(rawBody)
+  const parsed = parseAppendRequest(rawBody, { maxEventBytes })
   if (!parsed.ok) {
     writeJson(res, parsed.status, parsed.error)
     return
@@ -542,6 +618,8 @@ async function handleRequest(
   res: ServerResponse,
   options: TransportServerOptions,
   broker: LogBroker,
+  maxEventBytes: number,
+  maxRequestBytes: number,
 ): Promise<void> {
   const gateOptions: { now?: Date; maxLimit?: number } = {}
   if (options.now !== undefined) {
@@ -558,8 +636,18 @@ async function handleRequest(
   }
 
   if (result.request.route === 'append') {
-    const rawBody = await readBody(req)
-    await handleAppend(options.store, broker, result.request.logId, rawBody, res)
+    const body = await readBody(req, maxRequestBytes)
+    if (!body.ok) {
+      writeJson(res, 413, errorResponse(ErrorCodes.request_too_large, 'request body exceeds the maximum allowed size', {
+        maxRequestBytes,
+      }))
+      // 본문을 끝까지 읽지 않았으므로 소켓에는 아직 이 연결의 나머지 본문 바이트가 남아
+      // 있을 수 있다 — keep-alive로 재사용하면 다음 요청 파서가 그 잔여 바이트를 다음
+      // 요청의 시작으로 오인한다. 응답을 다 쓴 뒤 연결을 끊어 그 자리를 없앤다.
+      res.on('finish', () => req.destroy())
+      return
+    }
+    await handleAppend(options.store, broker, result.request.logId, body.body, maxEventBytes, res)
     return
   }
 
@@ -586,11 +674,30 @@ async function handleRequest(
  *
  * `LogBroker`는 서버 하나에 하나다 — 이 서버가 배선한 `store`(mori-nest #27이 못박은 단일
  * 프로세스 전제, 파일 상단 doc)에 대한 append 알림 전부가 이 한 인스턴스를 지난다.
+ *
+ * `maxEventBytes`·`maxRequestBytes`는 여기서 한 번만 검증하고(요청마다 다시 재지 않는다)
+ * `handleRequest`에 그대로 흘려보낸다 — `§1.3` L103-104의 MUST(`maxEventBytes ≥ 1 MiB`,
+ * `maxRequestBytes ≥ maxEventBytes`)를 어기는 설정으로는 서버 자체를 만들지 않는다.
+ * 값을 결정하는 것은 이 코드가 아니라 배포다(§8 미결 8) — 부재 시 기본값은 계약 하한
+ * 하나(`MIN_MAX_EVENT_BYTES`, 1 MiB)를 두 옵션이 공유한다.
  */
 export function createTransportServer(options: TransportServerOptions): Server {
+  const maxEventBytes = options.maxEventBytes ?? MIN_MAX_EVENT_BYTES
+  const maxRequestBytes = options.maxRequestBytes ?? MIN_MAX_EVENT_BYTES
+  if (maxEventBytes < MIN_MAX_EVENT_BYTES) {
+    throw new Error(
+      `maxEventBytes must be >= ${String(MIN_MAX_EVENT_BYTES)} bytes (1 MiB, 0002 §1.3 MUST); got ${String(maxEventBytes)}`,
+    )
+  }
+  if (maxRequestBytes < maxEventBytes) {
+    throw new Error(
+      `maxRequestBytes must be >= maxEventBytes (0002 §1.3 MUST); got maxRequestBytes=${String(maxRequestBytes)}, maxEventBytes=${String(maxEventBytes)}`,
+    )
+  }
+
   const broker = new LogBroker()
   return createServer((req, res) => {
-    handleRequest(req, res, options, broker).catch(() => {
+    handleRequest(req, res, options, broker, maxEventBytes, maxRequestBytes).catch(() => {
       // `req`/`res` 스트림 자체의 오류(연결이 끊기는 등)만 여기 닿는다 — 게이트·스토어의
       // 실패는 `handleRequest` 안에서 이미 응답으로 끝난다. 이미 끊긴 연결에 다시 쓰지 않는다.
       if (!res.writableEnded) {
