@@ -33,9 +33,12 @@ while (Date.now() < startAt) {
   // 스핀. 여기서 `await`를 쓰면 타이머 해상도만큼 시작이 어긋난다.
 }
 
+// `§1.6`의 출처 값. 이 시험이 재는 것은 dedup이므로 두 자식이 같은 값을 써도 되지만, 값이
+// **필수**라는 것 자체가 계약이라 여기서도 넘긴다.
 const result = await store.append(
   logId,
   ids.map((id) => ({ id, payload: `{"id":${JSON.stringify(id)}}` })),
+  { workspaceId: `ws_race_${String(process.pid)}`, tokenId: `tok_race_${String(process.pid)}` },
 )
 writeSync(1, `${JSON.stringify(result)}\n`)
 await store.close()

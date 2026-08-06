@@ -5,12 +5,13 @@
  *
  * 게이트 자신의 동작(토큰·봉투·바이트 슬라이스)은 `test/token.test.ts`·`test/event.test.ts`·
  * `test/request.test.ts`가 이미 덮는다 — 여기서 다시 쓰지 않는다 (mori-nest #28의 «비범위»).
- * 동작 하나당 테스트 하나, 다섯 개뿐이다.
+ * 동작 하나당 테스트 하나, 여섯 개뿐이다 (여섯째는 `§1.6`의 출처 배선 — mori-nest #46).
  */
 
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 
@@ -25,13 +26,15 @@ const TOKEN = mint(baseClaims({ scope: [LOG_ID] }))
 
 describe('append 라우트 배선 + 최소 HTTP 서버 (0002 §2)', () => {
   let dir: string
+  let dbPath: string
   let store: EventStore
   let server: Server
   let baseUrl: string
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'mori-nest-server-'))
-    store = await openEventStore(join(dir, 'events.db'))
+    dbPath = join(dir, 'events.db')
+    store = await openEventStore(dbPath)
     server = createTransportServer({ store, keys, now: () => NOW })
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
     const address = server.address() as AddressInfo
@@ -107,5 +110,23 @@ describe('append 라우트 배선 + 최소 HTTP 서버 (0002 §2)', () => {
     const body = (await res.json()) as Record<string, unknown>
     expect(Object.hasOwn(body, 'head')).toBe(false)
     expect(Object.keys(body).sort()).toEqual(['accepted', 'duplicate'])
+  })
+
+  it('⑥ 라우트를 통과한 append가 그 토큰의 workspaceId·tokenId를 기록에 남긴다 (§1.6)', async () => {
+    const claims = baseClaims({ scope: [LOG_ID] })
+
+    const res = await post('{"events":[{"id":"e1","payload":{"a":1}}]}')
+    expect(res.status).toBe(200)
+
+    // 스토어 단위 시험으로는 «배선이 끊겼다»를 잡을 수 없다 — `§1.6`이 지목한 실패 형태가
+    // 검증 결과가 기록 층까지 닿지 않는 것이므로, 라우트를 실제로 통과하는 검사가 필요하다.
+    // 출처는 응답에 실리지 않으므로(MUST NOT) 기록 층을 직접 본다.
+    const db = new DatabaseSync(dbPath)
+    const row = db
+      .prepare('SELECT workspace_id, token_id FROM events WHERE log_id = ? AND event_id = ?')
+      .get(LOG_ID, 'e1')
+    db.close()
+    expect(row?.['workspace_id']).toBe(claims.workspaceId)
+    expect(row?.['token_id']).toBe(claims.tokenId)
   })
 })

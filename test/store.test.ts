@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -9,13 +10,16 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { parseAppendRequest } from '../src/event.js'
 import type { PullEvent } from '../src/pull.js'
 import type { CursorStart } from '../src/request.js'
-import { EventStoreError, openEventStore, type EventStore } from '../src/store.js'
+import { EventStoreError, openEventStore, type EventProvenance, type EventStore } from '../src/store.js'
 
 /**
- * 이 파일의 테스트는 **동작 하나당 하나**이고 여섯 개다 (mori-nest #27의 «테스트» 절).
- * 커버리지 숫자용·스냅샷·구현 세부 결합 테스트를 여기에 더하지 않는다 — 스토어의 계약은
- * `0002`의 MUST 여섯 줄이고, 그 여섯 줄이 여기 하나씩 대응한다.
+ * 이 파일의 테스트는 **동작 하나당 하나**이고 아홉 개다 (mori-nest #27의 «테스트» 절 여섯 +
+ * #46의 출처 축 셋). 커버리지 숫자용·스냅샷·구현 세부 결합 테스트를 여기에 더하지 않는다 —
+ * 스토어의 계약은 `0002`의 MUST 줄들이고, 그 줄들이 여기 하나씩 대응한다.
  */
+
+/** `§1.6`의 출처 값. 재는 대상이 출처가 아닌 시험들은 이것 하나를 그대로 쓴다. */
+const PROVENANCE: EventProvenance = { workspaceId: 'ws_test', tokenId: 'tok_test' }
 
 const DURABILITY_CHILD = fileURLToPath(new URL('./store-durability-child.mjs', import.meta.url))
 const RACE_CHILD = fileURLToPath(new URL('./store-race-child.mjs', import.meta.url))
@@ -37,6 +41,28 @@ const ROUNDS = 12
 /** kill 지연의 범위(ms). 하한이 0이 아닌 것은 ack 0건인 라운드를 만들지 않기 위해서다. */
 const MIN_KILL_DELAY_MS = 40
 const MAX_KILL_DELAY_MS = 250
+
+/**
+ * 기록된 행의 출처 컬럼을 **DB에서 직접** 읽는다.
+ *
+ * `EventStore`의 표면으로는 읽을 수 없는 것이 `§1.6`의 요점이다 — 출처는 pull·subscribe 응답에
+ * 실리지 않으므로(MUST NOT), 「기록됐는가」를 재려면 기록 층을 직접 보는 수밖에 없다. 스토어를
+ * 열어 두고 두 번째 연결로 읽는다 (WAL이라 커밋된 것은 그대로 보인다).
+ */
+function readProvenanceRow(path: string, logId: string, eventId: string): Record<string, SQLOutputValue> {
+  const db = new DatabaseSync(path)
+  try {
+    const row = db
+      .prepare('SELECT workspace_id, token_id FROM events WHERE log_id = ? AND event_id = ?')
+      .get(logId, eventId)
+    if (row === undefined) {
+      throw new Error(`기록된 행이 없다: ${logId}/${eventId}`)
+    }
+    return row
+  } finally {
+    db.close()
+  }
+}
 
 /** `event.ts`의 게이트를 실제로 통과시켜 **원문 조각**을 얻는다 (`test/pull.test.ts`와 같은 방식). */
 function payloadSliceOf(body: string): string {
@@ -255,6 +281,7 @@ describe('이벤트 스토어 (0002 §1.3·§1.4·§2.1·§2.2·§3.1·§3.2)', 
     const result = await store.append(
       'ordered',
       ids.map((id, index) => ({ id, payload: `{"i":${index}}` })),
+      PROVENANCE,
     )
 
     expect(result.accepted.map((e) => e.id)).toEqual(ids)
@@ -267,16 +294,20 @@ describe('이벤트 스토어 (0002 §1.3·§1.4·§2.1·§2.2·§3.1·§3.2)', 
 
   it('④ 요청 안 하나가 실패하면 그 요청의 이벤트가 하나도 남지 않는다 (§2.1 L207-208)', async () => {
     const store = await openEventStore(dbPath)
-    await store.append('atomic', [{ id: 'before', payload: '{"kept":true}' }])
+    await store.append('atomic', [{ id: 'before', payload: '{"kept":true}' }], PROVENANCE)
 
     // 두 번째 이벤트가 실패한다 — **첫 번째는 이미 INSERT된 뒤**이므로 이 단언은 롤백을 본다
     // (요청 전체를 미리 검사하고 트랜잭션을 열지 않는 구현이면 이 시험은 아무것도 재지 못한다).
     await expect(
-      store.append('atomic', [
-        { id: 'ok', payload: '{"a":1}' },
-        { id: 'bad', payload: '   ' },
-        { id: 'never', payload: '{"b":2}' },
-      ]),
+      store.append(
+        'atomic',
+        [
+          { id: 'ok', payload: '{"a":1}' },
+          { id: 'bad', payload: '   ' },
+          { id: 'never', payload: '{"b":2}' },
+        ],
+        PROVENANCE,
+      ),
     ).rejects.toBeInstanceOf(EventStoreError)
 
     const stored = await readAllEvents(store, 'atomic')
@@ -299,6 +330,7 @@ describe('이벤트 스토어 (0002 §1.3·§1.4·§2.1·§2.2·§3.1·§3.2)', 
     await store.append(
       'bytes',
       slices.map((payload, index) => ({ id: `p${index}`, payload })),
+      PROVENANCE,
     )
 
     const stored = await readAllEvents(store, 'bytes')
@@ -316,9 +348,10 @@ describe('이벤트 스토어 (0002 §1.3·§1.4·§2.1·§2.2·§3.1·§3.2)', 
     const { accepted } = await store.append(
       'cursors',
       ids.map((id) => ({ id, payload: `{"id":${JSON.stringify(id)}}` })),
+      PROVENANCE,
     )
     // 다른 로그의 커서를 얻어 둔다 (`§1.4` — 다른 로그의 커서는 미지다).
-    const foreign = await store.append('other-log', [{ id: 'f0', payload: '{"x":1}' }])
+    const foreign = await store.append('other-log', [{ id: 'f0', payload: '{"x":1}' }], PROVENANCE)
     const foreignCursor = foreign.accepted[0]?.cursor ?? ''
     const cursor = accepted[0]?.cursor ?? ''
 
@@ -353,5 +386,81 @@ describe('이벤트 스토어 (0002 §1.3·§1.4·§2.1·§2.2·§3.1·§3.2)', 
     }
 
     await store.close()
+  })
+
+  it('⑦ append가 검증된 토큰의 workspaceId·tokenId를 기록에 남긴다 (§1.6)', async () => {
+    const store = await openEventStore(dbPath)
+    const provenance: EventProvenance = { workspaceId: 'ws_01HAAA', tokenId: 'tok_01HAAA' }
+
+    await store.append('provenance', [{ id: 'p0', payload: '{"a":1}' }], provenance)
+    await store.close()
+
+    const row = readProvenanceRow(dbPath, 'provenance', 'p0')
+    expect(row['workspace_id']).toBe(provenance.workspaceId)
+    expect(row['token_id']).toBe(provenance.tokenId)
+  })
+
+  it('⑧ 다른 작업공간이 같은 id를 다시 밀어도 기존 행의 출처가 바뀌지 않는다 (§1.6 MUST NOT)', async () => {
+    const store = await openEventStore(dbPath)
+    const first: EventProvenance = { workspaceId: 'ws_first', tokenId: 'tok_first' }
+    const impostor: EventProvenance = { workspaceId: 'ws_impostor', tokenId: 'tok_impostor' }
+
+    await store.append('spoof', [{ id: 's0', payload: '{"a":1}' }], first)
+    const result = await store.append('spoof', [{ id: 's0', payload: '{"a":2}' }], impostor)
+    await store.close()
+
+    expect(result.accepted).toEqual([])
+    expect(result.duplicate.map((e) => e.id)).toEqual(['s0'])
+    // 사칭 불가가 이 축을 세운 이유다 — 나중에 미는 쪽이 남의 이벤트 출처를 자기 것으로
+    // 바꿀 수 있으면 축 자체가 뜻을 잃는다.
+    const row = readProvenanceRow(dbPath, 'spoof', 's0')
+    expect(row['workspace_id']).toBe(first.workspaceId)
+    expect(row['token_id']).toBe(first.tokenId)
+  })
+
+  it('⑨ v1 DB를 열면 v2로 올라가고, 그 전에 쌓인 이벤트가 그대로 읽힌다 (스키마 이주)', async () => {
+    // v1 그대로의 DB를 손으로 만든다 — 출처 컬럼이 없고 `user_version = 1`이다.
+    const v1 = new DatabaseSync(dbPath)
+    v1.exec('PRAGMA journal_mode = WAL')
+    v1.exec('PRAGMA synchronous = FULL')
+    v1.exec(`
+      CREATE TABLE events (
+        seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+        log_id   TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        payload  BLOB NOT NULL,
+        UNIQUE (log_id, event_id)
+      ) STRICT;
+      CREATE INDEX events_log_seq ON events (log_id, seq);
+    `)
+    v1.prepare('INSERT INTO events (log_id, event_id, payload) VALUES (?, ?, ?)').run(
+      'legacy',
+      'old0',
+      Buffer.from('{"old":true}', 'utf8'),
+    )
+    v1.exec('PRAGMA user_version = 1')
+    v1.close()
+
+    const store = await openEventStore(dbPath)
+    // v1 시절 이벤트가 그대로 읽힌다 — 이주가 로그를 버리지 않는다 (`§1.4`).
+    const stored = await readAllEvents(store, 'legacy')
+    expect(stored.map((e) => e.id)).toEqual(['old0'])
+    expect(stored[0]?.payload).toBe('{"old":true}')
+    // 이주 뒤의 append는 출처를 정상적으로 남긴다.
+    await store.append('legacy', [{ id: 'new0', payload: '{"new":true}' }], PROVENANCE)
+    await store.close()
+
+    const migrated = new DatabaseSync(dbPath)
+    const version = migrated.prepare('PRAGMA user_version').get()?.['user_version']
+    migrated.close()
+    expect(Number(version)).toBe(2)
+    // 고른 이주 경로가 그대로 관찰된다: v1 행의 출처는 `NULL`(= 물을 수 없는 행)이고,
+    // 지어낸 값이 채워져 있지 않다. v2가 쓴 행에는 값이 있다.
+    const legacyRow = readProvenanceRow(dbPath, 'legacy', 'old0')
+    expect(legacyRow['workspace_id']).toBeNull()
+    expect(legacyRow['token_id']).toBeNull()
+    const freshRow = readProvenanceRow(dbPath, 'legacy', 'new0')
+    expect(freshRow['workspace_id']).toBe(PROVENANCE.workspaceId)
+    expect(freshRow['token_id']).toBe(PROVENANCE.tokenId)
   })
 })
