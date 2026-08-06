@@ -39,6 +39,16 @@ import { parseBody } from './body.js'
 const EVENT_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,256}$/
 
 /**
+ * `0002 §1.3` L103-104의 계약 하한 — `maxEventBytes ≥ 1 MiB`(MUST). 1 MiB = 2^20바이트.
+ *
+ * **기본값이지 배포값이 아니다** (`§8` 미결 8). {@link parseAppendRequest}를 `maxEventBytes`
+ * 없이 부르면 이 값을 쓴다 — 한도를 모르는 호출자(예: 이 한도를 다루지 않는 기존 테스트)가
+ * 계약 하한 아래에서 그대로 동작하게 하기 위해서다. 실제 배포 한도는
+ * `server.ts`의 `TransportServerOptions.maxEventBytes`로 주입한다.
+ */
+export const MIN_MAX_EVENT_BYTES = 1024 * 1024
+
+/**
  * 이벤트 봉투가 정의한 필드. `§1.3` L84-88의 `Event`가 가진 것이 이 둘뿐이다.
  *
  * 비어 있지 않은 상수다 — 비면 모든 이벤트가 거부된다(fail-closed). 그 반대,
@@ -81,10 +91,11 @@ export type AppendEvent = {
  * 이 게이트가 낼 수 있는 상태코드.
  *
  * `400`은 `§1.5` 표(L150·L152)의 두 code(`malformed_request`·`invalid_event`)가 쓰고,
+ * `413`은 단일 이벤트가 `maxEventBytes`를 넘었을 때(`event_too_large`, L158),
  * `500`은 스캐너와 `JSON.parse`의 판정이 갈라졌을 때뿐이다 ({@link parseAppendRequest}의
  * *"fail-closed"* 절).
  */
-export type AppendRequestErrorStatus = 400 | 500
+export type AppendRequestErrorStatus = 400 | 413 | 500
 
 /**
  * append 본문 게이트의 판정 결과.
@@ -267,24 +278,32 @@ function scanObject(raw: string, from: number, visit: MemberVisitor): number {
 }
 
 /**
- * `events` 배열을 훑어 원소마다 `payload` 값의 범위를 모은다.
+ * 원소 하나의 스캔 결과. `event`는 그 원소가 차지하는 원문 구간 전체다(`§1.3` L103의
+ * `maxEventBytes` 판정이 이 구간의 바이트 길이를 잰다) — 원소가 배열 안에 있는 한 언제나
+ * 있다. `payload`는 원소가 객체가 아니거나 `payload` 멤버가 없으면 `null`이다.
+ */
+type EventScan = { readonly event: TextRange; readonly payload: TextRange | null }
+
+/**
+ * `events` 배열을 훑어 원소마다 원문 구간 전체와 `payload` 값의 범위를 모은다.
  *
- * 원소가 객체가 아니거나 `payload` 멤버가 없으면 그 자리는 `null`이다 — 그 판정(=거부)은
+ * 원소가 객체가 아니거나 `payload` 멤버가 없으면 `payload`는 `null`이다 — 그 판정(=거부)은
  * 여기가 아니라 {@link parseAppendRequest}의 검증 루프가 한다. 스캐너는 **찾기만 한다.**
  */
 function scanEventsArray(
   raw: string,
   from: number,
-): { readonly ranges: readonly (TextRange | null)[]; readonly next: number } | null {
+): { readonly scans: readonly EventScan[]; readonly next: number } | null {
   if (raw[from] !== '[') {
     return null
   }
-  const ranges: (TextRange | null)[] = []
+  const scans: EventScan[] = []
   let i = skipWhitespace(raw, from + 1)
   if (raw[i] === ']') {
-    return { ranges, next: i + 1 }
+    return { scans, next: i + 1 }
   }
   for (;;) {
+    const elementStart = i
     if (raw[i] === '{') {
       // 방문자가 쓰는 자리. 지역 변수 대신 홀더인 것은 콜백 안의 대입이 밖의 좁히기를
       // 되돌리지 않기 때문이다 (타입이 아니라 사실을 정확히 적기 위한 것).
@@ -304,14 +323,14 @@ function scanEventsArray(
       if (end === NOT_FOUND) {
         return null
       }
-      ranges.push(found.range)
+      scans.push({ event: { start: elementStart, end }, payload: found.range })
       i = end
     } else {
       const end = scanValue(raw, i)
       if (end === NOT_FOUND) {
         return null
       }
-      ranges.push(null)
+      scans.push({ event: { start: elementStart, end }, payload: null })
       i = end
     }
     i = skipWhitespace(raw, i)
@@ -321,18 +340,18 @@ function scanEventsArray(
       continue
     }
     if (c === ']') {
-      return { ranges, next: i + 1 }
+      return { scans, next: i + 1 }
     }
     return null
   }
 }
 
 /**
- * 본문을 **1회 순회**하며 `events` 원소별 `payload` 원문 범위를 모은다.
- * 구조가 예상과 다르면 `null` — 부르는 쪽이 fail-closed로 처리한다.
+ * 본문을 **1회 순회**하며 `events` 원소별 스캔 결과(원문 구간 전체 + `payload` 원문 범위)를
+ * 모은다. 구조가 예상과 다르면 `null` — 부르는 쪽이 fail-closed로 처리한다.
  */
-function scanPayloadRanges(raw: string): readonly (TextRange | null)[] | null {
-  const collected: { ranges: readonly (TextRange | null)[] | null } = { ranges: null }
+function scanEventScans(raw: string): readonly EventScan[] | null {
+  const collected: { scans: readonly EventScan[] | null } = { scans: null }
   const start = skipWhitespace(raw, 0)
   const end = scanObject(raw, start, (key, valueStart) => {
     if (key !== 'events') {
@@ -344,13 +363,13 @@ function scanPayloadRanges(raw: string): readonly (TextRange | null)[] | null {
     }
     // 최상위에도 같은 키가 두 번 올 수 있다(`{"events":[…],"events":[…]}` — `parseBody`의
     // `Object.keys`에는 한 번만 보인다). 여기서도 뒤엣것이 이긴다.
-    collected.ranges = scanned.ranges
+    collected.scans = scanned.scans
     return scanned.next
   })
   if (end === NOT_FOUND || skipWhitespace(raw, end) !== raw.length) {
     return null
   }
-  return collected.ranges
+  return collected.scans
 }
 
 function malformed(message: string): AppendRequestResult {
@@ -377,6 +396,22 @@ function invalidEvent(
 }
 
 /**
+ * `413 event_too_large` (`§1.5` L158). 크기 판정은 `id` 검증보다 먼저 도므로 다른 사전
+ * 실패들(예: `event must be a JSON object`)과 같은 이유로 `eventId`를 싣지 않는다 —
+ * 검증을 통과한 id가 아직 없다. `eventIndex`만으로 클라이언트가 어느 원소인지 짚을 수 있다.
+ */
+function eventTooLarge(index: number, maxEventBytes: number): AppendRequestResult {
+  return {
+    ok: false,
+    status: 413,
+    error: errorResponse(ErrorCodes.event_too_large, 'event exceeds the maximum allowed size', {
+      eventIndex: index,
+      maxEventBytes,
+    }),
+  }
+}
+
+/**
  * 스캐너와 `JSON.parse`의 판정이 갈라졌다. **통과시키지 않는다.**
  *
  * `request.ts`가 라우트 표와 메서드 판정이 갈라지는 자리에 쓴 것과 같은 규율이다 — 도달하지
@@ -396,6 +431,9 @@ function scannerDisagrees(): AppendRequestResult {
  *
  * @param rawBody 요청 본문 **원문**. 파싱된 객체를 받지 않는다 — 받는 순간 바이트가 이미
  *   없다 (파일 상단 doc).
+ * @param options.maxEventBytes 단일 이벤트(원소 전체의 원문 구간)의 바이트 상한(`§1.3` L103
+ *   MUST). 부재면 {@link MIN_MAX_EVENT_BYTES}(계약 하한 1 MiB)를 쓴다 — 배포 한도는
+ *   `server.ts`가 `TransportServerOptions.maxEventBytes`로 주입해서 넘긴다.
  *
  * ## 검사 순서
  *
@@ -405,9 +443,10 @@ function scannerDisagrees(): AppendRequestResult {
  * 2. **배열 계약** — `events`가 배열이고 길이 ≥ 1. 아니면 `400 malformed_request`
  *    (`§2.1` L204-206 MUST: *"빈 요청을 `200`으로 돌려주면 클라이언트의 flush 경로가
  *    '밀었다'고 오인한다"*).
- * 3. **원문 범위 스캔** — 본문 1회 순회로 원소별 `payload` 범위를 모은다.
- * 4. **이벤트별 검증** — 배열 순서대로 `id` → `payload` 키 → 미정의 필드 → 요청 내 중복 id.
- *    **하나라도 실패하면 `400`이고 아무것도 돌려주지 않는다** (`§2.1` L207-208 MUST).
+ * 3. **원문 범위 스캔** — 본문 1회 순회로 원소별 원문 구간 전체와 `payload` 범위를 모은다.
+ * 4. **이벤트별 검증** — 배열 순서대로 크기(`maxEventBytes`, `413`) → `id` → `payload` 키 →
+ *    미정의 필드 → 요청 내 중복 id. **하나라도 실패하면 통과분을 돌려주지 않는다**
+ *    (`§2.1` L207-208 MUST — 크기 실패는 `413`, 나머지는 `400`이지만 all-or-nothing은 같다).
  *
  * 통과한 이벤트는 **요청 배열 순서를 보존한다** (`§2.1` L193 — `accepted`가 그 순서를 쓴다).
  *
@@ -469,7 +508,12 @@ function scannerDisagrees(): AppendRequestResult {
  * 못 훑는 것은 이 파일의 결함이지 클라이언트의 잘못이 아니고, 그때 `200`을 주면 바이트
  * 보존의 근거 없이 payload가 기록된다. 통과시키는 쪽으로 무너지지 않는다.
  */
-export function parseAppendRequest(rawBody: string): AppendRequestResult {
+export function parseAppendRequest(
+  rawBody: string,
+  options: { readonly maxEventBytes?: number } = {},
+): AppendRequestResult {
+  const maxEventBytes = options.maxEventBytes ?? MIN_MAX_EVENT_BYTES
+
   // ── 1: 최상위 형태. `parseBody`의 경계 — "최상위 형태까지" — 가 그대로 맞는 자리다.
   const parsed = parseBody(rawBody, ['events'])
   if (!parsed.ok) {
@@ -486,8 +530,8 @@ export function parseAppendRequest(rawBody: string): AppendRequestResult {
   }
 
   // ── 3: 원문 범위 스캔. 본문 1회 순회이고, 이벤트마다 본문을 다시 훑지 않는다.
-  const ranges = scanPayloadRanges(rawBody)
-  if (ranges === null || ranges.length !== events.length) {
+  const scans = scanEventScans(rawBody)
+  if (scans === null || scans.length !== events.length) {
     return scannerDisagrees()
   }
 
@@ -495,6 +539,21 @@ export function parseAppendRequest(rawBody: string): AppendRequestResult {
   const seenIds = new Set<string>()
   const accepted: AppendEvent[] = []
   for (let index = 0; index < events.length; index++) {
+    const scan = scans[index]
+    if (scan === undefined) {
+      // 길이는 위에서 맞춰 봤으니 도달하지 않는다 — `noUncheckedIndexedAccess`가 요구하는
+      // 형식적 좁히기다.
+      return scannerDisagrees()
+    }
+
+    // 크기 판정이 구조 판정보다 먼저 온다 — 원소가 유효한 봉투인지와 무관하게 원문 구간의
+    // 바이트 길이만 보므로, 다른 검사보다 먼저 걸어도 결과가 달라지지 않고 큰 원소에 대한
+    // 나머지 검증(키 순회 등)을 아낀다.
+    const eventBytes = Buffer.byteLength(rawBody.slice(scan.event.start, scan.event.end), 'utf8')
+    if (eventBytes > maxEventBytes) {
+      return eventTooLarge(index, maxEventBytes)
+    }
+
     const event: unknown = events[index]
     if (typeof event !== 'object' || event === null || Array.isArray(event)) {
       return invalidEvent(index, null, 'event must be a JSON object')
@@ -526,12 +585,12 @@ export function parseAppendRequest(rawBody: string): AppendRequestResult {
     }
     seenIds.add(id)
 
-    const range = ranges[index]
-    if (range === undefined || range === null) {
+    const payloadRange = scan.payload
+    if (payloadRange === null) {
       // 파싱된 이벤트에는 `payload` 키가 있는데 스캐너는 그 범위를 못 찾았다 — 갈라졌다.
       return scannerDisagrees()
     }
-    accepted.push({ id, payload: rawBody.slice(range.start, range.end) })
+    accepted.push({ id, payload: rawBody.slice(payloadRange.start, payloadRange.end) })
   }
 
   return { ok: true, events: accepted }
