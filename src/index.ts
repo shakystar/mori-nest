@@ -2,7 +2,7 @@
  * 두 평면(전송 · 제어)이 공유하는 계약.
  *
  * 여기 있는 것은 **어느 평면에도 속하지 않고 라우트를 하나도 모르는 것들뿐이다.**
- * 라우트 핸들러·서버 리슨·저장소는 이 패키지에 없다 (mori-nest #7).
+ * 라우트 핸들러·서버 리슨은 이 패키지에 없다 (mori-nest #7).
  *
  * 예외는 `token.js`·`request.js`·`event.js`·`sse.js`·`pull.js`다 — 전송 평면의 게이트와 직렬화
  * (0003 §3.3 · 0002 §1.2 · §1.3·§2.1 · §4.3 · §3.1)이므로 평면에 속하지만, 서버도 저장소도 모르는
@@ -13,6 +13,11 @@
  * 연결도 타이머도 갖지 않는다 — 언제 보낼지는 연결을 가진 조각이 안다. `pull.js`도 같다:
  * 저장소가 고른 페이지를 **JSON 텍스트로** 만들 뿐, 페이지를 고르는 일(커서 해석·정렬·`limit`·
  * `hasMore` 판정)은 로그를 읽는 쪽의 것이다.
+ *
+ * `store.js`는 그 *"로그를 읽는 쪽"* 이다 (mori-nest #27). 위의 순수 함수들과 달리 파일과
+ * 프로세스를 갖지만, **라우트는 여전히 모른다** — HTTP도 서버도 여기 없고, 이벤트를 붙이고
+ * 페이지를 고르는 것까지가 전부다. 두 게이트(`event.js`)와 두 직렬화(`pull.js`·`sse.js`)를
+ * 잇는 것은 여전히 서버 조각의 몫이다.
  */
 
 export { ErrorCodes, errorResponse, type ErrorCode, type ErrorResponse } from './errors.js'
@@ -60,3 +65,12 @@ export {
   type PullResponseFailure,
   type PullResponseResult,
 } from './pull.js'
+export {
+  openEventStore,
+  EventStoreError,
+  DEFAULT_PAGE_LIMIT,
+  type AppendResult,
+  type EventStore,
+  type EventStoreFailure,
+  type StoredEventRef,
+} from './store.js'
