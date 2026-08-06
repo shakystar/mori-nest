@@ -274,7 +274,7 @@ class Waker {
  * 순간의 대기자만 깨우고 지나가지만, 종료는 그 뒤로 몇 번을 물어도 항상 "이미 끝났다"여야
  * 한다.
  */
-class OnceSignal {
+export class OnceSignal {
   #fired = false
   #waiters: Array<() => void> = []
 
@@ -295,6 +295,16 @@ class OnceSignal {
       return Promise.resolve()
     }
     return new Promise((resolve) => this.#waiters.push(resolve))
+  }
+
+  /**
+   * 아직 `fire()`되지 않은 `wait()` 호출 수. 프로덕션 경로는 이 값을 보지 않는다 — 테스트가
+   * mori-nest #37 발견 2(`wait()`를 호출마다 다시 부르면 `#waiters`가 연결 수명 동안 단조
+   * 증가한다)의 수정 불변식("프라미스 하나를 만들어 재사용하면 `wait()`를 몇 번 다시
+   * `.then()` 걸어도 `#waiters`가 늘지 않는다")을 직접 관찰하기 위해 존재한다.
+   */
+  get waiterCount(): number {
+    return this.#waiters.length
   }
 }
 
@@ -339,6 +349,13 @@ class SubscribeConnection {
   readonly #logId: string
   readonly #waker = new Waker()
   readonly #closeSignal = new OnceSignal()
+  // `#closeSignal.wait()`를 딱 한 번만 불러 그 프라미스를 재사용한다. `#waitForDrainOrClose`는
+  // 백프레셔가 날 때마다(오래 사는 연결에서는 여러 번) 불리는데, 매번 새로
+  // `#closeSignal.wait()`를 불렀다면 `drain`으로 끝난 호출의 resolver가 `OnceSignal.#waiters`에
+  // 그대로 남아 연결 수명 동안 단조 증가했다(mori-nest #37 발견 2) — `fire()`(연결 종료)만
+  // 그 배열을 비우기 때문이다. 프라미스 하나에 `.then()`을 여러 번 거는 것은 새 waiter를
+  // 만들지 않으므로, 이 필드를 공유하면 `#waiters`에는 연결당 항목이 정확히 하나만 쌓인다.
+  readonly #closePromise: Promise<void> = this.#closeSignal.wait()
   readonly #unsubscribe: () => void
   readonly #onClose: () => void
   #closed = false
@@ -511,7 +528,10 @@ class SubscribeConnection {
       }
       const onDrain = (): void => finish()
       this.#res.once('drain', onDrain)
-      this.#closeSignal.wait().then(finish)
+      // `#closeSignal.wait()`를 다시 부르지 않는다 — 필드 초기화 때 만든 `#closePromise` 하나를
+      // 재사용한다 (위 필드 doc 참조). `.then()`은 매번 새로 걸지만 이것이 `OnceSignal.#waiters`에
+      // 항목을 추가하지는 않는다.
+      this.#closePromise.then(finish)
     })
   }
 
