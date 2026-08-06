@@ -326,7 +326,7 @@ type ListLogsResponse = {
 | ① 새 프로젝트를 만들며 join | `POST /v1/logs` | §2.1 — 기존 |
 | ② 기존 프로젝트에 join — `logId`를 얻는다 | `GET /v1/logs`, `GET /v1/logs/{logId}` | **§2.4 — 이 조각이 연다** |
 | ③ 작업을 시작한다 | `POST /v1/workspaces` | §4.2 — 기존, 단 join과 같은 사건이 아니다 (아래) |
-| ④ replica를 hub에 알린다 | 없음 | **이 조각의 비범위** — `replica-identity-and-join-adjudication.md` §Q4.1 공백 2. 출처 축의 자리가 아직 스펙에 없고(mori-nest #42, S1), replica 축이 실릴 곳도 그 조각이 정한다. #42가 그 축을 join이 채우는 것으로 정하면, 그때 이 자리를 표면으로 받는 조각이 따로 선다. 지금 이 문서는 `replica`라는 낱말을 여전히 갖지 않는다 |
+| ④ replica를 hub에 알린다 | `POST /v1/workspaces` | **이 조각의 비범위, 그리고 join의 표면이 아니다** — `replica-identity-and-join-adjudication.md` §Q4.1 공백 2는 `mori-nest #42`(S1, 머지됨)가 §4.9로 닫았다. §4.9는 replica 축을 **개시 요청(`POST /v1/workspaces`, §4.2)이 채우는 것으로 정했다** — join이 아니다(§4.9 "채우는 자리를 개시 요청 하나로 정한다" 근거 참고). 그래서 join의 ④ 단계는 hub 호출로 남지 않는다: replica 신고는 join 뒤에 오는 개시가 대신 진다 |
 
 **join을 §4.2에 얹지 않는다.** 겹치는 것처럼 보이지만(둘 다 join 흐름 위에 있다) 같은 사건이
 아니다:
