@@ -299,9 +299,14 @@ export class OnceSignal {
 
   /**
    * 아직 `fire()`되지 않은 `wait()` 호출 수. 프로덕션 경로는 이 값을 보지 않는다 — 테스트가
-   * mori-nest #37 발견 2(`wait()`를 호출마다 다시 부르면 `#waiters`가 연결 수명 동안 단조
-   * 증가한다)의 수정 불변식("프라미스 하나를 만들어 재사용하면 `wait()`를 몇 번 다시
-   * `.then()` 걸어도 `#waiters`가 늘지 않는다")을 직접 관찰하기 위해 존재한다.
+   * `OnceSignal` 자신의 계약(`fire()`가 대기자를 전부 비우고, 그 뒤 `wait()`는 다시 쌓이지
+   * 않는다)을 직접 관찰하기 위해 존재한다.
+   *
+   * **`SubscribeConnection`의 백프레셔 대기자 누적을 관측하는 용도로는 쓰지 않는다** —
+   * 예전에 그런 용도로 쓰였으나(`mori-nest #37` 최초 시도), 문제였던 누적은 `OnceSignal`이
+   * 아니라 재사용된 프라미스에 반복해서 건 `.then()`이 엔진 내부에 쌓는 reaction 목록에서
+   * 일어났고 이 값은 그것을 보지 못한다(PR #41 owner 반송 코멘트). 그 자리의 수정은
+   * `SubscribeConnection.#drainWaiter` 필드 doc을 본다.
    */
   get waiterCount(): number {
     return this.#waiters.length
@@ -367,18 +372,38 @@ class SubscribeConnection {
   readonly #logId: string
   readonly #waker = new Waker()
   readonly #closeSignal = new OnceSignal()
-  // `#closeSignal.wait()`를 딱 한 번만 불러 그 프라미스를 재사용한다. `#waitForDrainOrClose`는
-  // 백프레셔가 날 때마다(오래 사는 연결에서는 여러 번) 불리는데, 매번 새로
-  // `#closeSignal.wait()`를 불렀다면 `drain`으로 끝난 호출의 resolver가 `OnceSignal.#waiters`에
-  // 그대로 남아 연결 수명 동안 단조 증가했다(mori-nest #37 발견 2) — `fire()`(연결 종료)만
-  // 그 배열을 비우기 때문이다. 프라미스 하나에 `.then()`을 여러 번 거는 것은 새 waiter를
-  // 만들지 않으므로, 이 필드를 공유하면 `#waiters`에는 연결당 항목이 정확히 하나만 쌓인다.
-  readonly #closePromise: Promise<void> = this.#closeSignal.wait()
   readonly #unsubscribe: () => void
   readonly #onClose: () => void
   #closed = false
   #cursor: CursorStart
   #openSent = false
+  /**
+   * `#waitForDrainOrClose`가 현재 기다리고 있는 finisher(최대 하나). `mori-nest #37` PR #41
+   * 반송 코멘트가 지적한 문제: `#closeSignal.wait()`가 돌려준 프라미스를 재사용해도(필드로
+   * 캐싱해도) 백프레셔가 날 때마다 그 프라미스에 `.then()`을 다시 걸면, `OnceSignal.#waiters`는
+   * 늘지 않지만(재사용된 프라미스라서) **ECMAScript 엔진이 그 pending 프라미스에 붙이는
+   * `PromiseReaction` 목록(`[[PromiseFulfillReactions]]`)은 `.then()` 호출 수만큼 그대로
+   * 쌓인다** — settle(= `fire()` = 연결 종료) 전까지 비워지지 않는다. `OnceSignal.waiterCount`는
+   * `OnceSignal` 자신의 배열만 보므로 이 누적을 관측하지 못한다: 누적이 사라진 게 아니라
+   * 관측 가능한 자리에서 관측 불가능한 자리(엔진 내부 reaction 목록)로 옮겨갔을 뿐이었다.
+   *
+   * 진짜 고침: `.then()` 자체를 백프레셔 이벤트마다 걸지 않는다. `#closeSignal.wait()`에
+   * `.then()`을 이 클래스 생성자에서 **딱 한 번**만 걸어(아래 참조), 연결이 닫히면 그 순간
+   * `#drainWaiter`에 등록된 것이 있으면 그것 하나만 불러 깨운다. `#waitForDrainOrClose`는
+   * `.then()`을 걸지 않고 이 필드에 자기 finisher를 등록했다가 `drain`이나 종료로 끝나면
+   * 스스로 `null`로 되돌린다.
+   *
+   * **왜 배열이 아니라 스칼라로 충분한가**: `#drainWaiter`를 채우는 유일한 자리는
+   * `#waitForDrainOrClose`이고, 그 유일한 호출자는 `#writeFrame`이며, `#writeFrame`은
+   * `run()`의 메인 루프 한 곳에서만 매번 `await`되어 불린다(`#drain()` 안의 프레임 쓰기,
+   * 하트비트 쓰기 전부 같은 순차 흐름). 즉 이 연결에서 `#waitForDrainOrClose`가 동시에
+   * 두 번 진행 중일 수 없다 — 새 호출이 시작되는 시점엔 이전 finisher가 이미 `finish()`로
+   * 스스로를 `null`로 정리한 뒤다. 따라서 연결 수명 동안 `#closeSignal.wait()`의 프라미스에
+   * 걸리는 `.then()` reaction은 **생성자의 한 번**이 전부이고, 백프레셔 횟수와 무관하게
+   * 상수(1)로 고정된다. (이 전제가 깨질 수 있다고 판단되면 스칼라를 `Set`으로 바꾸되, 그때는
+   * 등록·해제가 짝을 이루는지가 새 검증 대상이다.)
+   */
+  #drainWaiter: (() => void) | null = null
 
   constructor(
     store: EventStore,
@@ -408,6 +433,15 @@ class SubscribeConnection {
     }
     req.once('close', this.#onClose)
     res.once('error', this.#onClose)
+
+    // `#closeSignal.wait()`에 `.then()`을 여기, 생성자에서 **한 번만** 건다 — `#drainWaiter`
+    // 필드 doc 참조. 연결이 닫히면 그 순간 등록돼 있는 finisher 하나(없으면 아무 일도 안 함)를
+    // 불러 깨우고 비운다. `#waitForDrainOrClose`는 이 프라미스에 다시 `.then()`을 걸지 않는다.
+    this.#closeSignal.wait().then(() => {
+      const waiter = this.#drainWaiter
+      this.#drainWaiter = null
+      waiter?.()
+    })
   }
 
   /** 연결의 전체 수명을 돈다. `req`/`res`가 끝나거나 한도를 넘겨 자를 때까지 반환하지 않는다. */
@@ -542,14 +576,18 @@ class SubscribeConnection {
         }
         settled = true
         this.#res.off('drain', onDrain)
+        // 자신이 여전히 현재 등록된 finisher일 때만 비운다 — 이론상으로만 유효한 방어다
+        // (`#drainWaiter` doc의 상호배제 전제대로면 다른 finisher가 그 사이 등록될 수 없다).
+        if (this.#drainWaiter === finish) {
+          this.#drainWaiter = null
+        }
         resolve()
       }
       const onDrain = (): void => finish()
       this.#res.once('drain', onDrain)
-      // `#closeSignal.wait()`를 다시 부르지 않는다 — 필드 초기화 때 만든 `#closePromise` 하나를
-      // 재사용한다 (위 필드 doc 참조). `.then()`은 매번 새로 걸지만 이것이 `OnceSignal.#waiters`에
-      // 항목을 추가하지는 않는다.
-      this.#closePromise.then(finish)
+      // `#closeSignal.wait()`에 `.then()`을 걸지 않는다 — 생성자에서 건 단 하나의 `.then()`이
+      // 종료 시 이 필드를 봐 준다 (`#drainWaiter` 필드 doc 참조). 여기서는 등록만 한다.
+      this.#drainWaiter = finish
     })
   }
 
