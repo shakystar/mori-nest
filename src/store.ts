@@ -5,7 +5,7 @@
  * 게이트 판정과 직렬화를 끝내 놓았고, 지금까지 없던 것이 **로그 그 자체**였다. 이 파일이 그것이다.
  * 라우트 핸들러도 HTTP 서버도 여기 없다 (후속 세 조각의 몫이다) — 이 파일은 저장소만이다.
  *
- * 구현은 `node:sqlite`다 (mori-nest [#15의 사람 결정, 2안 확정](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5198717953)).
+ * 구현은 `node:sqlite`다 (mori-nest [#15의 사람 결정, 2안 확정](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5198600623)).
  * 런타임 의존성은 **0을 유지한다** — `node:sqlite`는 빌트인이다.
  *
  * ## 이 파일의 요지 — 두 MUST를 **응용 코드가 아니라 스토어가** 강제한다
@@ -260,7 +260,7 @@ CREATE INDEX IF NOT EXISTS events_log_seq ON events (log_id, seq);
  *
  * `after=<cursor>`는 `application/x-www-form-urlencoded` 쿼리로 다니고 `request.ts`의
  * `queryValue`가 표준 디코딩을 하므로, 커서에 `+`가 있으면 **공백이 되어 돌아온다**
- * ([#15의 14:31 커서 알파벳 제약](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5193789043)).
+ * ([#15의 14:31 커서 알파벳 제약](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5193097287)).
  * `0-9`에는 `+`·공백·`&`·`=`·`%`·`#`가 하나도 없으므로 인코딩이 항등이고, 왕복이 자명하게
  * 안전하다. (표준 base64는 `+`·`/`·`=`를 쓰므로 이 자리에 쓸 수 없다.)
  *
