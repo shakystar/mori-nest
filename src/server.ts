@@ -43,8 +43,8 @@ import { MIN_MAX_EVENT_BYTES, parseAppendRequest } from './event.js'
 import { serializePullResponse, type PullPage } from './pull.js'
 import { verifyTransportRequest, type CursorStart, type RawRequest } from './request.js'
 import { serializeAppendFrame, serializeHeartbeatFrame, serializeOpenFrame, serializeResetFrame } from './sse.js'
-import type { VerificationKeySet } from './token.js'
-import type { EventStore } from './store.js'
+import type { VerificationKeySet, VerifiedWorkspaceToken } from './token.js'
+import { EventStoreError, eventProvenanceOf, type EventStore } from './store.js'
 
 export type TransportServerOptions = {
   readonly store: EventStore
@@ -189,11 +189,17 @@ function writeRaw(res: ServerResponse, status: number, body: string): void {
  * 코멘트). 요청이 전부 `duplicate`여도(새로 쓴 것이 없어도) 부른다 — 구독자의 다음 읽기는
  * 어차피 자기 커서 뒤에서 새 행을 찾지 못할 뿐이라 비용은 빈 조회 하나뿐이고, 조건을 갈라
  * "새로 쓴 게 있을 때만"으로 좁히면 그 판정 자체가 또 하나의 버그 표면이 된다.
+ *
+ * `§1.6`: 이 핸들러가 **검증된 토큰**을 받는 것은 출처 값을 기록 층까지 내리기 위해서다. 값을
+ * 만드는 것은 `eventProvenanceOf` 하나이고 이 파일은 그 결과를 `store.append`에 넘길 뿐이다 —
+ * 요청 본문·헤더·쿼리에서 출처를 읽지 않는다 (MUST NOT). **와이어 계약은 이 변경으로 늘지
+ * 않는다**: 응답 본문은 여전히 `{accepted, duplicate}` 그대로이고 출처는 실리지 않는다.
  */
 async function handleAppend(
   store: EventStore,
   broker: LogBroker,
   logId: string,
+  token: VerifiedWorkspaceToken,
   rawBody: string,
   maxEventBytes: number,
   res: ServerResponse,
@@ -206,8 +212,17 @@ async function handleAppend(
 
   let result
   try {
-    result = await store.append(logId, parsed.events)
-  } catch {
+    // `§1.6`: 출처 값의 유일한 출처는 이 요청이 통과한 토큰의 클레임이다 (MUST). 꺼내는 자리는
+    // `eventProvenanceOf` 하나이고, `parsed`(요청 본문)에서 오는 값은 `events`뿐이다 — 본문·
+    // 헤더·쿼리에서 출처를 읽는 코드가 이 파일에 없다 (MUST NOT).
+    result = await store.append(logId, parsed.events, eventProvenanceOf(token))
+  } catch (error) {
+    // 출처를 얻지 못한 상태는 내구성 문제가 아니라 서버 자신의 결함이다 — `§1.6`이 그 경우를
+    // `503`이 아니라 `500 internal`로 못 박았다 (MUST). 스토어의 다른 실패는 종전대로 `503`이다.
+    if (error instanceof EventStoreError && error.reason === 'missing_provenance') {
+      writeJson(res, 500, errorResponse(ErrorCodes.internal, 'append could not derive its provenance'))
+      return
+    }
     writeJson(res, 503, errorResponse(ErrorCodes.not_durable, 'append could not be durably committed'))
     return
   }
@@ -723,7 +738,17 @@ async function handleRequest(
       res.on('finish', () => req.destroy())
       return
     }
-    await handleAppend(options.store, broker, result.request.logId, body.body, maxEventBytes, res)
+    // `§1.6`: 검증된 토큰이 그대로 라우트 핸들러까지 내려간다. 이 인자가 «검증 결과가 기록
+    // 층까지 닿지 않은 구현»(§1.6이 지목한 실패 형태)을 닫는 자리다.
+    await handleAppend(
+      options.store,
+      broker,
+      result.request.logId,
+      result.request.token,
+      body.body,
+      maxEventBytes,
+      res,
+    )
     return
   }
 

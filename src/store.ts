@@ -5,7 +5,7 @@
  * 게이트 판정과 직렬화를 끝내 놓았고, 지금까지 없던 것이 **로그 그 자체**였다. 이 파일이 그것이다.
  * 라우트 핸들러도 HTTP 서버도 여기 없다 (후속 세 조각의 몫이다) — 이 파일은 저장소만이다.
  *
- * 구현은 `node:sqlite`다 (mori-nest [#15의 사람 결정, 2안 확정](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5198717953)).
+ * 구현은 `node:sqlite`다 (mori-nest [#15의 사람 결정, 2안 확정](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5198600623)).
  * 런타임 의존성은 **0을 유지한다** — `node:sqlite`는 빌트인이다.
  *
  * ## 이 파일의 요지 — 두 MUST를 **응용 코드가 아니라 스토어가** 강제한다
@@ -68,6 +68,7 @@ import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqli
 import type { AppendEvent } from './event.js'
 import type { PullEvent, PullPage } from './pull.js'
 import type { CursorStart } from './request.js'
+import type { VerifiedWorkspaceToken } from './token.js'
 
 /**
  * `SQLITE_CONSTRAINT_UNIQUE`. `UNIQUE` 제약 위반의 확장 결과코드이고, #15 결정의 부수 실측이
@@ -97,8 +98,12 @@ const BUSY_TIMEOUT_MS = 5000
  * 읽으면 컬럼 하나가 조용히 무시되는 형태로 틀리고, 그 틀림은 로그에 남는다(append-only라
  * 되돌릴 수 없다). `§3.2`가 *"저장소가 재구축돼 커서 표현이 바뀐 경우"* 를 미지 커서의 발생
  * 경로로 이미 적고 있으므로, 스키마가 언젠가 움직인다는 것은 전제된 사실이다.
+ *
+ * - **1** — `events(seq, log_id, event_id, payload)`.
+ * - **2** — `§1.6`의 서버 파생 출처 두 컬럼(`workspace_id`·`token_id`)이 붙는다
+ *   ({@link SCHEMA}의 「v1 → v2 이주」 절이 그 선택의 근거다).
  */
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
 /**
  * `limit`이 주어지지 않은 pull의 페이지 크기.
@@ -154,6 +159,8 @@ export type EventStoreFailure =
   | 'unexpected_row_shape'
   /** `UNIQUE` 위반을 받았는데 먼저 저장돼 있던 사본을 찾을 수 없다 */
   | 'duplicate_without_stored_copy'
+  /** `§1.6`의 출처 값이 비어 있다 — 그 상태로는 이벤트를 기록하지 않는다 (MUST NOT) */
+  | 'missing_provenance'
 
 /**
  * 스토어의 실패. `message`는 {@link EventStoreFailure}와 같은 고정 문자열이고, 클라이언트가
@@ -193,6 +200,33 @@ export type AppendResult = {
 }
 
 /**
+ * `§1.6`의 서버 파생 출처 값 — **기록에만 남고 와이어에는 나오지 않는다.**
+ *
+ * 필드가 둘뿐인 것이 조항 그대로다: `workspaceId`는 귀속·되돌림의 축(`0003 §4.6`),
+ * `tokenId`는 발급 건의 축(`0003 §3.8`)이고 **둘 다 적는다** (MUST). 토큰 문자열 자체와
+ * `scope`·`expiresAt`·`audience`·`issuedAt`은 **여기 없다** (MUST NOT) — 타입에 자리가 없으면
+ * 실수로 실릴 수도 없다.
+ *
+ * 이 값을 만드는 자리는 {@link eventProvenanceOf} **하나뿐이다.**
+ */
+export type EventProvenance = {
+  readonly workspaceId: string
+  readonly tokenId: string
+}
+
+/**
+ * 검증된 토큰의 클레임에서 출처 값을 꺼낸다 — **클레임을 읽는 자리는 이 함수뿐이다.**
+ *
+ * 두 군데에서 꺼내면 그 사이에서 갈릴 수 있고, 갈린 값은 append-only 로그에 남아 되돌릴 수
+ * 없다. 인자가 {@link VerifiedWorkspaceToken}인 것도 같은 규율이다: 그 타입은 `token.ts`의
+ * 브랜드가 붙은 것이라 **검증을 통과한 토큰으로만** 만들어지므로, 요청 본문·헤더·쿼리에서
+ * 읽은 값이 이 함수를 통해 출처가 되는 경로가 타입에 없다 (`§1.6` MUST NOT).
+ */
+export function eventProvenanceOf(token: VerifiedWorkspaceToken): EventProvenance {
+  return { workspaceId: token.claims.workspaceId, tokenId: token.claims.tokenId }
+}
+
+/**
  * 로그를 들고 있는 것. **`Promise`를 돌려주는 것이 계약**이고 동기 구현은 그 뒤에 있다
  * (파일 상단 doc *"인터페이스가 async인 이유"*).
  *
@@ -210,10 +244,19 @@ export type EventStore = {
    *   비어 있거나 미지의 값이면 아무 로그에도 걸리지 않을 뿐, 조건이 통째로 꺼져 다른 로그의
    *   이벤트에 닿는 경로는 이 파일에 없다.
    * @param events `event.ts`의 게이트를 통과한 이벤트들, **요청 배열 순서 그대로**.
+   * @param provenance `§1.6`의 서버 파생 출처 값. **선택 인자가 아니다** — 출처 없이 기록되는
+   *   이벤트가 계약상 존재하지 않으므로(`§1.6` MUST NOT) 그 경로를 타입이 먼저 막는다. 이
+   *   값은 새로 기록되는 행에만 붙는다: `duplicate`로 분류된 이벤트의 기존 행은 **덮이지
+   *   않는다** (`§1.6` MUST NOT — 덮으면 이 축이 사칭 가능해진다).
    * @throws {EventStoreError} 배열이 비었거나(`empty_batch`) 기록할 수 없는 `payload`가
-   *   섞여 있으면 — 그때 이 요청의 이벤트는 **하나도** 남지 않는다.
+   *   섞여 있거나(`blank_payload`·`payload_not_byte_preserving`) 출처 값이 비어 있으면
+   *   (`missing_provenance`) — 그때 이 요청의 이벤트는 **하나도** 남지 않는다.
    */
-  append(logId: string, events: readonly AppendEvent[]): Promise<AppendResult>
+  append(
+    logId: string,
+    events: readonly AppendEvent[],
+    provenance: EventProvenance,
+  ): Promise<AppendResult>
 
   /**
    * 커서 이후 한 페이지를 읽는다 (`§3.1`·`§3.2`).
@@ -242,25 +285,63 @@ export type EventStore = {
  *   들어가도 통과하고, TEXT는 인코딩 정규화가 개입할 수 있는 자리다.
  * - **`events_log_seq` 인덱스** — 페이지 읽기(`WHERE log_id = ? AND seq > ? ORDER BY seq`)가
  *   `UNIQUE (log_id, event_id)` 인덱스로는 정렬을 못 받기 때문에 따로 둔다.
+ * - **`workspace_id`·`token_id`** — `§1.6`의 서버 파생 출처 값이다. 봉투 밖이고 와이어에 나오지
+ *   않는다 ({@link EventProvenance}). 둘 다 두는 것이 `§1.6` MUST고, `payload` 옆이 아니라
+ *   나란한 컬럼인 것은 `§1.3`의 바이트 보존을 건드리지 않기 위해서다.
+ *
+ * ## v1 → v2 이주 — 왜 `NULL` 허용인가 (되돌리기 비싼 자리다)
+ *
+ * v1로 쌓인 행의 출처는 **영원히 채울 수 없다.** 로그는 append-only이고(`§1.4`) 출처의 유일한
+ * 출처는 그 요청이 통과한 토큰의 클레임인데(`§1.6`), 그 요청은 이미 끝났다. 그래서 이 자리에서
+ * 고를 수 있는 것은 「없다는 사실을 어떻게 적을 것인가」뿐이다. 셋을 재고 (b)를 골랐다.
+ *
+ * - **(a) `NOT NULL`로 선언한다 — 버렸다.** `ALTER TABLE ... ADD COLUMN`은 기본값 없는
+ *   `NOT NULL` 컬럼을 붙이지 못한다 (SQLite: *"Cannot add a NOT NULL column with default value
+ *   NULL"*, `STRICT` 여부와 무관한 제약이다). 그러므로 (a)는 `DEFAULT ''` 같은 값을 함께
+ *   요구하고, 그 순간 v1 행에 **서버가 지어낸 출처 값**이 들어간다. `§1.6`이 값의 유일한
+ *   출처를 토큰 클레임으로 못 박은 축에 서버가 만든 상수를 섞는 것이므로, 나중에 그 로그를
+ *   되짚는 쪽은 «출처가 빈 문자열인 작업공간» 과 «v1 시절 행» 을 구별할 수 없다.
+ * - **(b) `NULL` 허용, 「`NULL` = v1 시절 행 = 출처를 물을 수 없는 행」 — 골랐다.** 모르는 것을
+ *   모른다고 적는 표현이 이 자리에 이미 있다. **v2가 쓴 행에는 `NULL`이 나타날 수 없다**:
+ *   {@link EventStore.append}가 {@link EventProvenance}를 **필수 인자**로 받고
+ *   ({@link SqliteEventStore.append}가 값을 검사한 뒤에만 `INSERT`한다), 두 값은 모든 `INSERT`에
+ *   바인딩된다. 즉 `NULL`은 「v1에서 왔다」의 동의어이지 「v2가 비운 채 썼다」가 아니다.
+ * - **(c) v1 DB를 열지 않는다 — 버렸다.** 출처가 없는 것은 v1 행뿐인데 그 대가로 v1이 쌓은
+ *   이벤트 전량이 읽히지 않게 된다. `§1.4`가 수용된 이벤트의 삭제를 MUST NOT으로 막았고,
+ *   읽을 수 없게 만드는 것은 그 조항의 취지를 우회하는 형태다. 새 컬럼 둘을 얻으려고 로그를
+ *   버리는 교환은 성립하지 않는다.
+ *
+ * `STRICT` 테이블에서 `ALTER TABLE ADD COLUMN`이 할 수 있는 것과 없는 것도 여기 적어 둔다:
+ * 선언 타입이 `STRICT`의 허용 집합(`INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY`)에 있으면 붙고,
+ * `PRIMARY KEY`·`UNIQUE`는 어느 테이블에서도 `ADD COLUMN`으로 붙지 않는다. 위 (a)의 제약도
+ * `STRICT` 고유의 것이 아니라 `ADD COLUMN` 일반의 제약이다.
  */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS events (
-  seq      INTEGER PRIMARY KEY AUTOINCREMENT,
-  log_id   TEXT NOT NULL,
-  event_id TEXT NOT NULL,
-  payload  BLOB NOT NULL,
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  log_id       TEXT NOT NULL,
+  event_id     TEXT NOT NULL,
+  payload      BLOB NOT NULL,
+  workspace_id TEXT,
+  token_id     TEXT,
   UNIQUE (log_id, event_id)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS events_log_seq ON events (log_id, seq);
 `
 
+/** v1 테이블에 없는 출처 컬럼들. 이름과 선언은 {@link SCHEMA}의 것과 같아야 한다. */
+const PROVENANCE_COLUMNS: readonly { readonly name: string; readonly declaration: string }[] = [
+  { name: 'workspace_id', declaration: 'workspace_id TEXT' },
+  { name: 'token_id', declaration: 'token_id TEXT' },
+]
+
 /**
  * 커서 인코딩 — **`seq`의 10진수 표기**다. 쓰는 알파벳은 `0-9` **뿐이다.**
  *
  * `after=<cursor>`는 `application/x-www-form-urlencoded` 쿼리로 다니고 `request.ts`의
  * `queryValue`가 표준 디코딩을 하므로, 커서에 `+`가 있으면 **공백이 되어 돌아온다**
- * ([#15의 14:31 커서 알파벳 제약](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5193789043)).
+ * ([#15의 14:31 커서 알파벳 제약](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5193097287)).
  * `0-9`에는 `+`·공백·`&`·`=`·`%`·`#`가 하나도 없으므로 인코딩이 항등이고, 왕복이 자명하게
  * 안전하다. (표준 base64는 `+`·`/`·`=`를 쓰므로 이 자리에 쓸 수 없다.)
  *
@@ -380,8 +461,55 @@ function applySchema(db: DatabaseSync): void {
     throw new EventStoreError('schema_version_too_new')
   }
   db.exec(SCHEMA)
+  addMissingProvenanceColumns(db)
   // 값 바인딩이 불가능한 자리(PRAGMA)라 문자열을 잇는다. 상수이고 클라이언트 입력이 아니다.
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+}
+
+/**
+ * v1로 만들어진 `events`에 출처 컬럼을 붙인다 ({@link SCHEMA}의 「v1 → v2 이주」). 새로 만든
+ * DB에서는 `CREATE TABLE`이 이미 두 컬럼을 세웠으므로 아무것도 하지 않는다.
+ *
+ * 판정을 `user_version`이 아니라 **테이블의 실제 모양**으로 하는 이유: v1 코드의 `applySchema`는
+ * `CREATE TABLE` 다음 구문에서 `user_version`을 적었고 그 둘은 한 트랜잭션이 아니었다. 그
+ * 사이에서 죽은 DB는 «`events`는 있는데 `user_version`은 `0`» 이고, 버전만 보고 이주를 건너뛰면
+ * 그런 DB는 컬럼 없는 채로 v2로 표시된 뒤 첫 `INSERT`에서 터진다. 모양을 보면 그 경로가 없다.
+ *
+ * **읽고-쓰기가 한 트랜잭션 안이다.** `CREATE TABLE IF NOT EXISTS`와 달리 `ALTER TABLE ADD
+ * COLUMN`에는 멱등한 형태가 없어서, 같은 v1 파일을 두 프로세스가 동시에 열면 둘 다 «컬럼이
+ * 없다»를 보고 둘 다 붙이려 들 수 있다 — 뒤엣것은 `duplicate column name`으로 열기에 실패한다.
+ * 파일 상단 doc의 단일 프로세스 전제에서는 일어나지 않지만, 이 창은 **열 때**의 것이라 그
+ * 전제를 지키는 배포에서도 배포 교체·백업 도구가 겹치는 순간에 닿을 수 있다. `BEGIN
+ * IMMEDIATE`가 그 창을 없앤다 (`busy_timeout` 안에서 뒤엣것이 기다렸다가 컬럼이 이미 있는
+ * 것을 본다).
+ */
+function addMissingProvenanceColumns(db: DatabaseSync): void {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const existing = new Set(
+      db
+        .prepare('PRAGMA table_info(events)')
+        .all()
+        .map((row) => row['name']),
+    )
+    for (const column of PROVENANCE_COLUMNS) {
+      if (!existing.has(column.name)) {
+        // 상수 문자열이고 클라이언트 입력이 아니다 (`ALTER TABLE`은 식별자를 바인딩할 수 없다).
+        db.exec(`ALTER TABLE events ADD COLUMN ${column.declaration}`)
+      }
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    // 예외 경로에서 트랜잭션을 반드시 놓는다 — 붙잡은 채로 올라가면 이 연결은 쓸 수 없고,
+    // `openEventStore`가 닫기 전까지 파일 잠금이 남는다. 롤백 자체의 실패는 삼킨다
+    // ({@link SqliteEventStore}의 `#rollbackQuietly`와 같은 이유 — 원래 실패를 가린다).
+    try {
+      db.exec('ROLLBACK')
+    } catch {
+      // 트랜잭션이 이미 열려 있지 않다.
+    }
+    throw error
+  }
 }
 
 /** `limit` 부재/유효성 판정. */
@@ -408,7 +536,12 @@ class SqliteEventStore implements EventStore {
 
   constructor(db: DatabaseSync) {
     this.#db = db
-    this.#insert = db.prepare('INSERT INTO events (log_id, event_id, payload) VALUES (?, ?, ?)')
+    // `§1.6`: 출처 두 컬럼이 **이 한 구문 안에** 있다. 이벤트 행을 만드는 구문이 이것뿐이므로
+    // 출처 기록은 이벤트 기록과 자동으로 같은 원자 단위다 — 뒤이어 `UPDATE`를 거는 형태였다면
+    // 크래시 창에서 «이벤트는 있는데 출처는 비어 있는» 행이 표현 가능해진다 (MUST).
+    this.#insert = db.prepare(
+      'INSERT INTO events (log_id, event_id, payload, workspace_id, token_id) VALUES (?, ?, ?, ?, ?)',
+    )
     // 이 SELECT는 **선판정이 아니다.** `UNIQUE` 제약이 이미 "이미 있다"를 판정한 뒤, `§2.1`
     // L194가 요구하는 *"먼저 저장돼 있던 사본의 커서"* 를 가져오려고 부른다. 부르는 자리는
     // {@link append}의 `catch` 안 하나뿐이고, 같은 트랜잭션 안이라 그 사이에 값이 바뀌지 않는다.
@@ -424,12 +557,25 @@ class SqliteEventStore implements EventStore {
     )
   }
 
-  async append(logId: string, events: readonly AppendEvent[]): Promise<AppendResult> {
+  async append(
+    logId: string,
+    events: readonly AppendEvent[],
+    provenance: EventProvenance,
+  ): Promise<AppendResult> {
     // `§2.1` L204-206: 빈 요청은 `400`이고 `200`이 아니다. `event.ts`가 이미 거르지만, 여기서
     // 통과시키면 "아무것도 검사하지 않은 것"이 `{accepted: [], duplicate: []}`라는 **성공**으로
     // 보이는 형태가 계약에 남는다.
     if (events.length === 0) {
       throw new EventStoreError('empty_batch')
+    }
+
+    // `§1.6` MUST NOT: 출처 값을 얻지 못한 채로 기록하지 않는다. 타입이 인자의 **부재**는
+    // 막지만 빈 문자열은 막지 못하고, 클레임 형식(`0003 §3.2`)의 길이 접두사가 `0`이면
+    // `token.ts`는 그것을 빈 문자열로 읽는다 — 즉 런타임 경로가 남아 있다. 여기서 닫는다
+    // (부르는 쪽은 이 실패를 `500 internal`로 옮긴다, MUST). `encodePayload`와 같은 규율이다:
+    // **통과시키는 쪽으로 무너지지 않는다.**
+    if (provenance.workspaceId === '' || provenance.tokenId === '') {
+      throw new EventStoreError('missing_provenance')
     }
 
     const accepted: StoredEventRef[] = []
@@ -442,7 +588,7 @@ class SqliteEventStore implements EventStore {
       // 요청 배열 순서 그대로다 (`§1.4` MUST). `seq`가 삽입 순서로 늘어나므로 이 루프의
       // 순서가 곧 로그의 전순서 위 자리다 — 정렬하거나 묶어서 넣지 않는다.
       for (const event of events) {
-        this.#insertOne(logId, event, accepted, duplicate)
+        this.#insertOne(logId, event, provenance, accepted, duplicate)
       }
       // 커밋이 돌아온 시점이 `§2.2`의 *"내구화 완료"* 다 — `synchronous=FULL`이라 커밋은 WAL
       // 프레임이 디스크에 닿은 뒤에 돌아온다. 부르는 쪽은 이 `Promise`가 resolve된 **뒤에**
@@ -490,12 +636,19 @@ class SqliteEventStore implements EventStore {
   #insertOne(
     logId: string,
     event: AppendEvent,
+    provenance: EventProvenance,
     accepted: StoredEventRef[],
     duplicate: StoredEventRef[],
   ): void {
     const payload = encodePayload(event.payload)
     try {
-      const changes = this.#insert.run(logId, event.id, payload)
+      const changes = this.#insert.run(
+        logId,
+        event.id,
+        payload,
+        provenance.workspaceId,
+        provenance.tokenId,
+      )
       accepted.push({ id: event.id, cursor: encodeCursor(toSeq(changes.lastInsertRowid)) })
     } catch (error) {
       if (!isUniqueViolation(error)) {
@@ -504,6 +657,11 @@ class SqliteEventStore implements EventStore {
       // first-write-wins (`§2.1` L194): 이번 요청은 위치를 바꾸지 않고, 먼저 저장돼 있던
       // 사본의 커서를 그대로 돌려준다. payload 바이트는 **비교하지 않는다** (L192-193 —
       // 같은 id로 다른 바이트를 밀면 먼저 것이 남는다).
+      //
+      // **출처 값도 마찬가지로 손대지 않는다** (`§1.6` MUST NOT). 이 경로에 `UPDATE`가 없는
+      // 것이 그 조항이다 — 여기서 이번 요청의 `provenance`를 기존 행에 쓰면, 남의 이벤트
+      // 출처를 나중에 미는 쪽이 자기 것으로 바꿀 수 있고 그 순간 이 축은 사칭 가능해진다.
+      // 아래 `SELECT`가 `seq`만 읽는 것도 같은 이유다.
       const row = this.#selectSeqById.get(logId, event.id)
       if (row === undefined) {
         // `UNIQUE`가 충돌했는데 그 행이 없다 — 도달하면 안 되는 상태다. 통과시키지 않는다.

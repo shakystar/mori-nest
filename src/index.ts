@@ -68,9 +68,11 @@ export {
 } from './pull.js'
 export {
   openEventStore,
+  eventProvenanceOf,
   EventStoreError,
   DEFAULT_PAGE_LIMIT,
   type AppendResult,
+  type EventProvenance,
   type EventStore,
   type EventStoreFailure,
   type StoredEventRef,

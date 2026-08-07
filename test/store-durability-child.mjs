@@ -36,6 +36,9 @@ writeSync(1, 'ready\n')
 
 for (let index = 0; ; index++) {
   const id = `r${round}-${index}`
-  await store.append(logId, [{ id, payload: `{"round":${round},"index":${index}}` }])
+  await store.append(logId, [{ id, payload: `{"round":${round},"index":${index}}` }], {
+    workspaceId: 'ws_durable',
+    tokenId: `tok_durable_r${round}`,
+  })
   writeSync(1, `${id}\n`)
 }
