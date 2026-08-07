@@ -77,4 +77,9 @@ export {
   type EventStoreFailure,
   type StoredEventRef,
 } from './store.js'
-export { createTransportServer, type TransportServerOptions } from './server.js'
+export {
+  createTransportServer,
+  type TransportDiagnostic,
+  type TransportDiagnosticSite,
+  type TransportServerOptions,
+} from './server.js'
