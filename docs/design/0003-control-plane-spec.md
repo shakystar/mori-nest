@@ -4,14 +4,18 @@
 사람 결정으로 닫혔다. 2026-08-06 갱신 — §4.9(replica 축, §8-10~§8-12 신설)가 추가됐다. 2026-08-06
 갱신 — `mori-nest` #43(§Q5 S3): join이 기존 프로젝트에 붙는 경로가 부를 조회 표면(§2.4)과 그
 경계(§2.5)를 열었고, 로그 이름 메타데이터의 자리를 §8-13으로 정정했다(§2.1·§2.2의 존재하지 않는
-참조 2건 정정 포함, §4.9가 먼저 §8-10을 신설해 §8-13으로 옮김). §8-2·§8-3은 이 갱신 시점에도
-열려 있다.
+참조 2건 정정 포함, §4.9가 먼저 §8-10을 신설해 §8-13으로 옮김). 2026-08-07 갱신 — `mori-nest` #47
+(§Q5 S2): §4.10(포크 감지와 재발급 지시, advisory, §8-14 신설)이 §4.9 위에 섰다. `#15` 결정의
+전제("UNIQUE + 커서가 감지의 부품을 이미 제공한다")가 거짓임을 근거와 함께 적었다. §8-2·§8-3은
+이 갱신 시점에도 열려 있다.
 근거: [`0001-protocol-requirements.md`](./0001-protocol-requirements.md) §1.4·§2.4·§2.5,
-[`0002-transport-spec.md`](./0002-transport-spec.md) §1.1·§1.2·§5·§8-1·§8-2,
+[`0002-transport-spec.md`](./0002-transport-spec.md) §1.1·§1.2·§5·§7.2·§8-1·§8-2,
 mori-nest [#4](https://github.com/shakystar/mori-nest/issues/4),
 mori-nest [#6](https://github.com/shakystar/mori-nest/issues/6) (사람 결정 ①·②),
+mori-nest [#15](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5198600623),
 mori-nest [#43](https://github.com/shakystar/mori-nest/issues/43),
-`replica-identity-and-join-adjudication.md` §Q4·§Q5 S3,
+mori-nest [#47](https://github.com/shakystar/mori-nest/issues/47),
+`replica-identity-and-join-adjudication.md` §Q2.1·§Q2.4·§Q2.6·§Q4·§Q5 S2·§Q5 S3,
 mori [#115](https://github.com/shakystar/mori/issues/115).
 
 이 문서는 **제어 평면(smart)만** 정한다. 0001 §1.4가 전송/제어 두 평면 경계를 계승할
@@ -1177,6 +1181,126 @@ type ListWorkspacesResponse = {
 replica 단위 되돌림의 실행 형태(§8-12), 두 클론이 같은 `replicaId`를 물려받았을 때(클론 복제로
 값이 그대로 복사되는 경우) 무엇을 할 것인가(§8-10) — 셋 다 이 문서가 아직 정하지 않았다.
 
+### 4.10 포크 감지와 재발급 지시 — advisory
+
+[`mori-nest#15` 결정](https://github.com/shakystar/mori-nest/issues/15#issuecomment-5198600623)은
+포크 감지의 전제로 *"mori-nest#15에서 결정한 이벤트 스토어의 UNIQUE + 커서가 이 감지의 부품을
+이미 제공한다"* 고 적었다. **그 전제는 거짓이다** —
+`replica-identity-and-join-adjudication.md` §Q2.1이 유보 없이 그렇게 판정했고, §Q2.4가 구체
+인터리브로 보였다: `UNIQUE(log_id, event_id)`(§2.1의 스토어 실물)는 감지의 부품이 아니라 두
+replica가 같은 `event_id` 공간을 쓸 때 first-write-wins로 조용한 유실이 나는 **통로**이고, pull·
+subscribe의 커서는 **read 커서**라 push에 실리지 않으며(§Q2.3) 싣는 것 자체가 §7.2가 배제한
+조건부 append다. 이 절은 그 결정이 가리킨 **방향**(감지를 세운다는 것) 자체는 유지하되, 감지가
+실제로 설 수 있는 경로를 `replica-identity-and-join-adjudication.md` §Q2.6대로 다시 세운다 —
+결정을 뒤집는 것이 아니라, 결정이 딛고 선 사실이 달랐음을 기록하는 것이다.
+
+**owner 결정([mori-nest#47](https://github.com/shakystar/mori-nest/issues/47)) — 감지는
+advisory다.** 강제(재발급 전까지 push 거부)는 사실상 배타 제어이고, §7.2(아래)와 0002 §7.2가 두
+평면 **모두**에서 배제한 조정과 부딪힌다. 이 절은 강제를 세우지 않는다 — 세워야 한다는 판단이
+서면 이 절을 다시 여는 것이 아니라 별도 사람 결정으로 올린다
+(`replica-identity-and-join-adjudication.md` §Q5 S2).
+
+#### 판정 규칙 — 커서가 아니라 활성 구간 겹침
+
+**이 절은 §4.9가 세운 축 위에 선다.** §4.9의 문면을 다시 쓰지 않는다 — 재료는 전부 이미 있다:
+`WorkspaceRecord.replicaId`(런처가 개시 시 신고, §4.9)와 `openedAt`·`lastHeartbeatAt`·`endedAt`
+(§4.1·§4.6, 이미 정본). 새 필드는 하나도 늘지 않는다.
+
+- **작업공간의 활성 구간은 `[openedAt, effectiveEnd)`다.** `effectiveEnd`는 종단 상태(§4.1)면 그
+  `endedAt`(`abandoned`의 `endedAt`은 §4.6대로 `lastHeartbeatAt + gracePeriod`)이고, `active`면
+  아직 정해지지 않았다 — 판정 시점까지로 본다. §4.1이 유기 판정에서 쓴 것과 같은 모양이다.
+- **판정: 같은 `replicaId`를 신고한 서로 다른 두 `WorkspaceRecord`의 활성 구간이 겹치면 포크다**
+  (MUST 판정을 실행한다 — 결과의 취급은 advisory다, 아래). *"같은 source id가 두 자리에서 살아
+  있다"* (`replica-identity-and-join-adjudication.md` §Q2.6)를 커서 없이 잡는 것이 규칙의 요지다.
+- **판정은 하트비트 요청 처리 시점에 계산한다** (MUST). 이 작업공간의 활성 구간을 지금(요청
+  시각)까지로 보고, 같은 `replicaId`를 신고한 다른 레코드들과 겹치는지 본다. 별도 스케줄러·배치를
+  요구하지 않는다 (MUST NOT) — §4.1이 유기 판정에서 세운 것과 같은 이유다: 배치가 죽으면 감지가
+  영원히 조용해지고, 조용해진 감지는 "포크가 없다"와 구별되지 않는다.
+- **`replicaId`를 신고하지 않은 작업공간들 사이에서는 판정하지 않는다** (MUST NOT). §4.9의 규칙 —
+  미신고를 전량 일치로 떨어뜨리지 않는다 — 이 여기서도 그대로다. 신고가 없으면 비교할 축이 없다.
+- **자기 자신과는 비교하지 않는다.** 같은 `workspaceId`의 레코드는 겹침 판정에서 제외한다 — 자기
+  자신과는 정의상 항상 겹치므로 그 비교는 의미 없는 참이다.
+
+#### 재발급 지시가 실리는 자리 — 하트비트 응답
+
+`replica-identity-and-join-adjudication.md` §Q2.6 마지막 문단이 후보를 짚고 하트비트를 남겼다.
+이 절이 고른 이유와 버린 후보를 함께 적는다.
+
+| 후보 | 버렸는가 | 이유 |
+|---|---|---|
+| 전송 평면 에러 코드 (0002 §1.5) | **버림** | 0002의 에러 표·라우트 셋을 늘리지 않는다는 것이 owner 결정의 전제다. 에러 코드는 요청이 **실패**했다는 뜻이고, advisory는 실패가 아니다 |
+| subscribe의 `reset` 프레임 (0002 §4.5) | **버림** | 0002 §4.5가 *"`reset`의 `reason`은 사람이 읽는 설명이다. 클라이언트의 대응은 이유와 무관하게 하나다: pull로 따라잡고 다시 연다"* 로 못박았다. 지시를 실으면 그 조항이 깨진다 |
+| append 응답 (0002 §2.1) | **버림** | append는 이벤트 단위 dedup 응답이다. replica 정체성은 제어 평면의 어휘이고(§0), 전송 평면 응답에 실으면 두 평면 경계가 반대 방향으로 샌다 — 전송 평면이 제어 평면의 판정 결과를 실어 나르게 된다 |
+| **하트비트 응답 (`POST …/heartbeat`, §4.3)** | **골랐다** | 제어 평면 안에 있어 §0을 어기지 않는다. 런처가 이미 주기적으로 부르는 라우트이고(§3.4 — 서버가 쥔 주기로), 갱신 시 grant를 재판정해 응답에 싣는 것(§3.4)과 같은 모양이다 — "판정 결과를 다음 응답에 얹는다"가 이 문서의 기존 패턴이다 |
+
+`HeartbeatResponse`(§4.3)에 선택 필드를 더한다:
+
+```ts
+type HeartbeatResponse = {
+  workspaceId: string
+  state: "active"
+  token: string
+  tokenId: string
+  scope: string[]
+  expiresAt: string
+  heartbeatIntervalSeconds: number
+  forkAdvisory?: {                  // 위 판정이 겹침을 찾았을 때만 실린다
+    replicaId: string               // 이 작업공간이 신고한 값과 같다 (§4.9)
+    overlappingWorkspaceId: string  // 겹치는 다른 작업공간의 id
+  }
+}
+```
+
+- **`forkAdvisory`가 실려도 응답 상태코드는 그대로 `200`이고 다른 필드는 바뀌지 않는다** (MUST).
+  **감지는 하트비트를 거부하지 않는다** (MUST NOT) — advisory가 요청의 성패를 바꾸면 그 순간
+  advisory가 아니라 강제다.
+- **지시의 내용은 "재발급을 고려하라"는 신호이지, 무엇을 하라는 명령이 아니다.** 이 필드가 하는
+  일은 `supersedes`(§4.2)·`replicaId`(§4.9)가 이미 하는 일과 같은 층위다 — **서버는 사실을
+  선언하고, 해석과 행동은 런처의 몫이다.** 런처가 다음 개시(§4.2)에서 새 `replicaId`를 신고할지,
+  언제 신고할지는 이 문서가 정하지 않는다 — mori 클라이언트의 몫이다(`mori-nest CLAUDE.md`
+  하드 룰 4, §8-14).
+- **주체 스코프는 여기서도 그대로다** (MUST). `overlappingWorkspaceId`는 **요청 주체가 연
+  작업공간들 사이에서만** 계산한다 — §4.6이 조회에 대해 세운 규칙과 같다. 다른 주체의
+  작업공간과 겹쳤다는 사실을 노출하면 그 자체가 열거 경로이므로, 판정의 비교 대상 자체를 같은
+  주체로 좁힌다.
+
+#### 두 평면 경계를 넘지 않는다
+
+§0의 *"제어 평면은 이벤트를 읽지도 쓰지도 않는다 (MUST NOT)"* 이 여기서도 그대로다.
+
+- **이 판정은 `WorkspaceRecord`만 본다** (MUST). `events` 테이블·커서·payload 어느 것도 읽지
+  않는다. `replica-identity-and-join-adjudication.md` §Q1.4가 후보 (다)에 대해 적은 것 —
+  *"작업공간과 이벤트를 잇는 다리가 어느 문서에도 없다"* — 는 이 판정에 걸리지 않는다. 판정에
+  필요한 재료(`replicaId`·`openedAt`·`lastHeartbeatAt`·`endedAt`)가 전부 §4.9·§4.1이 이미
+  `WorkspaceRecord`에 세운 것이다. §Q1.5가 놓은 "다리"(이벤트의 서버 파생 출처 컬럼 —
+  `mori-nest#31` 산정 S4·S6이 코드로 내렸다, 0002 §1.6)는 **이 판정이 쓰지 않는다** — 그 다리는
+  P2(a, 오귀속 되돌림)의 몫이지 이 절(P3, 포크 감지)의 재료가 아니다. 두 문제가 §Q2.6-1에서
+  출처 축을 공유한다는 것과, 이 판정이 그 축을 **읽는다**는 것은 다른 이야기다.
+- **감지가 이벤트 집합에 대한 술어를 평가하지 않는다.** 이 판정이 묻는 것은 "이 `replicaId`로
+  열린 두 작업공간이 동시에 살아 있었는가"뿐이고, "이 `replicaId`가 이 이벤트를 썼는가"는 묻지
+  않는다 — 후자는 이벤트를 읽어야 답할 수 있고 전자는 `WorkspaceRecord`만으로 답할 수 있다. 이
+  구분이 §0의 MUST NOT을 깨지 않는 이유다.
+
+#### 조정(§7.2)을 끌어들이지 않는다
+
+- **하트비트는 여전히 리스가 아니다** (§7.2, MUST). 겹침이 감지돼도 어느 쪽 작업공간도 끊기지
+  않고, 어느 쪽도 우선순위를 갖지 않는다. 서버는 둘 중 하나를 고르지 않는다 (MUST NOT).
+- **감지는 push를 거부하지 않는다** (MUST NOT). append(0002)는 이 판정을 조회하지 않고, 조회할
+  수도 없다 — 판정이 제어 평면 안에서 끝나기 때문이다(위). 0002의 에러 표·라우트 셋은 이 절로
+  **0건** 늘어난다.
+- **잠금·CAS·조건부 쓰기를 추가하지 않는다** (MUST NOT). `revoke`(§4.5)가 이미 유일한 "끊는"
+  수단이고, 이 절은 그것을 자동으로 부르지 않는다 — 자동으로 부르면 그것이 강제다.
+- 위 세 조항은 §7.2를 다시 쓰는 것이 아니라, §4.10이 §7.2와 **부딪히지 않는지 대조**하는
+  것이다. §7.2의 본문도, 0002의 본문도 이 절이 고치지 않는다.
+
+#### 한계
+
+`replica-identity-and-join-adjudication.md` §Q2.6이 이미 적은 한계가 그대로 옮겨진다: **이 판정은
+"두 사본이 동시에 살아 있다"를 잡지, "한 사본이 죽은 뒤 다른 사본이 이어서 쓴다"를 잡지 못한다.**
+후자는 두 사본이 같은 `event_id`를 만들 때만(0002 §8 미결 3 — 같은 id·다른 바이트) 드러난다 — 이
+절의 advisory와 그 신호는 서로 다르고, 하나가 다른 하나를 대신하지 않는다. 둘을 겹쳐야 커버가
+넓어진다(같은 근거).
+
 ---
 
 ## 5. 0002 §5 불변식 대조표 4번을 닫는다
@@ -1364,3 +1488,8 @@ replica 단위 되돌림의 실행 형태(§8-12), 두 클론이 같은 `replica
     - 재검토 조건: 계정·멤버십 데이터 모델(§7.3이 가리키는, 아직 쓰이지 않은 별도 문서)이 서는
       시점, 또는 join 구현(mori #115 후속)이 실제로 이 공백에 부딪혀 스스로 미룰 수 없게 되는
       시점 중 먼저 오는 쪽.
+14. **advisory 수신 시 런처가 실제로 무엇을 하는가.** §4.10이 신호(`forkAdvisory`)가 실리는 자리와
+    판정 규칙까지 정했다. 그 신호를 받은 런처가 새 `replicaId`를 언제·어떻게 다시 신고하는지(다음
+    개시에서 즉시, 사용자에게 물어서, 재시도 백오프와 함께 등)는 **hub 계약이 아니라 클라이언트
+    (mori) 구현이다**(`mori-nest CLAUDE.md` 하드 룰 4). 서버는 신호를 내보내는 것까지가 몫이고,
+    §4.8이 flush 선언에 대해 세운 것과 같은 경계다 — 서버는 가시성을 만들지 이행을 강제하지 않는다.
