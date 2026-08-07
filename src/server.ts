@@ -99,7 +99,10 @@ import { EventStoreError, eventProvenanceOf, type EventStore } from './store.js'
  * 「리포 전역 관례」 문단이 적는다.
  */
 export type TransportDiagnosticSite =
-  /** {@link handleAppend}의 `store.append`가 던졌다 → `503 not_durable` (또는 `missing_provenance`면 `500 internal`) */
+  /**
+   * {@link handleAppend}의 `store.append`가 던졌다 → `503 not_durable` (`missing_provenance`
+   * 또는 `blank_origin`이면 `500 internal` — 둘 다 내구성이 아니라 출처 축의 결함이다, `§1.6`)
+   */
   | 'append.store'
   /** {@link handlePull}의 `store.readPage`가 던졌다 → `500 internal` */
   | 'pull.store'
@@ -336,8 +339,10 @@ function writeRaw(res: ServerResponse, status: number, body: string): void {
  *
  * `§1.6`: 이 핸들러가 **검증된 토큰**을 받는 것은 출처 값을 기록 층까지 내리기 위해서다. 값을
  * 만드는 것은 `eventProvenanceOf` 하나이고 이 파일은 그 결과를 `store.append`에 넘길 뿐이다 —
- * 요청 본문·헤더·쿼리에서 출처를 읽지 않는다 (MUST NOT). **와이어 계약은 이 변경으로 늘지
- * 않는다**: 응답 본문은 여전히 `{accepted, duplicate}` 그대로이고 출처는 실리지 않는다.
+ * 요청 본문·헤더·쿼리에서 출처를 읽지 않는다 (MUST NOT). `result`(= `store.append`가 돌려준
+ * `AppendResult`)의 `accepted[]`·`duplicate[]`는 이제 각각 `origin`을 싣는다 — 투영은
+ * `store.ts`의 `originOf` 하나가 이미 끝냈고, 이 파일은 다시 계산하지 않고 그대로 옮긴다
+ * (mori-nest #63, `§1.6` 「노출」).
  */
 async function handleAppend(
   store: EventStore,
@@ -366,8 +371,14 @@ async function handleAppend(
     // 훅은 이미 예외 원문을 받았다 — 갈림길 바깥에 두는 것이 "하나만 남는 자리가 없다"의 형태다.
     emit({ site: 'append.store', logId, error })
     // 출처를 얻지 못한 상태는 내구성 문제가 아니라 서버 자신의 결함이다 — `§1.6`이 그 경우를
-    // `503`이 아니라 `500 internal`로 못 박았다 (MUST). 스토어의 다른 실패는 종전대로 `503`이다.
-    if (error instanceof EventStoreError && error.reason === 'missing_provenance') {
+    // `503`이 아니라 `500 internal`로 못 박았다 (MUST). `missing_provenance`(쓰기 전 검사)와
+    // `blank_origin`(방금 읽은 duplicate 사본의 workspace_id가 빈 문자열 — 존재할 수 없는
+    // 값을 만난 경우, `§1.6` 완료 조건) 둘 다 같은 축의 결함이라 같은 code로 옮긴다. 스토어의
+    // 다른 실패는 종전대로 `503`이다.
+    if (
+      error instanceof EventStoreError &&
+      (error.reason === 'missing_provenance' || error.reason === 'blank_origin')
+    ) {
       writeJson(res, 500, errorResponse(ErrorCodes.internal, 'append could not derive its provenance'))
       return
     }
