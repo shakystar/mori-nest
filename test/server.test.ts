@@ -120,7 +120,8 @@ describe('append 라우트 배선 + 최소 HTTP 서버 (0002 §2)', () => {
 
     // 스토어 단위 시험으로는 «배선이 끊겼다»를 잡을 수 없다 — `§1.6`이 지목한 실패 형태가
     // 검증 결과가 기록 층까지 닿지 않는 것이므로, 라우트를 실제로 통과하는 검사가 필요하다.
-    // 출처는 응답에 실리지 않으므로(MUST NOT) 기록 층을 직접 본다.
+    // `tokenId`는 응답에 실리지 않으므로(MUST NOT, mori-nest #63) 기록 층을 직접 본다 —
+    // `workspaceId`가 응답(`accepted[].origin`)에도 실리는 것은 `test/server-origin.test.ts`가 잰다.
     const db = new DatabaseSync(dbPath)
     const row = db
       .prepare('SELECT workspace_id, token_id FROM events WHERE log_id = ? AND event_id = ?')
