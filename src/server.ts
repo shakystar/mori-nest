@@ -17,10 +17,10 @@
  * **두 `413` 경로(본문 전체 `request_too_large`, 단일 이벤트 `event_too_large`) 어느 쪽도
  * `store.append`에 닿지 않는다** — 둘 다 그 앞에서 응답을 끝낸다. 그래서 두 경로는 아무것도
  * 기록하지 않는다: 리포 전체에 `console.*` 호출이 0건이고, 아래 진단 훅을 부르는 자리는
- * **삼킨 예외 넷**({@link TransportDiagnosticSite})뿐인데 두 `413`은 그 넷 중 어디에도 닿지
- * 않는다 (둘 다 예외가 아니라 게이트의 정상 판정이다).
+ * **다섯 자리**({@link TransportDiagnosticSite})뿐인데 두 `413`은 그 다섯 중 어디에도 닿지
+ * 않는다 (둘 다 예외도, 고정 문자열로 덮는 결과 판정도 아니라 게이트의 정상 판정이다).
  *
- * ## 삼킨 예외의 진단 — 주입된 훅 하나로 통일한다 (mori-nest #38)
+ * ## 삼킨 예외의 진단 — 주입된 훅 하나로 통일한다 (mori-nest #38, #51)
  *
  * 세 라우트가 스토어 예외를 `catch`로 삼키고 고정 문자열만 내보내는 것은 `§1.5` L145-146
  * MUST NOT(예외 `message`를 봉투에 싣지 않는다)의 요구다 — **그 규율은 바뀌지 않는다.**
@@ -44,13 +44,23 @@
  * 훅은 **런타임 의존성을 늘리지 않는다** — 로거 라이브러리를 붙이는 대신 출력 매체를 정하지
  * 않고 배포에 넘기는 것이 (1)의 요점이다 (`package.json`의 `dependencies`는 여전히 없다).
  *
- * **이것은 리포 전역 관례다.** 새 라우트가 생기면 그 라우트가 예외를 삼키는 자리도 같은 훅을
- * 탄다: `catch`로 예외를 삼키고 고정 문자열로 응답하는 자리를 새로 만들면 {@link TransportDiagnosticSite}에
- * 이름을 하나 더하고 그 자리에서 `emit`을 부른다. 훅을 부르지 **않는** 자리는 두 종류뿐이고
- * 둘 다 예외가 「진단할 사건」이 아니어서다 — (a) 클라이언트 입력을 판정하는 파서의 `catch`
- * (`body.ts`·`event.ts`·`token.ts`: 예외가 곧 "이 입력은 유효하지 않다"라는 답이고, 정상
- * 운영에서 늘 난다), (b) 이미 끊긴 소켓에 쓰다 나는 `catch`
- * (`SubscribeConnection.#writeFrame`·`#endWithReset`: 연결 종료는 결함이 아니라 수명의 끝이다).
+ * **이것은 리포 전역 관례다 — 축은 `catch`가 아니라 「고정 문자열로 덮는 자리」다 (#51).**
+ * `catch`로 예외를 삼키는 자리 넷(`append.store`·`pull.store`·`subscribe.store`·`request`)이
+ * 지금까지 이 훅을 타는 전부였던 것은 **우연히 그 넷이 전부 `catch`였기 때문**이지, 훅을
+ * 부르는 조건이 `catch` 자체이기 때문이 아니다. `pull.serialize`(아래 {@link handlePull})가
+ * 그 우연을 깬다 — `serializePullResponse`가 실패를 돌려주는 것은 `catch`가 아니라 **결과
+ * 타입 판정**이지만, 서버가 그 결함을 고정 문자열 `500`으로 덮고 운영자에게 아무 흔적도
+ * 남기지 않는다는 점은 스토어 예외와 같다. 그래서 새 라우트·새 실패 경로가 생겼을 때 훅을
+ * 태울지 판단하는 기준은 *"이 자리가 `catch`인가"*가 아니라 *"이 자리가 결함을 고정
+ * 문자열로 덮어 클라이언트에게도 운영자에게도 원래 정보를 남기지 않는가"*다. 그런 자리를
+ * 새로 만들면 {@link TransportDiagnosticSite}에 이름을 하나 더하고 그 자리에서 `emit`을
+ * 부른다. 훅을 부르지 **않는** 자리는 두 종류뿐이고 둘 다 「진단할 사건」이 아니어서다 —
+ * (a) 클라이언트 입력을 판정하는 파서의 `catch` (`body.ts`·`event.ts`·`token.ts`: 예외가 곧
+ * "이 입력은 유효하지 않다"라는 답이고, 정상 운영에서 늘 난다), (b) 이미 끊긴 소켓에 쓰다
+ * 나는 `catch` (`SubscribeConnection.#writeFrame`·`#endWithReset`: 연결 종료는 결함이 아니라
+ * 수명의 끝이다) — 이 둘은 새 축에서도 여전히 제외다: (a)는 애초에 「결함」이 아니라 입력
+ * 판정의 정상 결과이고, (b)는 고정 문자열로 **덮는** 것이 아니라 이미 끊긴 대상에 쓰기를
+ * 포기하는 것이다.
  *
  * ## subscribe가 새 이벤트를 알아채는 방법 — `store.readPage`를 반복해서 부른다
  *
@@ -80,9 +90,10 @@ import type { VerificationKeySet, VerifiedWorkspaceToken } from './token.js'
 import { EventStoreError, eventProvenanceOf, type EventStore } from './store.js'
 
 /**
- * 예외를 삼키고 고정 문자열로 응답하는 자리의 이름. 값 하나가 코드 한 자리에 1:1로 대응한다 —
- * 운영자가 이 값만 보고 어느 라우트의 어느 호출이 깨졌는지 알 수 있어야 하므로, 라우트만도
- * 호출만도 아닌 `<라우트>.<호출>` 꼴로 적는다 (`append.`로 prefix 매칭하면 그 라우트만 걸린다).
+ * 결함을 고정 문자열로 덮는 자리의 이름 (파일 상단 doc의 「리포 전역 관례」 — 축은 `catch`가
+ * 아니다). 값 하나가 코드 한 자리에 1:1로 대응한다 — 운영자가 이 값만 보고 어느 라우트의 어느
+ * 호출이 깨졌는지 알 수 있어야 하므로, 라우트만도 호출만도 아닌 `<라우트>.<호출>` 꼴로 적는다
+ * (`append.`로 prefix 매칭하면 그 라우트만 걸린다).
  *
  * 여기 없는 자리는 훅을 부르지 않는다 — 무엇이 빠져 있고 왜인지는 파일 상단 doc의
  * 「리포 전역 관례」 문단이 적는다.
@@ -92,6 +103,14 @@ export type TransportDiagnosticSite =
   | 'append.store'
   /** {@link handlePull}의 `store.readPage`가 던졌다 → `500 internal` */
   | 'pull.store'
+  /**
+   * {@link handlePull}의 `serializePullResponse`가 `{ok:false}`를 돌려줬다 → `500 internal`.
+   * 다른 넷과 달리 **예외가 아니다** — 던지는 자리가 없고, `store.readPage`가 정상적으로
+   * resolve한 `PullPage`를 `serializePullResponse`가 결과 타입으로 거부한 것이다(`pull.ts`
+   * 결정 1·3, 저장소 쪽 결함). `TransportDiagnostic.error`가 이 자리에서 무엇을 싣는지는
+   * 그 필드 doc을 본다.
+   */
+  | 'pull.serialize'
   /** `SubscribeConnection.#drain`의 `store.readPage`가 던졌다 → `reset` 프레임 */
   | 'subscribe.store'
   /** 라우트 핸들러 **밖**에서 예외가 올라왔다 (`req`/`res` 스트림 오류 등) → `500 internal` */
@@ -100,18 +119,29 @@ export type TransportDiagnosticSite =
 /**
  * 진단 훅이 받는 사건 하나. **와이어에 나가는 값이 아니다** — 이 타입의 어떤 필드도 응답
  * 본문이나 `reset` 프레임에 실리지 않는다 (`§1.5` L145-146 MUST NOT). 반대 방향으로 읽으면:
- * 훅이 받는 것이 예외 **원문 그대로**인 것은, 이 값이 배포의 진단 평면으로만 가고 클라이언트로
- * 가지 않기 때문이다.
+ * 훅이 받는 것이 원문 그대로인 것은, 이 값이 배포의 진단 평면으로만 가고 클라이언트로 가지
+ * 않기 때문이다.
  */
 export type TransportDiagnostic = {
-  /** 예외를 삼킨 자리. */
+  /** 결함을 고정 문자열로 덮은 자리. */
   readonly site: TransportDiagnosticSite
   /**
    * 대상 로그. 게이트를 통과한 값이므로 `§1.1` 정규식을 만족한다 — payload도 토큰도 아니다.
    * `'request'`처럼 게이트 판정 전이라 알 수 없는 자리에서는 부재다.
    */
   readonly logId?: string
-  /** 삼킨 예외 **그대로**. `Error`라는 보장은 없다 (던지는 쪽이 무엇이든 던질 수 있다). */
+  /**
+   * 덮인 결함의 원문. 넷(`append.store`·`pull.store`·`subscribe.store`·`request`)은 **삼킨
+   * 예외 그대로**다 — `Error`라는 보장은 없다(던지는 쪽이 무엇이든 던질 수 있다). 이 넷의
+   * 의미는 `pull.serialize`가 생긴 뒤에도 바뀌지 않는다.
+   *
+   * `pull.serialize`는 예외가 없으므로 다르다 — `serializePullResponse`가 돌려준
+   * `PullResponseFailure` 값(`pull.ts`) 그대로를 싣는다. 타입을 좁히지 않고 기존
+   * `unknown`을 그대로 쓴 것은, 이 필드가 이미 "무엇이든 올 수 있다"는 계약이라 예외가 아닌
+   * 값을 받는 것도 그 계약 안이고, 다섯 자리를 매번 구분해 읽어야 하는 판별 유니온을 여기
+   * 새로 만들 근거가 없기 때문이다 — 어느 자리든 운영자는 `site`로 먼저 갈래를 타고 그 다음
+   * `error`를 그 자리에 맞게 해석한다.
+   */
   readonly error: unknown
 }
 
@@ -361,6 +391,13 @@ async function handleAppend(
  * 나왔다는 뜻이다) 클라이언트 요청 형식과 무관한 `500 internal`로 fail-closed한다.
  * `store.readPage`의 예외(`limit`이 양의 안전 정수가 아니면 등)도 같은 code로 옮긴다 —
  * 게이트가 이미 `limit` 형식·상한을 판정했으므로 정상 경로에서는 닿지 않는다.
+ *
+ * `serializePullResponse`의 실패도 `store.readPage`의 예외와 같은 자격으로 진단 훅을 탄다
+ * (mori-nest #51, 파일 상단 doc의 「리포 전역 관례」) — `catch`가 아니라 `{ok:false}` 결과
+ * 판정이지만, 응답이 고정 문자열 `500`으로 결함을 덮고 운영자에게도 아무 흔적이 남지 않는
+ * 것은 같다. `emit`을 부르는 위치는 이 실패를 판정한 직후, 응답을 쓰기 **전**이다 —
+ * `store.readPage`가 던진 경우와 같은 자리(갈림길 안이 아니라 판정 바로 뒤)에 두어 두 실패
+ * 원인이 같은 규칙으로 보고된다.
  */
 async function handlePull(
   store: EventStore,
@@ -381,6 +418,7 @@ async function handlePull(
 
   const serialized = serializePullResponse(page)
   if (!serialized.ok) {
+    emit({ site: 'pull.serialize', logId, error: serialized.reason })
     writeJson(res, 500, errorResponse(ErrorCodes.internal, 'store returned a page the pull response cannot serialize'))
     return
   }

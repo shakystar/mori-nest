@@ -1,13 +1,15 @@
 /**
- * 삼킨 예외의 진단 규율 (`server.ts` 파일 상단 doc의 「삼킨 예외의 진단」) — mori-nest #38.
+ * 결함을 고정 문자열로 덮는 자리의 진단 규율 (`server.ts` 파일 상단 doc의 「삼킨 예외의 진단」) —
+ * mori-nest #38, #51.
  *
  * 이 파일이 보는 것은 **두 가지가 동시에 성립하는가** 하나뿐이다:
  *
- * 1. 스토어 예외의 `message`가 클라이언트에 닿는 경로가 없다 (`0002 §1.5` L145-146 MUST NOT).
- *    그래서 던지는 예외의 메시지를 **식별 가능한 마커 문자열**로 두고, 응답 본문·`reset`
+ * 1. 덮인 결함의 원문이 클라이언트에 닿는 경로가 없다 (`0002 §1.5` L145-146 MUST NOT). 그래서
+ *    스토어 예외는 **식별 가능한 마커 문자열**을 메시지로 두고, `pull.serialize`(예외가 아닌
+ *    결과 판정)는 응답 봉투가 이 이슈 **전과 한 글자도 같은지**를 본다 — 응답 본문·`reset`
  *    프레임 어디에도 그 문자열이 없음을 본다 — 봉투를 필드별로 다시 검사하는 대신 원문
  *    전체를 훑는 것은, 「어느 필드로도 새지 않는다」가 필드 목록보다 강한 진술이기 때문이다.
- * 2. 그 예외가 주입한 훅에는 **원문 그대로** 닿는다.
+ * 2. 그 결함이 주입한 훅에는 **원문 그대로** 닿는다.
  *
  * 라우트 자신의 동작(정상 경로의 상태코드·봉투·프레임)은 `test/server.test.ts`·
  * `test/server-pull.test.ts`·`test/server-subscribe.test.ts`가 이미 덮는다 — 여기서 다시 쓰지
@@ -37,6 +39,19 @@ function explodingStore(): EventStore {
   return {
     append: () => Promise.reject(new Error(MARKER)),
     readPage: () => Promise.reject(new Error(MARKER)),
+    close: () => Promise.resolve(),
+  }
+}
+
+/**
+ * `readPage`가 **던지지 않고** `serializePullResponse`가 거부하는 `PullPage`로 resolve하는
+ * 스토어(`pull.ts` 결정 1 — `hasMore: true`인데 `events`가 비었다). `pull.serialize`는 예외가
+ * 아니라 이 결과 타입 판정에서 나므로, `explodingStore`(던지는 쪽)로는 이 자리를 겨눌 수 없다.
+ */
+function corruptPullPageStore(): EventStore {
+  return {
+    append: () => Promise.reject(new Error(MARKER)),
+    readPage: () => Promise.resolve({ events: [], hasMore: true, from: 'known' }),
     close: () => Promise.resolve(),
   }
 }
@@ -197,5 +212,23 @@ describe('삼킨 스토어 예외의 진단 규율 (mori-nest #38)', () => {
     // 게이트 판정 전이라 대상 로그를 알 수 없다.
     expect(seen[0]?.logId).toBeUndefined()
     expect((seen[0]?.error as Error).message).toBe(MARKER)
+  })
+
+  it('⑦ pull: serializePullResponse 실패도 같은 규율을 탄다 (site: "pull.serialize", mori-nest #51)', async () => {
+    const { baseUrl, seen } = await start({ store: corruptPullPageStore() })
+
+    const res = await pull(baseUrl)
+    const raw = await res.text()
+
+    expect(res.status).toBe(500)
+    expect(JSON.parse(raw)).toEqual({
+      error: { code: 'internal', message: 'store returned a page the pull response cannot serialize' },
+    })
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.site).toBe('pull.serialize')
+    expect(seen[0]?.logId).toBe(LOG_ID)
+    // 예외가 아니라 `serializePullResponse`가 돌려준 실패 사유 그대로다.
+    expect(seen[0]?.error).toBe('has_more_without_events')
   })
 })
