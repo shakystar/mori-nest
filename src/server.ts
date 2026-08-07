@@ -15,9 +15,42 @@
  * (mori-nest #29·#30 착수 시점 owner 코멘트).
  *
  * **두 `413` 경로(본문 전체 `request_too_large`, 단일 이벤트 `event_too_large`) 어느 쪽도
- * `store.append`에 닿지 않는다** — 둘 다 그 앞에서 응답을 끝낸다. 이 파일에 로깅 인프라가
- * 없으므로(리포 전체에 `console.*` 호출이 없다) 두 경로 모두 아무것도 기록하지 않는다는
- * 완료 조건이 구조로 성립한다.
+ * `store.append`에 닿지 않는다** — 둘 다 그 앞에서 응답을 끝낸다. 그래서 두 경로는 아무것도
+ * 기록하지 않는다: 리포 전체에 `console.*` 호출이 0건이고, 아래 진단 훅을 부르는 자리는
+ * **삼킨 예외 넷**({@link TransportDiagnosticSite})뿐인데 두 `413`은 그 넷 중 어디에도 닿지
+ * 않는다 (둘 다 예외가 아니라 게이트의 정상 판정이다).
+ *
+ * ## 삼킨 예외의 진단 — 주입된 훅 하나로 통일한다 (mori-nest #38)
+ *
+ * 세 라우트가 스토어 예외를 `catch`로 삼키고 고정 문자열만 내보내는 것은 `§1.5` L145-146
+ * MUST NOT(예외 `message`를 봉투에 싣지 않는다)의 요구다 — **그 규율은 바뀌지 않는다.**
+ * 문제는 삼킨 예외가 서버 쪽에도 남지 않아, 스토어가 깨졌을 때 운영자가 볼 수 있는 것이
+ * 상태코드 하나뿐이었다는 것이다. 셋을 재고 (1)을 골랐다.
+ *
+ * - **(1) 호출자가 주입하는 훅 — 골랐다.** *닫는 것*: 삼킨 예외 전부가 배포가 정한 진단
+ *   평면에 닿는다. 봉투는 그대로이므로 와이어 계약은 0건 바뀐다. *대가*: 아무것도 주입하지
+ *   않은 배포에서는 여전히 아무 흔적도 남지 않는다(기본값이 no-op이다) — 진단을 켜는 것이
+ *   배포의 명시적 행위가 된다. 라이브러리 표면이 필드 하나 늘고, 주입된 콜백이 던지는
+ *   경우를 이 파일이 감당해야 한다(아래 {@link diagnosticSink}).
+ * - **(2) `console.error` 직접 호출 — 버렸다.** *닫는 것*: 가장 짧고 아무 주입 없이도 흔적이
+ *   남는다. *대가*: 라이브러리가 배포의 로그 평면을 대신 정한다. `createTransportServer`는
+ *   라이브러리 표면이고 이 파일은 이미 「배포가 정하는 것」(`now`·`subscribeBacklogLimitBytes`·
+ *   `maxEventBytes`)을 전부 주입으로 받는 관례 위에 서 있다 — stderr 점유는 그 축을 깨고,
+ *   테스트마다 그것을 억제해야 하며, 구조화 로그를 쓰는 배포는 이 출력을 다시 파싱해야 한다.
+ * - **(3) 아무것도 하지 않고 근거만 남긴다 — 버렸다.** *닫는 것*: 표면이 0으로 유지된다.
+ *   *대가*: 운영 진단이 계속 없다. 이 이슈가 열린 이유 자체가 그 상태이므로 근거를 적는
+ *   것으로 닫히지 않는다.
+ *
+ * 훅은 **런타임 의존성을 늘리지 않는다** — 로거 라이브러리를 붙이는 대신 출력 매체를 정하지
+ * 않고 배포에 넘기는 것이 (1)의 요점이다 (`package.json`의 `dependencies`는 여전히 없다).
+ *
+ * **이것은 리포 전역 관례다.** 새 라우트가 생기면 그 라우트가 예외를 삼키는 자리도 같은 훅을
+ * 탄다: `catch`로 예외를 삼키고 고정 문자열로 응답하는 자리를 새로 만들면 {@link TransportDiagnosticSite}에
+ * 이름을 하나 더하고 그 자리에서 `emit`을 부른다. 훅을 부르지 **않는** 자리는 두 종류뿐이고
+ * 둘 다 예외가 「진단할 사건」이 아니어서다 — (a) 클라이언트 입력을 판정하는 파서의 `catch`
+ * (`body.ts`·`event.ts`·`token.ts`: 예외가 곧 "이 입력은 유효하지 않다"라는 답이고, 정상
+ * 운영에서 늘 난다), (b) 이미 끊긴 소켓에 쓰다 나는 `catch`
+ * (`SubscribeConnection.#writeFrame`·`#endWithReset`: 연결 종료는 결함이 아니라 수명의 끝이다).
  *
  * ## subscribe가 새 이벤트를 알아채는 방법 — `store.readPage`를 반복해서 부른다
  *
@@ -45,6 +78,42 @@ import { verifyTransportRequest, type CursorStart, type RawRequest } from './req
 import { serializeAppendFrame, serializeHeartbeatFrame, serializeOpenFrame, serializeResetFrame } from './sse.js'
 import type { VerificationKeySet, VerifiedWorkspaceToken } from './token.js'
 import { EventStoreError, eventProvenanceOf, type EventStore } from './store.js'
+
+/**
+ * 예외를 삼키고 고정 문자열로 응답하는 자리의 이름. 값 하나가 코드 한 자리에 1:1로 대응한다 —
+ * 운영자가 이 값만 보고 어느 라우트의 어느 호출이 깨졌는지 알 수 있어야 하므로, 라우트만도
+ * 호출만도 아닌 `<라우트>.<호출>` 꼴로 적는다 (`append.`로 prefix 매칭하면 그 라우트만 걸린다).
+ *
+ * 여기 없는 자리는 훅을 부르지 않는다 — 무엇이 빠져 있고 왜인지는 파일 상단 doc의
+ * 「리포 전역 관례」 문단이 적는다.
+ */
+export type TransportDiagnosticSite =
+  /** {@link handleAppend}의 `store.append`가 던졌다 → `503 not_durable` (또는 `missing_provenance`면 `500 internal`) */
+  | 'append.store'
+  /** {@link handlePull}의 `store.readPage`가 던졌다 → `500 internal` */
+  | 'pull.store'
+  /** `SubscribeConnection.#drain`의 `store.readPage`가 던졌다 → `reset` 프레임 */
+  | 'subscribe.store'
+  /** 라우트 핸들러 **밖**에서 예외가 올라왔다 (`req`/`res` 스트림 오류 등) → `500 internal` */
+  | 'request'
+
+/**
+ * 진단 훅이 받는 사건 하나. **와이어에 나가는 값이 아니다** — 이 타입의 어떤 필드도 응답
+ * 본문이나 `reset` 프레임에 실리지 않는다 (`§1.5` L145-146 MUST NOT). 반대 방향으로 읽으면:
+ * 훅이 받는 것이 예외 **원문 그대로**인 것은, 이 값이 배포의 진단 평면으로만 가고 클라이언트로
+ * 가지 않기 때문이다.
+ */
+export type TransportDiagnostic = {
+  /** 예외를 삼킨 자리. */
+  readonly site: TransportDiagnosticSite
+  /**
+   * 대상 로그. 게이트를 통과한 값이므로 `§1.1` 정규식을 만족한다 — payload도 토큰도 아니다.
+   * `'request'`처럼 게이트 판정 전이라 알 수 없는 자리에서는 부재다.
+   */
+  readonly logId?: string
+  /** 삼킨 예외 **그대로**. `Error`라는 보장은 없다 (던지는 쪽이 무엇이든 던질 수 있다). */
+  readonly error: unknown
+}
 
 export type TransportServerOptions = {
   readonly store: EventStore
@@ -78,6 +147,51 @@ export type TransportServerOptions = {
    * 하나를 공유한다 — 서로 다른 임의값을 지어내지 않는다).
    */
   readonly maxRequestBytes?: number
+  /**
+   * 삼킨 예외 하나를 배포의 진단 평면으로 넘기는 훅 (파일 상단 doc의 「삼킨 예외의 진단」).
+   * 부재면 no-op이다 — **부재가 곧 지금까지의 동작**이고, 주입해도 응답·프레임 봉투는 한
+   * 글자도 바뀌지 않는다.
+   *
+   * 이 훅은 **응답을 쓰기 전에, 동기로** 불린다. 그래서 두 가지를 지켜야 한다: (a) 오래 붙잡지
+   * 말 것 — 여기서 블로킹하면 그만큼 응답이 늦는다. (b) 던져도 된다 — 이 파일이 그 예외를
+   * 받아 삼키고 응답 경로를 그대로 이어간다 ({@link diagnosticSink}). 진단 실패가 요청 실패로
+   * 번지지 않는다.
+   *
+   * **진단 평면을 민감한 곳으로 다뤄라.** `§1.5` MUST NOT이 막는 것은 예외 원문이 **와이어에**
+   * 실리는 것이고, 이 훅은 그 반대편이다 — 훅이 받는 `error`는 이 파일이 편집하지 않은 원문
+   * 그대로이므로, 스토어 아래 계층(`node:sqlite` 등)이 던진 예외라면 그 `message`에 SQL 조각이나
+   * payload 바이트가 섞여 있을 수 있다. 그것을 **다시 클라이언트로 돌려보내는 배포는 이 조항을
+   * 우회하는 것이다**: 훅에 넣는 출력은 운영자만 보는 평면으로 보내고, 응답으로 되돌리지 않는다.
+   */
+  readonly onDiagnostic?: (diagnostic: TransportDiagnostic) => void
+}
+
+/** 삼킨 예외 하나를 진단 훅으로 넘긴다. 주입이 없으면 아무것도 하지 않는다. */
+type DiagnosticSink = (diagnostic: TransportDiagnostic) => void
+
+/**
+ * 주입된 훅을 {@link DiagnosticSink}로 감싼다. 감싸는 이유는 하나뿐이다: **훅이 던져도 요청
+ * 경로가 그것 때문에 무너지지 않아야 한다.** 훅은 배포가 준 코드이고 이 파일이 그 동작을
+ * 보장할 수 없는데, 훅의 예외가 그대로 올라가면 `503`으로 끝났어야 할 요청이 `500`이 되거나
+ * (`handleRequest`를 감싼 자리가 받는다) subscribe 연결이 `reset` 없이 끊긴다 — 진단을 켰다는
+ * 이유로 관찰 가능한 동작이 바뀌는 셈이라, 봉투 불변("주입해도 봉투는 바뀌지 않는다")을 깬다.
+ *
+ * 훅의 예외를 다시 훅으로 보고하지 않는다 — 그 훅이 또 던지면 끝나지 않는다. 진단 평면 자신의
+ * 고장을 이 파일이 보고할 자리는 없다(그것을 보고할 곳이 바로 고장난 그 평면이다).
+ */
+function diagnosticSink(hook: ((diagnostic: TransportDiagnostic) => void) | undefined): DiagnosticSink {
+  if (hook === undefined) {
+    return () => {
+      // no-op — 주입하지 않은 배포의 동작은 이 이슈 이전과 같다.
+    }
+  }
+  return (diagnostic) => {
+    try {
+      hook(diagnostic)
+    } catch {
+      // 진단 실패가 요청 실패로 번지지 않는다 (위 doc).
+    }
+  }
 }
 
 function toRawRequest(req: IncomingMessage): RawRequest {
@@ -202,6 +316,7 @@ async function handleAppend(
   token: VerifiedWorkspaceToken,
   rawBody: string,
   maxEventBytes: number,
+  emit: DiagnosticSink,
   res: ServerResponse,
 ): Promise<void> {
   const parsed = parseAppendRequest(rawBody, { maxEventBytes })
@@ -217,6 +332,9 @@ async function handleAppend(
     // 헤더·쿼리에서 출처를 읽는 코드가 이 파일에 없다 (MUST NOT).
     result = await store.append(logId, parsed.events, eventProvenanceOf(token))
   } catch (error) {
+    // 삼키기 **전에** 진단으로 넘긴다 (파일 상단 doc). 아래 두 응답 어느 쪽으로 갈라지든 이
+    // 훅은 이미 예외 원문을 받았다 — 갈림길 바깥에 두는 것이 "하나만 남는 자리가 없다"의 형태다.
+    emit({ site: 'append.store', logId, error })
     // 출처를 얻지 못한 상태는 내구성 문제가 아니라 서버 자신의 결함이다 — `§1.6`이 그 경우를
     // `503`이 아니라 `500 internal`로 못 박았다 (MUST). 스토어의 다른 실패는 종전대로 `503`이다.
     if (error instanceof EventStoreError && error.reason === 'missing_provenance') {
@@ -249,12 +367,14 @@ async function handlePull(
   logId: string,
   start: CursorStart,
   limit: number | undefined,
+  emit: DiagnosticSink,
   res: ServerResponse,
 ): Promise<void> {
   let page
   try {
     page = await store.readPage(logId, start, limit)
-  } catch {
+  } catch (error) {
+    emit({ site: 'pull.store', logId, error })
     writeJson(res, 500, errorResponse(ErrorCodes.internal, 'pull page could not be read'))
     return
   }
@@ -460,6 +580,7 @@ class SubscribeConnection {
   readonly #req: IncomingMessage
   readonly #res: ServerResponse
   readonly #backlogLimitBytes: number
+  readonly #emit: DiagnosticSink
   readonly #logId: string
   readonly #waker = new Waker()
   readonly #closeSignal = new OnceSignal()
@@ -504,11 +625,13 @@ class SubscribeConnection {
     req: IncomingMessage,
     res: ServerResponse,
     backlogLimitBytes: number,
+    emit: DiagnosticSink,
   ) {
     this.#store = store
     this.#req = req
     this.#res = res
     this.#backlogLimitBytes = backlogLimitBytes
+    this.#emit = emit
     this.#logId = logId
     this.#cursor = start
 
@@ -591,7 +714,10 @@ class SubscribeConnection {
       let page: PullPage
       try {
         page = await this.#store.readPage(this.#logId, this.#cursor)
-      } catch {
+      } catch (error) {
+        // `reset`의 `reason`은 종전대로 고정 문자열이다 (`§4.5` L443 — 클라이언트의 대응은
+        // 이유와 무관하게 하나다). 예외 원문이 가는 곳은 진단 훅뿐이다.
+        this.#emit({ site: 'subscribe.store', logId: this.#logId, error })
         this.#endWithReset('subscribe could not read the log')
         return false
       }
@@ -711,6 +837,7 @@ async function handleRequest(
   broker: LogBroker,
   maxEventBytes: number,
   maxRequestBytes: number,
+  emit: DiagnosticSink,
 ): Promise<void> {
   const gateOptions: { now?: Date; maxLimit?: number } = {}
   if (options.now !== undefined) {
@@ -747,13 +874,14 @@ async function handleRequest(
       result.request.token,
       body.body,
       maxEventBytes,
+      emit,
       res,
     )
     return
   }
 
   if (result.request.route === 'pull') {
-    await handlePull(options.store, result.request.logId, result.request.start, result.request.limit, res)
+    await handlePull(options.store, result.request.logId, result.request.start, result.request.limit, emit, res)
     return
   }
 
@@ -766,6 +894,7 @@ async function handleRequest(
     req,
     res,
     backlogLimitBytes,
+    emit,
   )
   await connection.run()
 }
@@ -797,10 +926,17 @@ export function createTransportServer(options: TransportServerOptions): Server {
   }
 
   const broker = new LogBroker()
+  const emit = diagnosticSink(options.onDiagnostic)
   return createServer((req, res) => {
-    handleRequest(req, res, options, broker, maxEventBytes, maxRequestBytes).catch(() => {
+    handleRequest(req, res, options, broker, maxEventBytes, maxRequestBytes, emit).catch((error: unknown) => {
       // `req`/`res` 스트림 자체의 오류(연결이 끊기는 등)만 여기 닿는다 — 게이트·스토어의
       // 실패는 `handleRequest` 안에서 이미 응답으로 끝난다. 이미 끊긴 연결에 다시 쓰지 않는다.
+      //
+      // 이 자리도 예외를 삼키므로 같은 규율을 탄다 (파일 상단 doc). `logId`를 싣지 않는 것은
+      // 게이트 판정 결과가 여기까지 내려오지 않아서다 — 예외가 게이트 **전에** 났을 수도 있다.
+      // 응답을 쓸 수 있는지와 무관하게 부른다: 응답이 이미 끝난 뒤라 아무 상태코드도 못 남기는
+      // 경우가 오히려 흔적이 가장 필요한 경우다.
+      emit({ site: 'request', error })
       if (!res.writableEnded) {
         writeJson(res, 500, errorResponse(ErrorCodes.internal, 'unexpected server error'))
       }
