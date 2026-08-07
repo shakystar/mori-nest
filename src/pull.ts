@@ -84,10 +84,11 @@
 
 import type { AppendEvent } from './event.js'
 import type { OpenFrom } from './sse.js'
+import type { Origin } from './store.js'
 
 /**
  * pull 응답에 실리는 이벤트 하나 (`§3.1` L291). `event.ts`가 돌려준 이벤트에 저장소가 붙인
- * 커서 하나를 더한 것이다.
+ * 커서와 출처를 더한 것이다.
  *
  * `payload`가 **원문 조각**이라는 계약이 그대로 이어진다 ({@link AppendEvent} 참조) —
  * 이 파일은 그 값을 파싱하지도 재직렬화하지도 않는다.
@@ -95,7 +96,9 @@ import type { OpenFrom } from './sse.js'
  * `sse.ts`의 `AppendFrameEvent`와 모양이 같다. 이름을 재사용하지 않은 것은 그 이름이 SSE
  * **프레임**에 묶여 있기 때문이고, 값 집합이 아니라 구조를 가진 타입이라 둘이 갈라질 자리가
  * 없다 — 구조 타입이므로 부르는 쪽은 어느 쪽 이름으로 만든 값이든 그대로 넘길 수 있다.
- * (`from`의 `OpenFrom`은 반대다 — 값 집합이 같으므로 타입을 새로 만들지 않고 import한다.)
+ * (`from`의 `OpenFrom`은 반대다 — 값 집합이 같으므로 타입을 새로 만들지 않고 import한다.
+ * `origin`의 `Origin`도 마찬가지 이유로 `store.js`에서 import한다 — 만드는 자리가
+ * {@link Origin}을 정의한 `originOf` 하나뿐이어야 하므로 새 타입을 만들지 않는다.)
  */
 export type PullEvent = AppendEvent & {
   /**
@@ -104,6 +107,11 @@ export type PullEvent = AppendEvent & {
    * (`sse.ts`가 `id:` 줄 때문에 커서를 검사해야 했던 것과 다른 자리다).
    */
   readonly cursor: string
+  /**
+   * `§1.6`의 와이어 출처. 저장소가 `undefined`로 두면(v1 시절 행, 출처를 물을 수 없음) 응답에
+   * `origin` 키가 아예 없다 — 이 함수는 그 부재를 그대로 옮길 뿐 판정하지 않는다.
+   */
+  readonly origin?: Origin
 }
 
 /**
@@ -152,15 +160,20 @@ export type PullResponseResult =
   | { readonly ok: false; readonly reason: PullResponseFailure }
 
 /**
- * 이벤트 하나를 `§3.1` L291의 선언 순서(`id` → `payload` → `cursor`)로 손조립한다.
+ * 이벤트 하나를 `§3.1` L291의 선언 순서(`id` → `payload` → `cursor` → `origin`)로 손조립한다.
  *
- * `payload`만 **원문을 그대로 이어 붙이고**, `id`·`cursor`는 문자열이므로 `JSON.stringify`로
- * 정상 직렬화한다 — 그 둘은 이스케이프를 지나므로 어떤 문자가 와도 문서를 깨뜨리지 못한다.
+ * `payload`만 **원문을 그대로 이어 붙이고**, `id`·`cursor`·`origin`은 `JSON.stringify`로
+ * 정상 직렬화한다 — 그 셋은 이스케이프를 지나므로 어떤 값이 와도 문서를 깨뜨리지 못한다.
  * `sse.ts`의 `data:` 문서와 같은 모양이고, 같은 이유로 `payload`에는 `JSON.stringify`를
  * 부르지 않는다.
+ *
+ * `origin`이 `undefined`면 **키 자체를 내지 않는다** (`§1.6` — 부재는 `null`이나 `{}`가
+ * 아니다). `JSON.stringify(undefined)`는 `undefined`(문자열이 아님)를 돌려주므로, 조건 없이
+ * 이었으면 `"origin":undefined`라는 JSON이 아닌 조각이 나갔을 것이다.
  */
 function serializeEvent(event: PullEvent): string {
-  return `{"id":${JSON.stringify(event.id)},"payload":${event.payload},"cursor":${JSON.stringify(event.cursor)}}`
+  const origin = event.origin === undefined ? '' : `,"origin":${JSON.stringify(event.origin)}`
+  return `{"id":${JSON.stringify(event.id)},"payload":${event.payload},"cursor":${JSON.stringify(event.cursor)}${origin}}`
 }
 
 /**

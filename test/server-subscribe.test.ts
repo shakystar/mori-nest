@@ -146,7 +146,14 @@ describe('subscribe 라우트 배선 — 연결 수명·재개·백프레셔 (00
     const appended = await reader.next()
     expect(appended?.event).toBe('append')
     expect(appended?.id).toBe(cursor)
-    expect(JSON.parse(appended?.data ?? '')).toEqual({ id: 'e1', payload: { id: 'e1' }, cursor })
+    // `origin`이 실리는 것은 mori-nest #63(`§1.6` 「노출」)의 배선이다 — 이 테스트가 재는 것은
+    // 프레임 배선(§4)이므로 `workspaceId`는 시드에 쓴 토큰의 것을 그대로 기대한다.
+    expect(JSON.parse(appended?.data ?? '')).toEqual({
+      id: 'e1',
+      payload: { id: 'e1' },
+      cursor,
+      origin: { workspaceId: baseClaims().workspaceId },
+    })
 
     await reader.cancel()
   })

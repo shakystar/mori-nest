@@ -161,6 +161,13 @@ export type EventStoreFailure =
   | 'duplicate_without_stored_copy'
   /** `§1.6`의 출처 값이 비어 있다 — 그 상태로는 이벤트를 기록하지 않는다 (MUST NOT) */
   | 'missing_provenance'
+  /**
+   * 저장된 행의 `workspace_id`가 빈 문자열이다. `append`가 빈 값을 막으므로(`missing_provenance`)
+   * v2가 쓴 행에는 나타날 수 없는 값이고, 만났다면 행 자체의 결함이다. `NULL`(= v1 시절 행,
+   * {@link originOf}가 `undefined`로 투영)과 다른 경우다 — `§1.6`이 빈 문자열 `origin`을
+   * 내보내는 것을 MUST NOT으로 막았으므로 여기서 fail-closed한다.
+   */
+  | 'blank_origin'
 
 /**
  * 스토어의 실패. `message`는 {@link EventStoreFailure}와 같은 고정 문자열이고, 클라이언트가
@@ -178,12 +185,27 @@ export class EventStoreError extends Error {
 
 /**
  * 로그에 자리를 얻은 이벤트 하나. `§2.1`의 `AppendResponse`가 `accepted`·`duplicate` 양쪽에
- * 싣는 모양 그대로다 (`{ id, cursor }`).
+ * 싣는 모양 그대로다 (`{ id, cursor, origin? }`).
+ *
+ * `origin`이 선택 필드인 것은 v1 시절 행(출처를 물을 수 없음)을 표현할 자리가 필요해서다
+ * (`§1.6`). `accepted`는 이 필드가 **언제나 있다** — 그 보장은 이 타입이 아니라
+ * {@link AcceptedEventRef}가 진다.
  */
 export type StoredEventRef = {
   readonly id: string
   /** {@link EventStore.readPage}가 해석할 수 있는 커서 (알파벳은 {@link encodeCursor}). */
   readonly cursor: string
+  /** `§1.6`의 와이어 출처. 만드는 자리는 {@link originOf} 하나뿐이다. */
+  readonly origin?: Origin
+}
+
+/**
+ * `accepted`에 실리는 참조. `origin`이 **선택 필드가 아니다** (`§1.6` — 새로 기록된 행에는
+ * 출처가 없을 수 없다, `append`가 빈 값을 `missing_provenance`로 이미 막았다). 타입으로
+ * 그 보장을 세운다 — 부르는 쪽이 검사 없이 `origin.workspaceId`를 읽을 수 있다.
+ */
+export type AcceptedEventRef = StoredEventRef & {
+  readonly origin: Origin
 }
 
 /**
@@ -195,12 +217,14 @@ export type StoredEventRef = {
  * all-or-nothing을 MUST로 적었고, 실패는 값이 아니라 예외({@link EventStoreError})다.
  */
 export type AppendResult = {
-  readonly accepted: readonly StoredEventRef[]
+  readonly accepted: readonly AcceptedEventRef[]
   readonly duplicate: readonly StoredEventRef[]
 }
 
 /**
- * `§1.6`의 서버 파생 출처 값 — **기록에만 남고 와이어에는 나오지 않는다.**
+ * `§1.6`의 서버 파생 출처 값 — 이 타입 **자신은 기록에만 남고 와이어에는 나오지 않는다.**
+ * 와이어에 나오는 것은 이 값을 {@link originOf}로 투영한 {@link Origin}이다 (`tokenId`가 빠진
+ * 부분집합).
  *
  * 필드가 둘뿐인 것이 조항 그대로다: `workspaceId`는 귀속·되돌림의 축(`0003 §4.6`),
  * `tokenId`는 발급 건의 축(`0003 §3.8`)이고 **둘 다 적는다** (MUST). 토큰 문자열 자체와
@@ -224,6 +248,45 @@ export type EventProvenance = {
  */
 export function eventProvenanceOf(token: VerifiedWorkspaceToken): EventProvenance {
   return { workspaceId: token.claims.workspaceId, tokenId: token.claims.tokenId }
+}
+
+/**
+ * `§1.6` 「노출」의 와이어 투영 — `EventProvenance`에서 `tokenId`를 뺀 것. append·pull·SSE 세
+ * 응답 자리에 실리는 것은 언제나 이 타입이지 {@link EventProvenance}가 아니다 (MUST NOT —
+ * `tokenId`는 기록에만 남는다). 필드가 하나뿐인 것도 타입에 자리가 없으면 실수로 실릴 수도
+ * 없다는 같은 규율이다.
+ */
+export type Origin = {
+  readonly workspaceId: string
+}
+
+/**
+ * `workspaceId`를 와이어에 노출 가능한 {@link Origin}으로 투영한다 — **이 함수를 거치지 않고
+ * `EventProvenance`나 저장된 컬럼 값을 응답 자리에 옮기지 않는다** (`eventProvenanceOf`가
+ * 「클레임을 읽는 자리는 하나」로 세운 것과 같은 규율).
+ *
+ * 두 오버로드가 두 호출 자리를 그대로 반영한다:
+ * - **`string`** — 방금 이 요청이 기록한 행의 출처(`provenance.workspaceId`, `append`가 이미
+ *   빈 값이 아님을 검사했다). 결과가 항상 있다 — `accepted[].origin`이 **선택 필드가 아닌**
+ *   이유가 이 오버로드다.
+ * - **`string | null`** — DB에서 그대로 읽은 컬럼 값. `null`은 v1 시절 행(출처를 물을 수
+ *   없음)이고 `undefined`로 투영된다 — `§1.6`이 부재의 뜻을 하나로 못박았으므로 이 함수도
+ *   부재를 하나로만 표현한다(값을 지어내거나 가리는 대신 그대로 없앤다).
+ *
+ * 빈 문자열은 **두 오버로드 모두에서** 던진다(`blank_origin`) — v2가 쓴 행에는 나타날 수 없는
+ * 값이므로(`append`의 `missing_provenance` 검사), 만났다면 「있음으로 읽히는 빈 값」을
+ * 내보내는 대신 fail-closed한다 (`§1.6` MUST NOT).
+ */
+export function originOf(workspaceId: string): Origin
+export function originOf(workspaceId: string | null): Origin | undefined
+export function originOf(workspaceId: string | null): Origin | undefined {
+  if (workspaceId === null) {
+    return undefined
+  }
+  if (workspaceId === '') {
+    throw new EventStoreError('blank_origin')
+  }
+  return { workspaceId }
 }
 
 /**
@@ -404,11 +467,31 @@ function columnAsSeq(value: SQLOutputValue | undefined): number {
 }
 
 /**
+ * 행에서 `workspace_id` 컬럼을 꺼낸다. `TEXT`(v2가 쓴 행) 또는 `NULL`(v1 시절 행, `§1.6`)만
+ * 유효한 모양이다 — 그 밖의 타입이 오면 컬럼이 스키마와 다른 뜻으로 쓰인 것이므로 fail-closed.
+ * `undefined`(컬럼 자체가 SELECT에 없음)도 여기서 걸린다.
+ */
+function columnAsWorkspaceId(value: SQLOutputValue | undefined): string | null {
+  if (value === null) {
+    return null
+  }
+  if (typeof value === 'string') {
+    return value
+  }
+  throw new EventStoreError('unexpected_row_shape')
+}
+
+/**
  * 저장된 행 하나를 `pull.ts`가 쓰는 이벤트로 되돌린다.
  *
  * `payload`는 BLOB(= 넣을 때의 UTF-8 바이트)이고, 여기서 UTF-8로 디코드한 것이 **넣은 원문
  * 조각과 같은 문자열**이다 — {@link SqliteEventStore.append}가 넣기 전에 그 왕복을 검사해
  * 통과한 것만 기록하기 때문이다 (`§1.3` L96 MUST).
+ *
+ * `origin`은 {@link originOf}로 `workspace_id` 컬럼을 투영한 값이다 — `NULL`(v1 시절 행)은
+ * `undefined`가 되어 `origin` 키 자체가 응답에 없다 (`§1.6`). `token_id` 컬럼은 이 함수도
+ * 이 함수를 부르는 `#selectPage`도 읽지 않는다 — 애초에 SELECT 목록에 없으므로 새는 경로가
+ * 타입에도 SQL에도 없다.
  */
 function toPullEvent(row: Record<string, SQLOutputValue>): PullEvent {
   const eventId = row['event_id']
@@ -416,10 +499,15 @@ function toPullEvent(row: Record<string, SQLOutputValue>): PullEvent {
   if (typeof eventId !== 'string' || !(payload instanceof Uint8Array)) {
     throw new EventStoreError('unexpected_row_shape')
   }
+  // `exactOptionalPropertyTypes`: `origin?: Origin`에 `undefined`를 값으로 대입할 수 없다 —
+  // 부재는 **키가 없는 것**이지 `origin: undefined`가 아니다. 그래서 조건부 스프레드로
+  // 키 자체를 만들지 여부를 가른다.
+  const origin = originOf(columnAsWorkspaceId(row['workspace_id']))
   return {
     id: eventId,
     payload: Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength).toString('utf8'),
     cursor: encodeCursor(columnAsSeq(row['seq'])),
+    ...(origin === undefined ? {} : { origin }),
   }
 }
 
@@ -543,17 +631,21 @@ class SqliteEventStore implements EventStore {
       'INSERT INTO events (log_id, event_id, payload, workspace_id, token_id) VALUES (?, ?, ?, ?, ?)',
     )
     // 이 SELECT는 **선판정이 아니다.** `UNIQUE` 제약이 이미 "이미 있다"를 판정한 뒤, `§2.1`
-    // L194가 요구하는 *"먼저 저장돼 있던 사본의 커서"* 를 가져오려고 부른다. 부르는 자리는
-    // {@link append}의 `catch` 안 하나뿐이고, 같은 트랜잭션 안이라 그 사이에 값이 바뀌지 않는다.
-    this.#selectSeqById = db.prepare('SELECT seq FROM events WHERE log_id = ? AND event_id = ?')
+    // L194가 요구하는 *"먼저 저장돼 있던 사본의 커서"* 와 그 사본의 `workspace_id`(`§1.6`
+    // `duplicate[].origin` — 이번 요청의 것이 아니라 **먼저 저장된 사본**의 것이어야 한다)를
+    // 가져오려고 부른다. 부르는 자리는 {@link append}의 `catch` 안 하나뿐이고, 같은 트랜잭션
+    // 안이라 그 사이에 값이 바뀌지 않는다. `token_id`는 **읽지 않는다** — SELECT 목록에 없으면
+    // 그 값이 응답 자리로 새는 경로가 타입 이전에 SQL에서부터 없다.
+    this.#selectSeqById = db.prepare('SELECT seq, workspace_id FROM events WHERE log_id = ? AND event_id = ?')
     // 커서 해석(`§3.2`). 다른 로그의 `seq`를 보내면 `log_id`가 걸러 **미지**가 된다 (`§1.4` —
     // *"다른 로그의 커서를 보내면 미지 커서로 취급된다"*).
     this.#selectSeqExists = db.prepare('SELECT 1 AS ok FROM events WHERE log_id = ? AND seq = ?')
     // `§3.1` L307-311: 커서 해석·정렬이 **끝난 뒤** 앞에서부터 취한다. `LIMIT ?`에 한 건을 더
     // 얹어 읽는 것이 `hasMore` 판정이다 — 별도의 `COUNT(*)`를 돌리면 그 사이에 append가 끼어
-    // 개수와 페이지가 서로 다른 순간을 가리킬 수 있다.
+    // 개수와 페이지가 서로 다른 순간을 가리킬 수 있다. `workspace_id`는 `§1.6`의 `origin`
+    // 투영을 위해서고, `token_id`는 여기도 읽지 않는다.
     this.#selectPage = db.prepare(
-      'SELECT seq, event_id, payload FROM events WHERE log_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?',
+      'SELECT seq, event_id, payload, workspace_id FROM events WHERE log_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?',
     )
   }
 
@@ -578,7 +670,7 @@ class SqliteEventStore implements EventStore {
       throw new EventStoreError('missing_provenance')
     }
 
-    const accepted: StoredEventRef[] = []
+    const accepted: AcceptedEventRef[] = []
     const duplicate: StoredEventRef[] = []
 
     // `BEGIN IMMEDIATE`인 것은 이 트랜잭션이 반드시 쓰기 때문이다. 지연 트랜잭션(`BEGIN`)은
@@ -637,7 +729,7 @@ class SqliteEventStore implements EventStore {
     logId: string,
     event: AppendEvent,
     provenance: EventProvenance,
-    accepted: StoredEventRef[],
+    accepted: AcceptedEventRef[],
     duplicate: StoredEventRef[],
   ): void {
     const payload = encodePayload(event.payload)
@@ -649,7 +741,14 @@ class SqliteEventStore implements EventStore {
         provenance.workspaceId,
         provenance.tokenId,
       )
-      accepted.push({ id: event.id, cursor: encodeCursor(toSeq(changes.lastInsertRowid)) })
+      // `provenance.workspaceId`는 이 시점에 이미 검증됐다 (`append`의 빈 값 검사) — `originOf`의
+      // `string` 오버로드가 그래서 `Origin | undefined`가 아니라 `Origin`을 돌려준다
+      // (`accepted[].origin`이 선택 필드가 아니라는 타입 보장이 여기서 나온다).
+      accepted.push({
+        id: event.id,
+        cursor: encodeCursor(toSeq(changes.lastInsertRowid)),
+        origin: originOf(provenance.workspaceId),
+      })
     } catch (error) {
       if (!isUniqueViolation(error)) {
         throw error
@@ -661,13 +760,22 @@ class SqliteEventStore implements EventStore {
       // **출처 값도 마찬가지로 손대지 않는다** (`§1.6` MUST NOT). 이 경로에 `UPDATE`가 없는
       // 것이 그 조항이다 — 여기서 이번 요청의 `provenance`를 기존 행에 쓰면, 남의 이벤트
       // 출처를 나중에 미는 쪽이 자기 것으로 바꿀 수 있고 그 순간 이 축은 사칭 가능해진다.
-      // 아래 `SELECT`가 `seq`만 읽는 것도 같은 이유다.
+      // 아래 `SELECT`가 `workspace_id`를 읽되 `token_id`는 읽지 않는 것도 같은 이유다 —
+      // `duplicate[].origin`은 **먼저 저장된 사본**의 것이어야 하므로(같은 원자 단위 안에서
+      // 읽는다, `§1.6` 완료 조건) 이번 요청의 `provenance`가 아니라 이 SELECT의 값을 쓴다.
       const row = this.#selectSeqById.get(logId, event.id)
       if (row === undefined) {
         // `UNIQUE`가 충돌했는데 그 행이 없다 — 도달하면 안 되는 상태다. 통과시키지 않는다.
         throw new EventStoreError('duplicate_without_stored_copy')
       }
-      duplicate.push({ id: event.id, cursor: encodeCursor(columnAsSeq(row['seq'])) })
+      // `exactOptionalPropertyTypes`: `toPullEvent`와 같은 이유로 조건부 스프레드를 쓴다 —
+      // 부재는 `origin: undefined`가 아니라 키가 없는 것이다.
+      const origin = originOf(columnAsWorkspaceId(row['workspace_id']))
+      duplicate.push({
+        id: event.id,
+        cursor: encodeCursor(columnAsSeq(row['seq'])),
+        ...(origin === undefined ? {} : { origin }),
+      })
     }
   }
 
