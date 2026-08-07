@@ -18,7 +18,7 @@
  * 페이지를 고르는 것까지가 전부다.
  *
  * `server.js`가 그 둘(게이트 → 본문 게이트 → 스토어 → 응답)을 처음 잇는 조각이다
- * (mori-nest #28). 지금은 `append` 라우트만 배선됐다 — pull·subscribe는 후속 조각이다.
+ * (mori-nest #28). `append`·`pull`·`subscribe` 세 라우트가 모두 배선돼 있다 (mori-nest #29·#30).
  */
 
 export { ErrorCodes, errorResponse, type ErrorCode, type ErrorResponse } from './errors.js'
