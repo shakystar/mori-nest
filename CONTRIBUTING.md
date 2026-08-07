@@ -15,18 +15,24 @@
 예: `docs/design/0002-transport-spec.md:84-89`.
 (선례: `docs/replica-identity-and-join-adjudication.md` §부록.)
 
-같은 문서 안에서 같은 파일을 반복 인용할 때는 전체 경로 대신, 이미 한 번 전체 경로로
-밝힌 파일을 가리키는 짧은 이름으로 줄인다 — 번호가 붙은 스펙 문서는 `0002:110`처럼
-번호로, 그 외 파일은 `src/store.ts:101` 다음에 이어지는 `:374-385`처럼 줄 번호만으로.
-(선례: `docs/selective-removal-and-retention-adjudication.md:57-59` §0.3 "리포 루트
-상대 경로 + `:줄`, 같은 문서 안에서 반복될 때는 `0002:110`으로 줄인다"; 실사용 예 —
-`docs/replica-identity-and-join-adjudication.md:791` `` `src/store.ts:101`, `:374-385` ``.)
+같은 문서 안에서 반복 인용하는 파일은 본문에서 짧은 이름으로 쓴다 — 번호가 붙은 스펙
+문서는 `0002:110-111`처럼 번호로, 그 외 파일은 `src/store.ts:101` 다음에 이어지는
+`:374-385`처럼 줄 번호만으로. **전체 경로는 본문이 아니라 `## 부록 — 이 산정이 인용한
+것` 표에 모아 둔다** — 축약형이 어느 파일을 가리키는지는 그 표가 해소한다.
+(선례: `docs/selective-removal-and-retention-adjudication.md:57-59` §0.3가 관례를
+진술하고, `:478-` 부록 표가 전체 경로를 모은다; `docs/replica-identity-and-join-adjudication.md:759-`도
+같다.)
 
 절 참조(`0002 §1.4`처럼 번호+§+절 번호)는 줄 참조와 함께, 또는 줄 참조 대신 쓴다 — 정확한
 줄보다 절 전체를 가리키고 싶을 때, 그리고 줄이 밀려도 절로 되찾을 수 있는 앵커를 남기고
 싶을 때다.
-(선례: `docs/selective-removal-and-retention-adjudication.md:67` `` `0003:1444-1446` (§8-4) ``;
-`docs/replica-identity-and-join-adjudication.md:105` `` `0002-transport-spec.md:110-111` (§1.4) ``.)
+(선례: `docs/selective-removal-and-retention-adjudication.md:67` `` `0003:1444-1446` (§8-4) ``.)
+
+> 참고 — `docs/replica-identity-and-join-adjudication.md:105`의
+> `` `0002-transport-spec.md:110-111` (§1.4) ``는 절 참조는 맞지만 경로 형태가 위 「경로
+> 형태」 규칙에서 이탈한 혼종 표기다(접두 `docs/design/` 없음, 축약형도 아님). **따라
+> 쓰지 마라** — 같은 문서 부록(`:769`)의 `docs/design/0002-transport-spec.md:110-111`이
+> 정식 형태다.
 
 ### 기준 커밋 명시
 
