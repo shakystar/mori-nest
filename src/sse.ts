@@ -74,6 +74,7 @@
  */
 
 import type { AppendEvent } from './event.js'
+import type { Origin } from './store.js'
 
 /**
  * `§4.3` L395의 `from` 3변이.
@@ -85,10 +86,13 @@ import type { AppendEvent } from './event.js'
 export type OpenFrom = 'beginning' | 'known' | 'unknown'
 
 /**
- * `append` 프레임의 입력. `event.ts`가 돌려준 이벤트에 저장소가 붙인 커서 하나를 더한 것이다.
+ * `append` 프레임의 입력. `event.ts`가 돌려준 이벤트에 저장소가 붙인 커서와 출처를 더한 것이다.
  *
  * `payload`가 **원문 조각**이라는 계약이 그대로 이어진다 ({@link AppendEvent} 참조) —
  * 이 파일은 그 값을 파싱하지도 재직렬화하지도 않는다.
+ *
+ * `pull.ts`의 `PullEvent`와 모양이 같고, `Origin`을 `store.js`에서 import하는 이유도 같다
+ * (`pull.ts`의 `PullEvent` doc 참조) — 만드는 자리가 `originOf` 하나뿐이어야 한다.
  */
 export type AppendFrameEvent = AppendEvent & {
   /**
@@ -96,6 +100,12 @@ export type AppendFrameEvent = AppendEvent & {
    * 않고, `id:` 줄에 실을 수 있는지만 본다 (결정 2).
    */
   readonly cursor: string
+  /**
+   * `§1.6`의 와이어 출처. `undefined`면(v1 시절 행) `data:` 문서에 `origin` 키가 아예 없다 —
+   * `pull.ts`의 `serializeEvent`와 같은 판정이다 (`§4.5`가 두 경로를 갈아탈 수 있게 요구하므로
+   * 부재의 표현도 같아야 한다).
+   */
+  readonly origin?: Origin
 }
 
 /**
@@ -214,6 +224,10 @@ export function serializeOpenFrame(from: OpenFrom): string {
  * 무관하게 여기서는 `JSON.stringify`를 지나 `data:` 값 안으로 들어가므로 제어문자가 와도
  * 이스케이프되어 줄을 끊지 못한다. 줄을 끊을 수 있는 것은 이스케이프를 지나지 않는 둘 —
  * 원문 조각인 `payload`와 `id:` 줄에 날것으로 실리는 `cursor` — 뿐이고, 그 둘만 본다.
+ *
+ * `origin`도 `JSON.stringify`를 지나므로 검사할 것이 없다 (`Origin`은 `workspaceId` 문자열
+ * 하나뿐이라 어떤 값이 와도 이스케이프된다). `undefined`면 `origin` 키를 내지 않는다
+ * (`pull.ts`의 `serializeEvent`와 같은 판정 — `§4.5`가 두 경로의 동일성을 요구한다).
  */
 export function serializeAppendFrame(event: AppendFrameEvent): AppendFrameResult {
   if (!isRepresentablePayload(event.payload)) {
@@ -222,7 +236,8 @@ export function serializeAppendFrame(event: AppendFrameEvent): AppendFrameResult
   if (!isRepresentableCursor(event.cursor)) {
     return { ok: false, reason: 'cursor_not_representable' }
   }
-  const data = `{"id":${JSON.stringify(event.id)},"payload":${event.payload},"cursor":${JSON.stringify(event.cursor)}}`
+  const origin = event.origin === undefined ? '' : `,"origin":${JSON.stringify(event.origin)}`
+  const data = `{"id":${JSON.stringify(event.id)},"payload":${event.payload},"cursor":${JSON.stringify(event.cursor)}${origin}}`
   return { ok: true, frame: frame('append', data, event.cursor) }
 }
 
