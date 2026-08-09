@@ -1,9 +1,9 @@
 /**
- * 제어 평면 요청 판정 (`verifyControlRequest`, mori-nest #83·#93 — #68 라우트 조각 1/2).
+ * 제어 평면 요청 판정 (`verifyControlRequest`, mori-nest #83·#93·#102 — #68 라우트 조각 1/2).
  *
- * #83 이슈 본문이 못박은 아홉 건 + #93 이슈 본문이 못박은 두 건(`§2.6` revoke 판정)이고,
- * 그 이상 만들지 않는다. HTTP 서버·라우트 실행(스토어를 실제로 부르는 배선)은 라우트
- * 조각 2/2다 — 여기서는 다루지 않는다.
+ * #83 이슈 본문이 못박은 아홉 건 + #93 이슈 본문이 못박은 두 건(`§2.6` revoke 판정) + #102
+ * 이슈 본문이 못박은 네 건(`§4.2` openWorkspace 판정)이고, 그 이상 만들지 않는다. HTTP
+ * 서버·라우트 실행(스토어를 실제로 부르는 배선)은 라우트 조각 2/2다 — 여기서는 다루지 않는다.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -161,6 +161,77 @@ describe('verifyControlRequest — POST /v1/logs/{logId}/revoke', () => {
     if (result.ok) return
     expect(result.status).toBe(400)
     expect(result.error.error.code).toBe('malformed_request')
+  })
+})
+
+describe('verifyControlRequest — POST /v1/workspaces', () => {
+  function openReq(token: string, headers: Readonly<Record<string, string>> = {}): RawRequest {
+    return {
+      method: 'POST',
+      url: '/v1/workspaces',
+      headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'key-1', ...headers },
+    }
+  }
+
+  it('⑫ 유효 자격증명 + { logs: ["log-a"] } + Idempotency-Key → openWorkspace 판정, logs·idempotencyKey가 실리고 replicaId를 안 보냈으면 그 필드가 없다 (§4.2)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-k')
+
+    const result = await verifyControlRequest(openReq(token), JSON.stringify({ logs: ['log-a'] }), store)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.request.route).toBe('openWorkspace')
+    if (result.request.route !== 'openWorkspace') return
+    expect(result.request.subject).toBe('subject-k')
+    expect(result.request.logs).toEqual(['log-a'])
+    expect(result.request.idempotencyKey).toBe('key-1')
+    expect('replicaId' in result.request).toBe(false)
+  })
+
+  it('⑬ logs가 빈 배열이면 → 400 empty_scope, logs 원소가 LOG_ID_PATTERN 위반이면 → 400 invalid_log_id (§4.2)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-l')
+
+    const emptyResult = await verifyControlRequest(openReq(token), JSON.stringify({ logs: [] }), store)
+    expect(emptyResult.ok).toBe(false)
+    if (emptyResult.ok) return
+    expect(emptyResult.status).toBe(400)
+    expect(emptyResult.error.error.code).toBe('empty_scope')
+
+    const invalidResult = await verifyControlRequest(openReq(token), JSON.stringify({ logs: ['not valid'] }), store)
+    expect(invalidResult.ok).toBe(false)
+    if (invalidResult.ok) return
+    expect(invalidResult.status).toBe(400)
+    expect(invalidResult.error.error.code).toBe('invalid_log_id')
+  })
+
+  it('⑭ Idempotency-Key가 없으면 → 400 missing_idempotency_key (§4.2)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-m')
+
+    const result = await verifyControlRequest(
+      { method: 'POST', url: '/v1/workspaces', headers: { authorization: `Bearer ${token}` } },
+      JSON.stringify({ logs: ['log-a'] }),
+      store,
+    )
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(400)
+    expect(result.error.error.code).toBe('missing_idempotency_key')
+  })
+
+  it('⑮ POST 아닌 메서드 → 405, Allow: POST (§4.2)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+
+    const result = await verifyControlRequest({ method: 'GET', url: '/v1/workspaces', headers: {} }, '', store)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(405)
+    expect(result.error.error.code).toBe('method_not_allowed')
+    expect(result.headers['Allow']).toBe('POST')
   })
 })
 
