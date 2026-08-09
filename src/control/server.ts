@@ -821,8 +821,9 @@ async function handleHeartbeatWorkspace(
     return
   }
 
+  let beat
   try {
-    await options.workspaces.heartbeat(subject, workspaceId, { gracePeriodMs })
+    beat = await options.workspaces.heartbeat(subject, workspaceId, { gracePeriodMs })
   } catch (error) {
     if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_found') {
       writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
@@ -850,7 +851,10 @@ async function handleHeartbeatWorkspace(
 
   writeJson(response, 200, {
     workspaceId,
-    state: 'active',
+    // 위 `getWorkspace`가 본 값이 아니라 **전이가 확정한 값**이다 (`§4.1` — 원본은 `heartbeat`).
+    // 여기에 `'active'`를 상수로 적으면 스토어가 다른 상태를 돌려줄 수 있게 되는 날 응답이
+    // 조용히 거짓말을 한다.
+    state: beat.state,
     token: issued.token,
     tokenId: issued.tokenId,
     scope,
