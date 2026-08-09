@@ -1,7 +1,7 @@
 /**
- * 제어 평면의 요청 판정 — 런처 자격 게이트 + 로그 라우트 4종 판별
- * (`0003 §1.1`·`§1.2`·`§1.3`·`§1.4`·`§2.1`·`§2.2`·`§2.4`·`§2.6`, mori-nest #68 라우트 조각 1/2 ·
- * #83 · #93).
+ * 제어 평면의 요청 판정 — 런처 자격 게이트 + 로그 라우트 4종 + 작업공간 개시 판별
+ * (`0003 §1.1`·`§1.2`·`§1.3`·`§1.4`·`§2.1`·`§2.2`·`§2.4`·`§2.6`·`§4.2`·`§4.9`, mori-nest #68
+ * 라우트 조각 1/2 · #83 · #93 · #102).
  *
  * `src/transport/request.ts`와 같은 모양이다: **판정 함수 하나.** HTTP 응답을 쓰지 않고,
  * 판정 결과(해석된 요청, 또는 `§1.3`의 에러 봉투 + 상태코드)를 **반환**할 뿐이다. 다른 점
@@ -9,15 +9,16 @@
  * 평면에는 [내구성 단일 장애점] 제약이 없다"), 이 함수는 async이고 {@link LauncherCredentialStore}를
  * 주입받는다.
  *
- * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 중 넷이다 — `POST /v1/logs`(`§2.1`),
- * `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`), `POST /v1/logs/{logId}/revoke`(`§2.6`).
- * 나머지 다섯(작업공간 개시·하트비트·종료·폐기·조회)은 이 조각의 비범위다.
+ * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 중 다섯이다 — `POST /v1/logs`(`§2.1`),
+ * `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`), `POST /v1/logs/{logId}/revoke`(`§2.6`),
+ * `POST /v1/workspaces`(`§4.2`, 컬렉션 경로만 — 하위 경로는 비범위, mori-nest #102 이슈 본문).
+ * 나머지 넷(작업공간 하트비트·종료·폐기·조회)은 이 조각의 비범위다.
  *
- * 이 파일에는 HTTP 서버도 스토어 호출(`isGranted`·`createLog`·`revoke`)도 없다 — 그것은
- * 라우트 배선(`./server.js`, mori-nest #83 이슈 본문 "후속")의 몫이다. `src/transport/`를
- * import하지 않는 것도 같은 경계 규율이다(`src/control/index.ts` 상단 doc) — 아래 헬퍼들이
- * `src/transport/request.ts`의 것과 모양이 겹치는 것은 우연이 아니라 같은 문제를 각 평면이
- * 독립적으로 풀기 때문이다.
+ * 이 파일에는 HTTP 서버도 스토어 호출(`isGranted`·`createLog`·`revoke`·`openWorkspace`·
+ * `issueWorkspaceToken`)도 없다 — 그것은 라우트 배선(`./server.js`, mori-nest #83 이슈 본문
+ * "후속")의 몫이다. `src/transport/`를 import하지 않는 것도 같은 경계 규율이다
+ * (`src/control/index.ts` 상단 doc) — 아래 헬퍼들이 `src/transport/request.ts`의 것과 모양이
+ * 겹치는 것은 우연이 아니라 같은 문제를 각 평면이 독립적으로 풀기 때문이다.
  */
 
 import { parseBody } from '../body.js'
@@ -37,8 +38,13 @@ const BEARER_CREDENTIALS = /^Bearer (\S+)$/i
 /** `0003 §3.1`과 같은 형식(양의 정수만) — `limit` 쿼리의 값 형식. */
 const LIMIT_PATTERN = /^[1-9][0-9]*$/
 
-/** `0003 §2.2`: 서버가 발급할 식별자를 제안하는 것으로 읽히는 최상위 필드 이름들. */
-const CLIENT_MINTED_ID_FIELDS = new Set(['logId', 'id', 'name'])
+/** `0003 §2.2`: 서버가 발급할 식별자를 제안하는 것으로 읽히는 최상위 필드 이름들. 로그와
+ * 작업공간 둘 다 서버 mint이므로 `workspaceId`도 이 집합에 든다(`§2.2`·`§4.2` MUST). */
+const CLIENT_MINTED_ID_FIELDS = new Set(['logId', 'id', 'name', 'workspaceId'])
+
+/** `0003 §4.9`: `replicaId := ^[A-Za-z0-9_-]{1,128}$` — `0002 §1.1`의 `logId`와 같은
+ * 모양이지만 축이 다르므로(§4.9) `LOG_ID_PATTERN`과 별도로 옮겨 적는다. */
+const REPLICA_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 
 /** `/v1/logs` 경로의 세그먼트. */
 const PATH_PREFIX = ['', 'v1', 'logs'] as const
@@ -48,6 +54,13 @@ const REVOKE_SUFFIX = 'revoke'
 
 /** `§2.6`의 `RevokeLogRequest` 본문에서 게이트가 아는 최상위 필드. */
 const REVOKE_BODY_FIELDS = ['reason']
+
+/** `/v1/workspaces` 경로의 세그먼트(`§4.2`). 컬렉션 경로 하나만 판별한다 — 하위 경로
+ * (하트비트·종료·폐기·조회, `§4.3`~`§4.6`)는 이 조각의 비범위다(mori-nest #102 이슈 본문). */
+const WORKSPACE_PATH_PREFIX = ['', 'v1', 'workspaces'] as const
+
+/** `§4.2`의 `OpenWorkspaceRequest` 본문에서 게이트가 아는 최상위 필드. */
+const OPEN_WORKSPACE_BODY_FIELDS = ['logs', 'supersedes', 'replicaId']
 
 /** Node 표준 HTTP 서버가 넘겨주는 요청 객체와 모양만 맞는 요청 입력. `src/transport/request.ts`의
  * `RawRequest`와 같은 모양이지만 독립적으로 정의한다 — import하면 그 자체로 평면 경계가 깨진다. */
@@ -59,7 +72,7 @@ export type RawRequest = {
 
 /** 이 게이트가 판별하는 라우트 셋. `ControlStore`의 메서드 이름과 나란히 둔다
  * (`createLog`·`listLogsForSubject`). */
-export type ControlRoute = 'createLog' | 'listLogs' | 'getLog' | 'revokeLog'
+export type ControlRoute = 'createLog' | 'listLogs' | 'getLog' | 'revokeLog' | 'openWorkspace'
 
 /**
  * 게이트를 통과한 요청. `subject`는 항상 런처 자격증명 조회로만 해석된다(`§1.2` MUST NOT —
@@ -92,6 +105,14 @@ export type ControlRequest =
       readonly subject: string
       readonly logId: string
       readonly reason?: string
+    }
+  | {
+      readonly route: 'openWorkspace'
+      readonly subject: string
+      readonly logs: readonly string[]
+      readonly supersedes?: string
+      readonly replicaId?: string
+      readonly idempotencyKey: string
     }
 
 /** 이 게이트가 낼 수 있는 상태코드. 전부 `0003 §1.3` 표에 있는 것뿐이다. */
@@ -260,6 +281,70 @@ function checkRevokeLogBody(raw: string): { readonly ok: true; readonly reason?:
   return { ok: true, reason }
 }
 
+/**
+ * `POST /v1/workspaces`의 본문 (`§4.2`) — `OpenWorkspaceRequest`.
+ *
+ * `client_minted_id`가 `malformed_request`보다 우선하는 것은 {@link checkCreateLogBody}와
+ * 같은 이유다(`§2.2`) — `workspaceId`도 `CLIENT_MINTED_ID_FIELDS`에 들어 있으므로 이 재판정이
+ * 그대로 걸린다. 그다음 `logs` 형식(`empty_scope`·`invalid_log_id`), 그다음 `replicaId` 형식
+ * (`invalid_replica_id`, `§4.9`), 마지막으로 `supersedes`는 타입만 본다(문자열인가) — 가리키는
+ * 것이 존재하는지·같은 주체의 것인지는 스토어가 답한다(이 조각의 비범위, 이슈 #102 본문).
+ */
+function checkOpenWorkspaceBody(
+  raw: string,
+):
+  | {
+      readonly ok: true
+      readonly logs: readonly string[]
+      readonly supersedes?: string
+      readonly replicaId?: string
+    }
+  | { readonly ok: false; readonly error: ErrorResponse } {
+  const parsed = parseBody(raw, OPEN_WORKSPACE_BODY_FIELDS)
+  if (!parsed.ok) {
+    const unknownFields = parsed.error.error.details?.['unknownFields']
+    const proposesIdentifier =
+      Array.isArray(unknownFields) &&
+      unknownFields.some((field) => typeof field === 'string' && CLIENT_MINTED_ID_FIELDS.has(field))
+    if (proposesIdentifier) {
+      return {
+        ok: false,
+        error: errorResponse(ErrorCodes.client_minted_id, 'request body proposes a server-minted identifier'),
+      }
+    }
+    return { ok: false, error: parsed.error }
+  }
+
+  const logs = parsed.body['logs']
+  if (!Array.isArray(logs) || logs.length === 0) {
+    return { ok: false, error: errorResponse(ErrorCodes.empty_scope, 'logs must be a non-empty array') }
+  }
+  const isValidLogId = (logId: unknown): logId is string => typeof logId === 'string' && LOG_ID_PATTERN.test(logId)
+  if (!logs.every(isValidLogId)) {
+    return { ok: false, error: errorResponse(ErrorCodes.invalid_log_id, 'logs contains an invalid log id') }
+  }
+
+  const replicaId = parsed.body['replicaId']
+  if (replicaId !== undefined && (typeof replicaId !== 'string' || !REPLICA_ID_PATTERN.test(replicaId))) {
+    return {
+      ok: false,
+      error: errorResponse(ErrorCodes.invalid_replica_id, 'replicaId does not match the required shape'),
+    }
+  }
+
+  const supersedes = parsed.body['supersedes']
+  if (supersedes !== undefined && typeof supersedes !== 'string') {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'supersedes must be a string') }
+  }
+
+  return {
+    ok: true,
+    logs,
+    ...(supersedes === undefined ? {} : { supersedes }),
+    ...(replicaId === undefined ? {} : { replicaId }),
+  }
+}
+
 /** 자격 부재·형식 오류의 고정 `401`. `src/transport/request.ts`의 같은 이름 함수와 같은
  * 이유로 `details`가 없다 — 받은 헤더 값을 되비추지 않는다. */
 function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }> {
@@ -290,6 +375,9 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *    - `revokeLog`: 본문 형태(`§2.6` — `reason`이 있는데 문자열이 아니면
  *      `400 malformed_request`). `Idempotency-Key`를 요구하지 않는다(`§2.6`의 멱등은
  *      연산 자체가 성립시킨다, 이슈 #93 본문).
+ *    - `openWorkspace`: 본문 형태(`§4.2` — `client_minted_id` → `logs`(`empty_scope`·
+ *      `invalid_log_id`) → `replicaId`(`invalid_replica_id`, `§4.9`) → `supersedes`(타입만,
+ *      `malformed_request`)) 그다음 `Idempotency-Key` 형식(`§1.4`).
  * 4. **자격** — `Authorization: Bearer <런처 자격증명>` → `credentials.verify`. 아니면 `401`.
  *    작업공간 토큰이 이 자리에서 걸린다: 그 값은 이 스토어에 조회되는 해시와 절대
  *    일치하지 않으므로 `verify`가 그대로 `401`을 낸다(`§1.1`) — 이 파일에 작업공간 토큰을
@@ -317,7 +405,9 @@ export async function verifyControlRequest(
 ): Promise<ControlRequestResult> {
   const { path, query } = splitTarget(request.url)
 
-  // ── 1: 라우트 해석. `/v1/logs`(셋) · `/v1/logs/{logId}`(넷) · `/v1/logs/{logId}/revoke`(다섯)뿐이다.
+  // ── 1: 라우트 해석. `/v1/logs`(셋) · `/v1/logs/{logId}`(넷) · `/v1/logs/{logId}/revoke`(다섯) ·
+  // `/v1/workspaces`(셋, 컬렉션 경로만 — 하위 경로는 세그먼트 수가 달라 아래 어느 것과도 매치되지
+  // 않고 `malformed_request`로 떨어진다)뿐이다.
   const segments = path.split('/')
   const prefixMatches = PATH_PREFIX.every((expected, index) => segments[index] === expected)
   const isCollection = prefixMatches && segments.length === PATH_PREFIX.length
@@ -328,13 +418,16 @@ export async function verifyControlRequest(
       ? (segments[PATH_PREFIX.length] ?? '')
       : ''
   const isRevoke = revokeLogIdSegment !== ''
+  const isOpenWorkspace =
+    WORKSPACE_PATH_PREFIX.every((expected, index) => segments[index] === expected) &&
+    segments.length === WORKSPACE_PATH_PREFIX.length
 
-  if (!isCollection && !hasLogId && !isRevoke) {
+  if (!isCollection && !hasLogId && !isRevoke && !isOpenWorkspace) {
     return reject(400, errorResponse(ErrorCodes.malformed_request, 'request target is not a control route'))
   }
 
   // ── 2: 메서드.
-  const allowedMethods = isRevoke ? ['POST'] : hasLogId ? ['GET'] : ['POST', 'GET']
+  const allowedMethods = isRevoke ? ['POST'] : hasLogId ? ['GET'] : isOpenWorkspace ? ['POST'] : ['POST', 'GET']
   const allowHeader: Readonly<Record<string, string>> = { Allow: allowedMethods.join(', ') }
   const methodCheck = checkMethod(request.method, allowedMethods)
   if (!methodCheck.ok) {
@@ -342,6 +435,34 @@ export async function verifyControlRequest(
   }
 
   // ── 3: 라우트별 문법.
+  if (isOpenWorkspace) {
+    const bodyCheck = checkOpenWorkspaceBody(body)
+    if (!bodyCheck.ok) {
+      return reject(400, bodyCheck.error)
+    }
+    const idempotencyHeader = atMostOne(headerValues(request.headers, 'idempotency-key'))
+    const parsedKey = parseIdempotencyKey(idempotencyHeader.ok ? idempotencyHeader.value : undefined)
+    if (!parsedKey.ok) {
+      return reject(400, errorResponse(ErrorCodes.missing_idempotency_key, 'a valid Idempotency-Key header is required'))
+    }
+
+    const authResult = await authenticate(request, credentials)
+    if (!authResult.ok) {
+      return authResult
+    }
+    return {
+      ok: true,
+      request: {
+        route: 'openWorkspace',
+        subject: authResult.subject,
+        logs: bodyCheck.logs,
+        ...(bodyCheck.supersedes === undefined ? {} : { supersedes: bodyCheck.supersedes }),
+        ...(bodyCheck.replicaId === undefined ? {} : { replicaId: bodyCheck.replicaId }),
+        idempotencyKey: parsedKey.key,
+      },
+    }
+  }
+
   if (isRevoke) {
     const bodyCheck = checkRevokeLogBody(body)
     if (!bodyCheck.ok) {
