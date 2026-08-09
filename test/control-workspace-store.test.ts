@@ -1,12 +1,15 @@
 /**
  * 작업공간 생애 추적 — 개시 + 단건 조회 + 파생 상태 (mori-nest #97, #68 범위 5번 조각 1/3),
- * 그리고 하트비트·종료·폐기 전이 (#98 조각 2/3).
+ * 하트비트·종료·폐기 전이 (#98 조각 2/3), 그리고 목록 조회 (#99 조각 3/3).
  *
- * 두 이슈 본문이 못박은 대로 **다섯 건 + 여섯 건**이고, 그 이상 만들지 않는다. 목록
- * 조회(조각 3/3)는 여기서 다루지 않는다 — 그 라우트가 아직 없다.
+ * 세 이슈 본문이 못박은 대로 **다섯 건 + 여섯 건 + 다섯 건**이고, 그 이상 만들지 않는다.
+ *
+ * 목록 조회 테스트는 `openedAt` 순서를 검증해야 하는데 `openWorkspace`는 `new Date()`로
+ * `openedAt`을 정하므로(주입 지점이 없다), 같은 밀리초에 걸리면 순서 단언이 들쭉날쭉해진다.
+ * `vi.useFakeTimers()` + `vi.setSystemTime`으로 각 개시 사이의 시각을 고정해 결정적으로 만든다.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { RandomBytesFn } from '../src/control/store.js'
 import {
@@ -16,6 +19,28 @@ import {
   type WorkspaceStore,
   type WorkspaceStoreFailure,
 } from '../src/control/workspace-store.js'
+
+/** 개시 사이에 `vi.setSystemTime`으로 시각을 옮기며 여러 작업공간을 연다 — 파일 상단 doc
+ * "목록 조회 테스트는 openedAt 순서를 검증해야 하는데" 참고. `store.openWorkspace`의
+ * `openedAt`이 옮긴 시각 그대로가 되도록 매 반복 사이에 시계를 앞으로 옮긴다. */
+async function openSequenced(
+  store: WorkspaceStore,
+  subject: string,
+  timesMs: readonly number[],
+): Promise<string[]> {
+  const ids: string[] = []
+  vi.useFakeTimers()
+  try {
+    for (const timeMs of timesMs) {
+      vi.setSystemTime(timeMs)
+      const { workspaceId } = await store.openWorkspace(subject, { logs: ['log-a'] })
+      ids.push(workspaceId)
+    }
+  } finally {
+    vi.useRealTimers()
+  }
+  return ids
+}
 
 describe('WorkspaceStore.openWorkspace + getWorkspace', () => {
   it('개시 직후 단건 조회는 active이고 lastHeartbeatAt === openedAt, logs가 요청 그대로이며 replicaId 미신고 시 그 필드가 없다', async () => {
@@ -251,5 +276,102 @@ describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
       store.heartbeat('alice', 'ws_nonexistent', { gracePeriodMs, now: new Date(openedAt + 2_000) }),
       'workspace_not_found',
     )
+  })
+})
+
+describe('WorkspaceStore.listWorkspaces', () => {
+  it('필터 없이 나열하면 openedAt 오름차순이고, 다른 주체의 작업공간은 실리지 않는다', async () => {
+    const store = await openWorkspaceStore(':memory:')
+    const gracePeriodMs = 60_000
+
+    // 삽입 순서(2_000 → 3_000 → 1_000)와 openedAt 오름차순(1_000 → 2_000 → 3_000)이 다르게
+    // 되도록 일부러 시각을 뒤섞는다 — 응답 순서가 삽입 순서를 우연히 따라가는 것이 아니라
+    // 실제로 `openedAt`으로 정렬됐음을 확인한다.
+    const [second, third, first] = await openSequenced(store, 'alice', [2_000, 3_000, 1_000])
+    await openSequenced(store, 'mallory', [1_500])
+
+    const page = await store.listWorkspaces('alice', { gracePeriodMs })
+
+    expect(page.workspaces.map((w) => w.workspaceId)).toEqual([first, second, third])
+    expect(page.hasMore).toBe(false)
+  })
+
+  it('§4.7 관찰 조건: 하트비트 뒤 방치된 작업공간이 state=abandoned 필터에 잡히고, endedAt이 lastHeartbeatAt + gracePeriod이며 logs가 개시 시 스코프 그대로다', async () => {
+    const store = await openWorkspaceStore(':memory:')
+    const gracePeriodMs = 1_000
+    const [workspaceId] = await openSequenced(store, 'alice', [0])
+    const beatAt = new Date(100)
+    await store.heartbeat('alice', workspaceId!, { gracePeriodMs, now: beatAt })
+    const deadline = beatAt.getTime() + gracePeriodMs
+
+    const page = await store.listWorkspaces('alice', {
+      state: 'abandoned',
+      gracePeriodMs,
+      now: new Date(deadline + 5_000),
+    })
+
+    expect(page.workspaces).toHaveLength(1)
+    expect(page.workspaces[0]?.workspaceId).toBe(workspaceId)
+    expect(page.workspaces[0]?.state).toBe('abandoned')
+    expect(page.workspaces[0]?.endedAt).toBe(new Date(deadline).toISOString())
+    expect(page.workspaces[0]?.logs).toEqual(['log-a'])
+  })
+
+  it('필터 → 정렬 → limit 순서: 유기 1건 + 그보다 나중에 열린 active 여러 건에서 state=abandoned + limit=1이 그 유기 1건을 돌려주고 hasMore가 false다', async () => {
+    const store = await openWorkspaceStore(':memory:')
+    const gracePeriodMs = 1_000
+
+    // ws1은 개시 후 하트비트 없이 방치된다 — 나머지 둘은 ws1의 유기 시각(1_000)이 지난
+    // 뒤에 열려 아직 자기 grace 안이다(개시 시각 == lastHeartbeatAt이 그 시각의 deadline).
+    // 조회 시각(now)도 gracePeriodMs + 2로 고정한다 — 실시각을 쓰면(그때는 이미 세 작업공간
+    // 모두 grace를 한참 넘긴 뒤이므로) 나머지 둘도 abandoned로 잡혀 이 시험이 성립하지 않는다.
+    const [abandonedId] = await openSequenced(store, 'alice', [0])
+    await openSequenced(store, 'alice', [gracePeriodMs + 1, gracePeriodMs + 2])
+
+    const page = await store.listWorkspaces('alice', {
+      state: 'abandoned',
+      limit: 1,
+      gracePeriodMs,
+      now: new Date(gracePeriodMs + 2),
+    })
+
+    expect(page.workspaces.map((w) => w.workspaceId)).toEqual([abandonedId])
+    expect(page.hasMore).toBe(false)
+  })
+
+  it('커서로 다음 페이지를 이어 받으면 앞 페이지 항목이 반복되지 않고 전량이 정확히 한 번씩 나온다', async () => {
+    const store = await openWorkspaceStore(':memory:')
+    const gracePeriodMs = 60_000
+    const ids = await openSequenced(store, 'alice', [0, 1_000, 2_000, 3_000, 4_000])
+
+    const firstPage = await store.listWorkspaces('alice', { limit: 2, gracePeriodMs })
+    expect(firstPage.workspaces.map((w) => w.workspaceId)).toEqual(ids.slice(0, 2))
+    expect(firstPage.hasMore).toBe(true)
+    const firstCursor = firstPage.cursor
+    if (firstCursor === undefined) throw new Error('cursor가 비어 있다')
+
+    const secondPage = await store.listWorkspaces('alice', { limit: 2, after: firstCursor, gracePeriodMs })
+    expect(secondPage.workspaces.map((w) => w.workspaceId)).toEqual(ids.slice(2, 4))
+    expect(secondPage.hasMore).toBe(true)
+    const secondCursor = secondPage.cursor
+    if (secondCursor === undefined) throw new Error('cursor가 비어 있다')
+
+    const thirdPage = await store.listWorkspaces('alice', { limit: 2, after: secondCursor, gracePeriodMs })
+    expect(thirdPage.workspaces.map((w) => w.workspaceId)).toEqual(ids.slice(4, 5))
+    expect(thirdPage.hasMore).toBe(false)
+
+    const seen = [...firstPage.workspaces, ...secondPage.workspaces, ...thirdPage.workspaces].map((w) => w.workspaceId)
+    expect(seen).toEqual(ids)
+    expect(new Set(seen).size).toBe(ids.length)
+  })
+
+  it('state가 다섯 이름 밖이면 실패하고, 해석 불가 커서도 실패한다 (둘 다 «전부 반환»으로 떨어지지 않는다)', async () => {
+    const store = await openWorkspaceStore(':memory:')
+    const gracePeriodMs = 60_000
+    await openSequenced(store, 'alice', [0])
+
+    await expectFailure(store.listWorkspaces('alice', { state: 'bogus', gracePeriodMs }), 'invalid_state_filter')
+    await expectFailure(store.listWorkspaces('alice', { state: '', gracePeriodMs }), 'invalid_state_filter')
+    await expectFailure(store.listWorkspaces('alice', { after: 'not-a-cursor', gracePeriodMs }), 'invalid_cursor')
   })
 })

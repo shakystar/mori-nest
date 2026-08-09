@@ -40,11 +40,12 @@
  * 함께 안다. 넷의 **관계**를 강제하는 자리도 여기다 (`§3.4` — 아래 파서 doc).
  *
  * 같은 이유로 작업공간 생애 추적의 스토어(`./workspace-store.js` · #97 조각 1/3, #98 조각
- * 2/3)도 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)·단건 조회(`getWorkspace`)·세
- * 전이(`heartbeat`·`closeWorkspace`·`revokeWorkspace`)까지고, 목록 조회(조각 3/3)는 아직
- * 없다. `gracePeriod`·조회 시각·전이 시각은 여전히 그 스토어의 메서드 **인자**다 — 값을
- * 정하는 것은 설정이고(`gracePeriodSeconds`), 그것을 ms로 환산해 넘기는 것은 라우트다
- * (`./server.js`의 개시 핸들러 한 곳).
+ * 2/3, #99 조각 3/3)도 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)·단건 조회(`getWorkspace`)·
+ * 세 전이(`heartbeat`·`closeWorkspace`·`revokeWorkspace`)·목록 조회(`listWorkspaces`)까지다.
+ * `gracePeriod`·조회 시각·전이 시각은 여전히 그 스토어의 메서드 **인자**다 — 값을 정하는
+ * 것은 설정이고(`gracePeriodSeconds`), 그것을 ms로 환산해 넘기는 것은 라우트다
+ * (`./server.js`의 개시 핸들러 한 곳). 나머지 전이·목록에는 아직 그 값을 넘길 라우트가
+ * 없다 (`§4.3`~`§4.6`).
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
@@ -110,6 +111,8 @@ export {
   WorkspaceStoreError,
   type CloseOutcome,
   type GetWorkspaceOptions,
+  type ListWorkspacesOptions,
+  type ListWorkspacesPage,
   type OpenWorkspaceRequest,
   type WorkspaceRecord,
   type WorkspaceState,
