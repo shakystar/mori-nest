@@ -55,7 +55,13 @@ import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
 import type { LauncherCredentialStore } from './credential.js'
 import { IdempotencyStoreError, type IdempotencyStore } from './idempotency.js'
 import { verifyControlRequest, type ControlRequest, type RawRequest } from './request.js'
-import type { ControlStore } from './store.js'
+import { DEFAULT_PAGE_LIMIT, type ControlStore } from './store.js'
+
+/**
+ * `GET /v1/logs`의 `limit` 천장 ({@link handleListLogs} doc). 스토어가 `limit` 없이 쓰는
+ * 페이지 크기를 그대로 재사용한다 — 이 자리에 새 숫자를 지어내지 않는다.
+ */
+const MAX_PAGE_LIMIT = DEFAULT_PAGE_LIMIT
 
 /**
  * 요청 객체 — Node 표준 HTTP 서버가 넘겨주는 것과 **모양만** 맞는 독립 타입 (파일 상단 doc).
@@ -325,6 +331,15 @@ async function handleCreateLog(
  *
  * `cursor`는 이 페이지 마지막 항목의 `logId`다 (`§2.4`의 `ListLogsResponse` 주석 — "비면
  * 없음"). 빈 결과도 `200`이다.
+ *
+ * **`limit` 상한은 여기서 선다** ({@link MAX_PAGE_LIMIT}) — `./request.js`가 "서버 상한이
+ * 생기면 그 판정도 다음 조각의 것"이라며 비워 둔 자리다. 게이트는 형식만 보고 값을 그대로
+ * 실어 보내므로(`§1.3` 표에 이 판정을 위한 code가 없다), 상한이 없으면 스토어가 받지 못하는
+ * 크기(`ControlStoreError('invalid_page_limit')`)가 그대로 올라와 **클라이언트가 문법적으로
+ * 멀쩡한 요청으로 `500`을 만들 수 있다.** 깎는 것은 `§2.4`가 이미 허락한 동작이다 — 표의
+ * `limit` 설명이 "서버가 더 작게 깎을 수 있다"이다. 새 값을 지어내지 않고 이 리포가 이미
+ * 고른 페이지 크기(`DEFAULT_PAGE_LIMIT`)를 천장으로 재사용한다. 깎아도 `hasMore`는 여전히
+ * 참이다 — 스토어가 그 값에 한 건을 더 얹어 읽어 판정하기 때문이다.
  */
 async function handleListLogs(
   options: ControlServerOptions,
@@ -336,7 +351,7 @@ async function handleListLogs(
     query.after = request.after
   }
   if (request.limit !== undefined) {
-    query.limit = request.limit
+    query.limit = Math.min(request.limit, MAX_PAGE_LIMIT)
   }
 
   let page

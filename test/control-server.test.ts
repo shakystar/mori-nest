@@ -201,6 +201,16 @@ describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4)', () => {
     const seen = [...firstPage.logs, ...secondPage.logs].map((log) => log.logId)
     expect(seen).toEqual([...seen].sort())
     expect(new Set(seen).size).toBe(3)
+
+    // 서버 천장을 넘는 `limit`도 `200`이다 — 게이트는 형식만 보므로(§1.3에 이 판정의 code가
+    // 없다) 상한을 라우트가 세우지 않으면 이 요청이 `500`이 된다. 깎는 것은 §2.4가 허락한
+    // 동작이다("서버가 더 작게 깎을 수 있다").
+    const huge = bodyOf(await read('/v1/logs?limit=99999999999', tokenA)) as {
+      logs: { logId: string }[]
+      hasMore: boolean
+    }
+    expect(huge.logs).toHaveLength(3)
+    expect(huge.hasMore).toBe(false)
   })
 
   it('⑤ GET /v1/logs/{logId} — 남의 로그와 없는 로그의 404가 바이트 단위로 같다 (§2.4)', async () => {
