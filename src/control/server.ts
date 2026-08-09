@@ -2,9 +2,10 @@
  * 제어 평면 라우트 배선 + 최소 HTTP 서버 (`node:http`, 빌트인). 런타임 의존성 0을 유지한다
  * (`0002 §4.1-3`).
  *
- * `POST /v1/logs`(`0003 §2.1`) · `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`) 셋을 배선한다.
+ * `POST /v1/logs`(`0003 §2.1`) · `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`) ·
+ * `POST /v1/logs/{logId}/revoke`(`§2.6`) 넷을 배선한다.
  * **판정은 이 파일에 없다** — 자격 게이트·라우트 판별·본문/쿼리 검사는 `./request.js`의
- * {@link verifyControlRequest}가 이미 끝냈고(mori-nest #83), 여기서는 그 산출물을 스토어
+ * {@link verifyControlRequest}가 이미 끝냈고(mori-nest #83 · #93), 여기서는 그 산출물을 스토어
  * 호출로 잇는다. 페이지네이션도 마찬가지다: 판정 → 정렬 → `limit` 적용과 `hasMore` 판정은
  * `listLogsForSubject`가 이미 답했으므로 이 파일이 **다시 자르지 않는다** (자르면 `hasMore`가
  * 거짓말이 된다, `§2.4`).
@@ -24,10 +25,10 @@
  * 핸들러를 감싸지 않고 **핸들러가 계층을 부른다** — 응답(상태코드·본문)이 자원을 만든
  * 뒤에야 정해지기 때문이다(`./idempotency.js` 머리말).
  *
- * ## 이 조각의 비범위 (mori-nest #84 이슈 본문)
+ * ## 이 조각의 비범위 (mori-nest #84 · #93 이슈 본문)
  *
- * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 `§2.6` 폐기 라우트와 `§4`
- * 작업공간 계열. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
+ * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 `§4` 작업공간 계열과 폐기 사유
+ * (`reason`)의 저장. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
  * 뜻이다** — 전송 평면의 `maxRequestBytes`(`0002 §1.3` L103)에 해당하는 자리가 이 평면에는
  * 아직 배선되지 않았다(`0003 §1.3` 표에 `413 request_too_large`가 있으므로 자리는 열려 있고,
  * 값을 정하는 것은 이 조각이 아니다). 그 라우트를 여는 다음 조각이 이 함수에 상한을 준다.
@@ -55,7 +56,7 @@ import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
 import type { LauncherCredentialStore } from './credential.js'
 import { IdempotencyStoreError, type IdempotencyStore } from './idempotency.js'
 import { verifyControlRequest, type ControlRequest, type RawRequest } from './request.js'
-import { DEFAULT_PAGE_LIMIT, type ControlStore } from './store.js'
+import { ControlStoreError, DEFAULT_PAGE_LIMIT, type ControlStore } from './store.js'
 
 /**
  * `GET /v1/logs`의 `limit` 천장 ({@link handleListLogs} doc). 스토어가 `limit` 없이 쓰는
@@ -401,6 +402,38 @@ async function handleGetLog(
 }
 
 /**
+ * `POST /v1/logs/{logId}/revoke` (`§2.6`) — `store.revoke`가 폐기 이전의 자격만 보고 판정한다
+ * (`log_subjects` 관계 행이 있었는가). 관계가 없으면 `ControlStoreError('log_not_found')`를
+ * 던지고, 이 핸들러가 그것을 `404`로 옮긴다 — 없는 로그와 이 주체가 애초에 grant받지 못한
+ * 로그를 구분하지 않는다({@link handleGetLog}와 같은 열거 오라클 금지).
+ *
+ * **`§2.6` MUST**: 이미 `revoked`인 로그에 대한 재폐기가 바이트 단위로 같은 `200`이다.
+ * `store.revoke`가 `COALESCE`로 첫 폐기 시각을 그대로 돌려주므로(`./store.js`), 이 핸들러가
+ * 매번 같은 필드 순서로 짓는 것 외에는 아무것도 하지 않아도 그 성질이 유지된다.
+ *
+ * `reason`은 게이트(`./request.js`)가 형식만 봤다 — 이 핸들러도 저장도 응답도 하지 않는다
+ * (`§2.6`의 응답 타입에 자리가 없다, 이슈 #93 비범위).
+ */
+async function handleRevokeLog(
+  options: ControlServerOptions,
+  request: Extract<ControlRequest, { route: 'revokeLog' }>,
+  response: ResponseWriter,
+): Promise<void> {
+  let revoked
+  try {
+    revoked = await options.store.revoke(request.subject, request.logId)
+  } catch (error) {
+    if (error instanceof ControlStoreError && error.reason === 'log_not_found') {
+      writeJson(response, 404, errorResponse(ErrorCodes.log_not_found, 'log not found'))
+      return
+    }
+    writeFailure(response, storeFailure(error))
+    return
+  }
+  writeJson(response, 200, { logId: request.logId, state: 'revoked', revokedAt: revoked.revokedAt })
+}
+
+/**
  * 게이트 → 라우트. 본문을 **`POST`일 때만** 읽는 것은 전송 평면과 같은 규율이다(GET 라우트는
  * 본문을 쓰지 않는다). 이 분기는 라우트 판별이 아니다 — 경로·메서드·문법의 판정은 그 아래
  * {@link verifyControlRequest}가 처음부터 다시 전부 한다.
@@ -436,6 +469,9 @@ async function handleRequest(
       return
     case 'getLog':
       await handleGetLog(options, gate.request, response)
+      return
+    case 'revokeLog':
+      await handleRevokeLog(options, gate.request, response)
       return
   }
 }

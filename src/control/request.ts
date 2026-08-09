@@ -1,6 +1,7 @@
 /**
- * 제어 평면의 요청 판정 — 런처 자격 게이트 + 로그 라우트 3종 판별
- * (`0003 §1.1`·`§1.2`·`§1.3`·`§1.4`·`§2.1`·`§2.2`·`§2.4`, mori-nest #68 라우트 조각 1/2 · #83).
+ * 제어 평면의 요청 판정 — 런처 자격 게이트 + 로그 라우트 4종 판별
+ * (`0003 §1.1`·`§1.2`·`§1.3`·`§1.4`·`§2.1`·`§2.2`·`§2.4`·`§2.6`, mori-nest #68 라우트 조각 1/2 ·
+ * #83 · #93).
  *
  * `src/transport/request.ts`와 같은 모양이다: **판정 함수 하나.** HTTP 응답을 쓰지 않고,
  * 판정 결과(해석된 요청, 또는 `§1.3`의 에러 봉투 + 상태코드)를 **반환**할 뿐이다. 다른 점
@@ -8,13 +9,13 @@
  * 평면에는 [내구성 단일 장애점] 제약이 없다"), 이 함수는 async이고 {@link LauncherCredentialStore}를
  * 주입받는다.
  *
- * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 중 셋뿐이다 — `POST /v1/logs`(`§2.1`),
- * `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`). 나머지 다섯(작업공간 개시·하트비트·종료·
- * 폐기·조회, 로그 폐기)은 이 조각의 비범위다.
+ * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 중 넷이다 — `POST /v1/logs`(`§2.1`),
+ * `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`), `POST /v1/logs/{logId}/revoke`(`§2.6`).
+ * 나머지 다섯(작업공간 개시·하트비트·종료·폐기·조회)은 이 조각의 비범위다.
  *
- * 이 파일에는 HTTP 서버도 스토어 호출(`isGranted`·`createLog`)도 없다 — 그것은 다음 조각
- * (라우트 배선, mori-nest #83 이슈 본문 "후속")의 몫이다. `src/transport/`를 import하지
- * 않는 것도 같은 경계 규율이다(`src/control/index.ts` 상단 doc) — 아래 헬퍼들이
+ * 이 파일에는 HTTP 서버도 스토어 호출(`isGranted`·`createLog`·`revoke`)도 없다 — 그것은
+ * 라우트 배선(`./server.js`, mori-nest #83 이슈 본문 "후속")의 몫이다. `src/transport/`를
+ * import하지 않는 것도 같은 경계 규율이다(`src/control/index.ts` 상단 doc) — 아래 헬퍼들이
  * `src/transport/request.ts`의 것과 모양이 겹치는 것은 우연이 아니라 같은 문제를 각 평면이
  * 독립적으로 풀기 때문이다.
  */
@@ -42,6 +43,12 @@ const CLIENT_MINTED_ID_FIELDS = new Set(['logId', 'id', 'name'])
 /** `/v1/logs` 경로의 세그먼트. */
 const PATH_PREFIX = ['', 'v1', 'logs'] as const
 
+/** `POST /v1/logs/{logId}/revoke`(`§2.6`)의 마지막 세그먼트. */
+const REVOKE_SUFFIX = 'revoke'
+
+/** `§2.6`의 `RevokeLogRequest` 본문에서 게이트가 아는 최상위 필드. */
+const REVOKE_BODY_FIELDS = ['reason']
+
 /** Node 표준 HTTP 서버가 넘겨주는 요청 객체와 모양만 맞는 요청 입력. `src/transport/request.ts`의
  * `RawRequest`와 같은 모양이지만 독립적으로 정의한다 — import하면 그 자체로 평면 경계가 깨진다. */
 export type RawRequest = {
@@ -52,7 +59,7 @@ export type RawRequest = {
 
 /** 이 게이트가 판별하는 라우트 셋. `ControlStore`의 메서드 이름과 나란히 둔다
  * (`createLog`·`listLogsForSubject`). */
-export type ControlRoute = 'createLog' | 'listLogs' | 'getLog'
+export type ControlRoute = 'createLog' | 'listLogs' | 'getLog' | 'revokeLog'
 
 /**
  * 게이트를 통과한 요청. `subject`는 항상 런처 자격증명 조회로만 해석된다(`§1.2` MUST NOT —
@@ -79,6 +86,12 @@ export type ControlRequest =
       readonly route: 'getLog'
       readonly subject: string
       readonly logId: string
+    }
+  | {
+      readonly route: 'revokeLog'
+      readonly subject: string
+      readonly logId: string
+      readonly reason?: string
     }
 
 /** 이 게이트가 낼 수 있는 상태코드. 전부 `0003 §1.3` 표에 있는 것뿐이다. */
@@ -227,6 +240,26 @@ function checkCreateLogBody(raw: string): { readonly ok: true } | { readonly ok:
   return { ok: false, error: parsed.error }
 }
 
+/**
+ * `POST /v1/logs/{logId}/revoke`의 본문 (`§2.6`) — `{ reason?: string }`. `reason`이 있는데
+ * 문자열이 아니면 `400 malformed_request`; 없으면(필드 자체가 없어도) 통과한다 — 응답에도
+ * 저장에도 싣지 않으므로 형식 검사가 이 게이트가 하는 전부다(이슈 #93 비범위).
+ */
+function checkRevokeLogBody(raw: string): { readonly ok: true; readonly reason?: string } | { readonly ok: false; readonly error: ErrorResponse } {
+  const parsed = parseBody(raw, REVOKE_BODY_FIELDS)
+  if (!parsed.ok) {
+    return { ok: false, error: parsed.error }
+  }
+  const reason = parsed.body['reason']
+  if (reason === undefined) {
+    return { ok: true }
+  }
+  if (typeof reason !== 'string') {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'reason must be a string') }
+  }
+  return { ok: true, reason }
+}
+
 /** 자격 부재·형식 오류의 고정 `401`. `src/transport/request.ts`의 같은 이름 함수와 같은
  * 이유로 `details`가 없다 — 받은 헤더 값을 되비추지 않는다. */
 function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }> {
@@ -237,7 +270,7 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
 }
 
 /**
- * 제어 평면 세 라우트의 공통 게이트. 통과하면 해석된 요청을, 아니면 `§1.3`의 봉투와
+ * 제어 평면 네 라우트의 공통 게이트. 통과하면 해석된 요청을, 아니면 `§1.3`의 봉투와
  * 상태코드를 반환한다.
  *
  * ## 검사 순서
@@ -245,7 +278,8 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  * `src/transport/request.ts`와 같은 원칙(문법 검사가 자격 검사보다 앞선다 — 응답이
  * 알려주는 것이 스펙을 읽은 사람이 이미 아는 것뿐이게 한다)을 따른다:
  *
- * 1. **라우트 해석** — 경로가 `/v1/logs` 또는 `/v1/logs/{logId}`인가. 아니면 `400 malformed_request`.
+ * 1. **라우트 해석** — 경로가 `/v1/logs`·`/v1/logs/{logId}`·`/v1/logs/{logId}/revoke`
+ *    중 하나인가. 아니면 `400 malformed_request`.
  * 2. **메서드** — `checkMethod`. 아니면 `405` + `Allow`.
  * 3. **라우트별 문법**:
  *    - `listLogs`: `after` 형식(`§2.4`) — 해석 불가면 `400 invalid_cursor`. `limit`은
@@ -253,6 +287,9 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *    - `createLog`: 본문 형태(`§2.1`·`§2.2`) 그다음 `Idempotency-Key` 형식(`§1.4`).
  *    - `getLog`: 없음 — 경로의 `logId`를 그대로 싣는다. grant 판정은 이 게이트의 일이
  *      아니다(다음 조각).
+ *    - `revokeLog`: 본문 형태(`§2.6` — `reason`이 있는데 문자열이 아니면
+ *      `400 malformed_request`). `Idempotency-Key`를 요구하지 않는다(`§2.6`의 멱등은
+ *      연산 자체가 성립시킨다, 이슈 #93 본문).
  * 4. **자격** — `Authorization: Bearer <런처 자격증명>` → `credentials.verify`. 아니면 `401`.
  *    작업공간 토큰이 이 자리에서 걸린다: 그 값은 이 스토어에 조회되는 해시와 절대
  *    일치하지 않으므로 `verify`가 그대로 `401`을 낸다(`§1.1`) — 이 파일에 작업공간 토큰을
@@ -261,7 +298,7 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  * ## 이 게이트가 하지 않는 것
  *
  * - **스토어를 보지 않는다** (자격증명 조회는 예외 — `§1.1`이 그 형태를 요구한다).
- *   `isGranted`·`createLog`·`listLogsForSubject`는 다음 조각(라우트 배선)의 것이다.
+ *   `isGranted`·`createLog`·`listLogsForSubject`·`revoke`는 라우트 배선의 것이다.
  * - **`limit` 상한을 적용하지 않는다.** 형식이 유효한 값을 그대로 싣는다 — 서버 상한이
  *   생기면 그 판정도 다음 조각의 것이다(이 조각의 비범위, `§3.1`급 `maxLimit` 개념이
  *   `0003`에는 아직 없다).
@@ -280,19 +317,24 @@ export async function verifyControlRequest(
 ): Promise<ControlRequestResult> {
   const { path, query } = splitTarget(request.url)
 
-  // ── 1: 라우트 해석. `/v1/logs`(다섯 세그먼트 아님, 셋) 또는 `/v1/logs/{logId}`(넷)뿐이다.
+  // ── 1: 라우트 해석. `/v1/logs`(셋) · `/v1/logs/{logId}`(넷) · `/v1/logs/{logId}/revoke`(다섯)뿐이다.
   const segments = path.split('/')
   const prefixMatches = PATH_PREFIX.every((expected, index) => segments[index] === expected)
   const isCollection = prefixMatches && segments.length === PATH_PREFIX.length
   const logIdSegment = prefixMatches && segments.length === PATH_PREFIX.length + 1 ? (segments[PATH_PREFIX.length] ?? '') : ''
   const hasLogId = logIdSegment !== ''
+  const revokeLogIdSegment =
+    prefixMatches && segments.length === PATH_PREFIX.length + 2 && segments[PATH_PREFIX.length + 1] === REVOKE_SUFFIX
+      ? (segments[PATH_PREFIX.length] ?? '')
+      : ''
+  const isRevoke = revokeLogIdSegment !== ''
 
-  if (!isCollection && !hasLogId) {
+  if (!isCollection && !hasLogId && !isRevoke) {
     return reject(400, errorResponse(ErrorCodes.malformed_request, 'request target is not a control route'))
   }
 
   // ── 2: 메서드.
-  const allowedMethods = hasLogId ? ['GET'] : ['POST', 'GET']
+  const allowedMethods = isRevoke ? ['POST'] : hasLogId ? ['GET'] : ['POST', 'GET']
   const allowHeader: Readonly<Record<string, string>> = { Allow: allowedMethods.join(', ') }
   const methodCheck = checkMethod(request.method, allowedMethods)
   if (!methodCheck.ok) {
@@ -300,6 +342,27 @@ export async function verifyControlRequest(
   }
 
   // ── 3: 라우트별 문법.
+  if (isRevoke) {
+    const bodyCheck = checkRevokeLogBody(body)
+    if (!bodyCheck.ok) {
+      return reject(400, bodyCheck.error)
+    }
+
+    const authResult = await authenticate(request, credentials)
+    if (!authResult.ok) {
+      return authResult
+    }
+    return {
+      ok: true,
+      request: {
+        route: 'revokeLog',
+        subject: authResult.subject,
+        logId: revokeLogIdSegment,
+        ...(bodyCheck.reason === undefined ? {} : { reason: bodyCheck.reason }),
+      },
+    }
+  }
+
   if (hasLogId) {
     // getLog에는 이 게이트가 판정할 문법이 없다 — 경로의 logId를 그대로 싣는다.
     // grant 판정(존재하지 않거나 이 주체가 볼 수 없는 로그 → 404)은 다음 조각의 것이다.

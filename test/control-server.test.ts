@@ -14,12 +14,12 @@ import { createControlServer } from '../src/control/server.js'
 import { openControlStore, type ControlStore } from '../src/control/store.js'
 
 /**
- * 제어 평면 로그 라우트 셋 (`0003 §2.1`·`§2.4`·`§1.4`, mori-nest #84).
+ * 제어 평면 로그 라우트 셋 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`, mori-nest #84·#93).
  *
- * **동작 하나당 하나 — 일곱 건, 그 이상 만들지 않는다** (이슈 #84 완료 조건). 게이트 판정
- * (자격·메서드·본문 형태·커서 형식)의 케이스는 여기서 다시 세우지 않는다 — `#83`이
- * `test/control-request.test.ts`에 아홉 건으로 이미 세웠고, 이 파일이 보는 것은 **판정
- * 결과가 스토어 호출로 이어진 뒤의 관찰 가능한 응답**이다.
+ * **동작 하나당 하나 — #84가 일곱 건, #93이 그 위에 세 건(`§2.6` revoke)을 더한다**
+ * (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·커서 형식)의 케이스는
+ * 여기서 다시 세우지 않는다 — `#83`·`#93`이 `test/control-request.test.ts`에 이미 세웠고,
+ * 이 파일이 보는 것은 **판정 결과가 스토어 호출로 이어진 뒤의 관찰 가능한 응답**이다.
  *
  * 기존 서버 테스트(`test/server*.test.ts`)를 복사해 변형하지 않는다 — 전송 평면 라우트와
  * 이 라우트는 계약이 다르다(이슈 본문).
@@ -76,7 +76,7 @@ function runRaceChild(
   })
 }
 
-describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4)', () => {
+describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4·§2.6)', () => {
   let dir: string
   let store: ControlStore
   let idempotency: IdempotencyStore
@@ -101,6 +101,15 @@ describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4)', () => {
 
   function read(path: string, token: string): Promise<Reply> {
     return send(path, { headers: { Authorization: `Bearer ${token}` } })
+  }
+
+  /** `Idempotency-Key`를 보내지 않는다 — `§2.6`이 이 라우트에 그 헤더를 요구하지 않는다. */
+  function revokeLog(logId: string, token: string, body = '{}'): Promise<Reply> {
+    return send(`/v1/logs/${logId}/revoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body,
+    })
   }
 
   /** `POST`가 `201`로 돌려준 `logId`. 실패하면 그 자리에서 시험을 세운다. */
@@ -290,4 +299,40 @@ describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4)', () => {
     },
     30_000,
   )
+
+  it('⑧ 폐기 → 200 { logId, state: "revoked", revokedAt }, 재폐기는 바이트 단위로 같다 (§2.6 MUST)', async () => {
+    const logId = await mintedLogId(tokenA, 'revoke-key-1')
+
+    const first = await revokeLog(logId, tokenA)
+    expect(first.status).toBe(200)
+    const body = bodyOf(first) as { logId: string; state: string; revokedAt: string }
+    expect(body).toEqual({ logId, state: 'revoked', revokedAt: expect.any(String) })
+
+    const retry = await revokeLog(logId, tokenA)
+    expect(retry.status).toBe(first.status)
+    expect(retry.text).toBe(first.text)
+  })
+
+  it('⑨ 없는 logId와 남의 logId의 404가 바이트 단위로 같다 (§2.6)', async () => {
+    const others = await mintedLogId(tokenB, 'other-revoke-log')
+
+    const hidden = await revokeLog(others, tokenA)
+    const missing = await revokeLog('does-not-exist', tokenA)
+
+    expect(hidden.status).toBe(404)
+    expect(missing.status).toBe(404)
+    expect(hidden.text).toBe(missing.text)
+    expect(bodyOf(hidden)).toEqual({ error: { code: 'log_not_found', message: expect.any(String) } })
+  })
+
+  it('⑩ 폐기 후 GET /v1/logs 목록에서 빠지고 GET /v1/logs/{logId}가 404다 (§2.6)', async () => {
+    const logId = await mintedLogId(tokenA, 'revoke-key-2')
+
+    expect((await revokeLog(logId, tokenA)).status).toBe(200)
+
+    const listed = bodyOf(await read('/v1/logs', tokenA)) as { logs: { logId: string }[] }
+    expect(listed.logs.map((log) => log.logId)).not.toContain(logId)
+
+    expect((await read(`/v1/logs/${logId}`, tokenA)).status).toBe(404)
+  })
 })
