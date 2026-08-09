@@ -1,8 +1,10 @@
 /**
- * 제어 평면 스토어 — `logId` mint와 (주체, 로그) 다대다 관계 (mori-nest #72).
+ * 제어 평면 스토어 — `logId` mint와 (주체, 로그) 다대다 관계 (mori-nest #72), 그리고 폐기
+ * (`§2.6`, mori-nest #92)의 스토어 표면.
  *
- * 이슈 본문이 못박은 대로 **여섯 건**이고, 그 이상 만들지 않는다. HTTP 상태코드·에러
- * 봉투·폐기(§2.6)·파일 저장 형식 자체는 여기서 다루지 않는다 — 라우트가 아직 없다.
+ * #72가 못박은 여섯 건에 #92 이슈 본문이 못박은 **다섯 건**(revoke 동작 하나당 하나)을
+ * 더한다 — 그 이상 만들지 않는다. HTTP 상태코드·에러 봉투·`POST /v1/logs/{logId}/revoke`
+ * 라우트 자체·파일 저장 형식은 여기서 다루지 않는다 — 라우트가 아직 없다.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -102,5 +104,69 @@ describe('ControlStore.listLogsForSubject', () => {
 
     const allReturned = [...page1.logs, ...page2.logs].map((log) => log.logId)
     expect(allReturned).not.toContain(yLogId)
+  })
+})
+
+describe('ControlStore.revoke', () => {
+  it('revoke 후 isGranted가 false다', async () => {
+    const store = await openControlStore(':memory:')
+    const { logId } = await store.createLog('owner')
+
+    await store.revoke('owner', logId)
+
+    expect(await store.isGranted('owner', logId)).toBe(false)
+  })
+
+  it('revoke 후 listLogsForSubject에서 그 로그가 빠지고, 남은 건수·hasMore가 폐기분을 제외한 값이다', async () => {
+    const store = await openControlStore(':memory:')
+    const { logId: keptA } = await store.createLog('subject')
+    const { logId: keptB } = await store.createLog('subject')
+    const { logId: revokedA } = await store.createLog('subject')
+    const { logId: revokedB } = await store.createLog('subject')
+    const { logId: revokedC } = await store.createLog('subject')
+
+    // 3건 중 1건만 폐기한다 — 남은 4건(kept 2 + 미폐기 2) 기준으로 hasMore를 판정한다는 것을
+    // 확인하려면 폐기가 WHERE에서 일어나야 한다(라우트나 스토어 바깥에서 나중에 거르면 이
+    // 페이지가 폐기된 로그로 채워지거나 hasMore가 거짓말이 된다).
+    await store.revoke('subject', revokedA)
+
+    const page = await store.listLogsForSubject('subject', { limit: 1 })
+    expect(page.logs.map((log) => log.logId)).not.toContain(revokedA)
+    expect(page.hasMore).toBe(true)
+
+    const remaining = (await store.listLogsForSubject('subject')).logs.map((log) => log.logId)
+    expect(remaining.sort()).toEqual([keptA, keptB, revokedB, revokedC].sort())
+  })
+
+  it('같은 (주체, 로그) revoke 2회가 같은 revokedAt을 돌려준다 — 멱등', async () => {
+    const store = await openControlStore(':memory:')
+    const { logId } = await store.createLog('owner')
+
+    const first = await store.revoke('owner', logId)
+    const second = await store.revoke('owner', logId)
+
+    expect(second.revokedAt).toBe(first.revokedAt)
+  })
+
+  it('폐기된 로그에 대한 revoke가 여전히 성공한다 — 폐기가 자기 판정의 입력이 아니다', async () => {
+    const store = await openControlStore(':memory:')
+    const { logId } = await store.createLog('owner')
+    await store.revoke('owner', logId)
+
+    // isGranted는 폐기를 입력으로 삼아 이미 false다(§2.4·§3.6, 위 첫 테스트와 같은 사실).
+    // revoke 자신의 자격 판정은 그렇지 않다는 것을, 이 상태에서도 재호출이 실패하지 않는
+    // 것으로 확인한다 — 값이 같다는 것(위 세 번째 테스트)과는 다른 명제다.
+    expect(await store.isGranted('owner', logId)).toBe(false)
+    await expect(store.revoke('owner', logId)).resolves.toBeDefined()
+  })
+
+  it('관계 행이 없는 (주체, 로그)의 revoke가 404로 옮길 수 있는 형태로 실패한다', async () => {
+    const store = await openControlStore(':memory:')
+    const { logId } = await store.createLog('owner')
+
+    const attempt = store.revoke('stranger', logId)
+
+    await expect(attempt).rejects.toThrow(ControlStoreError)
+    await expect(attempt).rejects.toMatchObject({ reason: 'log_not_found' })
   })
 })
