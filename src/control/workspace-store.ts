@@ -587,6 +587,7 @@ class SqliteWorkspaceStore implements WorkspaceStore {
   readonly #insert: StatementSync
   readonly #selectByWorkspaceId: StatementSync
   readonly #selectSupersededBy: StatementSync
+  readonly #selectSupersededByBatch: StatementSync
   readonly #moveHeartbeat: StatementSync
   readonly #writeTerminal: StatementSync
   readonly #selectPage: StatementSync
@@ -605,6 +606,19 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     )
     this.#selectSupersededBy = db.prepare(
       'SELECT workspace_id FROM workspaces WHERE supersedes = ? ORDER BY workspace_id ASC LIMIT 1',
+    )
+    // `listWorkspaces`(N+1 회피, 이 클래스 doc 참고)가 페이지 전체의 `workspaceId` 목록을
+    // 한 번에 넘겨 쓴다. `IN (...)`을 페이지 크기별로 동적 생성하지 않고 `json_each(?)`를
+    // 쓴 이유: 이 생성자가 문장을 준비해 재사용하는 관례상 자리표 개수가 호출마다 달라지는
+    // 문장을 만들 수 없고, 이 파일이 이미 `logs` 컬럼에 JSON 직렬화를 쓰고 있어(`#insert`)
+    // 새 인코딩 관례를 늘리지 않는다. `MIN(workspace_id)`가 `#selectSupersededBy`의
+    // `ORDER BY workspace_id ASC LIMIT 1`과 같은 규칙의 집합 표현이다 — 둘 다 컬럼에 별도
+    // COLLATE가 없어 기본 BINARY 비교를 쓰므로 동치.
+    this.#selectSupersededByBatch = db.prepare(
+      `SELECT supersedes, MIN(workspace_id) AS superseded_by
+       FROM workspaces
+       WHERE supersedes IN (SELECT value FROM json_each(?))
+       GROUP BY supersedes`,
     )
     // 두 `UPDATE`의 `WHERE`에 실린 `terminal_state IS NULL`·`last_heartbeat_at = ?`가 파일
     // 상단 doc "원자성"의 2차 보장이다 — 판정에 쓴 값을 쓰기 조건으로 다시 싣는다.
@@ -795,10 +809,24 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     const hasMore = rows.length > limit
     const page = hasMore ? rows.slice(0, limit) : rows
 
+    // 페이지당 최대 1회의 질의로 `supersededBy`를 해소한다 (파일 상단 doc, mori-nest #109) —
+    // `getWorkspace`의 행당 1회 조회(`#selectSupersededBy`)와 달리, 여기는 페이지 전체의
+    // workspaceId를 한 번에 묶어 `#selectSupersededByBatch`에 넘긴다. 페이지가 비면 그 질의도
+    // 돌지 않는다.
+    const supersededByMap = new Map<string, string>()
+    if (page.length > 0) {
+      const workspaceIds = page.map((row) => columnAsString(row['workspace_id']))
+      for (const supersededByRow of this.#selectSupersededByBatch.all(JSON.stringify(workspaceIds))) {
+        supersededByMap.set(
+          columnAsString(supersededByRow['supersedes']),
+          columnAsString(supersededByRow['superseded_by']),
+        )
+      }
+    }
+
     const workspaces = page.map((row) => {
       const workspaceId = columnAsString(row['workspace_id'])
-      const supersededByRow = this.#selectSupersededBy.get(workspaceId)
-      const supersededBy = supersededByRow === undefined ? undefined : columnAsString(supersededByRow['workspace_id'])
+      const supersededBy = supersededByMap.get(workspaceId)
       return rowToRecord(workspaceId, row, { gracePeriodMs: options.gracePeriodMs, now, supersededBy })
     })
 
