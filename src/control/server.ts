@@ -3,7 +3,8 @@
  * (`0002 §4.1-3`).
  *
  * `POST /v1/logs`(`0003 §2.1`) · `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`) ·
- * `POST /v1/logs/{logId}/revoke`(`§2.6`) · `POST /v1/workspaces`(`§4.2`) 다섯을 배선한다.
+ * `POST /v1/logs/{logId}/revoke`(`§2.6`) · `POST /v1/workspaces`(`§4.2`) ·
+ * `POST /v1/workspaces/{workspaceId}/heartbeat`(`§4.3`) 여섯을 배선한다.
  * **판정은 이 파일에 없다** — 자격 게이트·라우트 판별·본문/쿼리 검사는 `./request.js`의
  * {@link verifyControlRequest}가 이미 끝냈고(mori-nest #83 · #93 · #102), 여기서는 그 산출물을
  * 스토어 호출로 잇는다. 페이지네이션도 마찬가지다: 판정 → 정렬 → `limit` 적용과 `hasMore` 판정은
@@ -30,17 +31,24 @@
  * {@link handleOpenWorkspace}의 doc이 따로 적는다: 멱등 예약(`§1.4`) → grant fail-closed
  * (`§3.6`) → 상태 판정과 발급의 원자성(`§4.1`·`§4.2`).
  *
- * **`§3.8`**: 토큰 문자열이 남는 곳은 개시 응답 본문 하나다 — 로그도 에러 봉투도 멱등
+ * 하트비트(`§4.3`, mori-nest #113)가 그 위에 **갱신**을 얹는다. 발급 경로는 여전히 하나이고
+ * ({@link issueToken}), 갈리는 것은 스코프의 출처다: 개시는 요청한 `logs`를 그대로 싣지만
+ * 갱신은 **개시 시 스코프를 다시 판정해 좁힌 결과**를 싣는다 (`§3.4` MUST). 그 순서가 왜
+ * 재판정 → 전이인지는 {@link handleHeartbeatWorkspace}의 doc이 적는다.
+ *
+ * **`§3.8`**: 토큰 문자열이 남는 곳은 개시·갱신의 응답 본문뿐이다 — 로그도 에러 봉투도 멱등
  * 저장분도 그것을 싣지 않는다(멱등 저장분이 무엇을 담는지는
  * {@link OpenWorkspaceReservation} doc).
  *
- * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 이슈 본문)
+ * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 · #113 이슈 본문)
  *
- * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간의 하트비트·종료·폐기
- * **배선**과 조회 라우트(`§4.6`) 전부, 폐기 사유(`reason`)의 저장. 하트비트·종료·폐기는
- * `./request.js`가 이미 판별하지만(#112), 이 파일의 `switch`는 그 셋을 아직 `503 unavailable`로
- * 묶어 답한다({@link handleRequest} 안의 주석) — 스토어 호출(`WorkspaceStore.heartbeat`·
- * `closeWorkspace`·`revokeWorkspace`)을 여는 것은 각각 다음 조각이다. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
+ * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간의 종료·폐기 **배선**과
+ * 조회 라우트(`§4.6`) 전부, 폐기 사유(`reason`)의 저장, `§4.10` 포크 감지·재발급 지시
+ * (하트비트 **응답**에 실리는 것이 맞지만 판정 규칙이 따로 있는 별도 작업이다 — 이 파일은 그
+ * 필드를 만들지 않는다). 종료·폐기는 `./request.js`가 이미 판별하지만(#112), 이 파일의
+ * `switch`는 그 둘을 아직 `503 unavailable`로 묶어 답한다({@link handleRequest} 안의 주석) —
+ * 스토어 호출(`WorkspaceStore.closeWorkspace`·`revokeWorkspace`)을 여는 것은 각각 다음
+ * 조각이다. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
  * 뜻이다** — 전송 평면의 `maxRequestBytes`(`0002 §1.3` L103)에 해당하는 자리가 이 평면에는
  * 아직 배선되지 않았다(`0003 §1.3` 표에 `413 request_too_large`가 있으므로 자리는 열려 있고,
  * 값을 정하는 것은 이 조각이 아니다). 그 라우트를 여는 다음 조각이 이 함수에 상한을 준다.
@@ -733,6 +741,125 @@ async function handleOpenWorkspace(
 }
 
 /**
+ * `POST /v1/workspaces/{workspaceId}/heartbeat` (`§4.3`) — 조회 → 스코프 재판정 → 전이 →
+ * 토큰 갱신 → `200`.
+ *
+ * ## 재판정은 좁힌다 — 개시의 all-or-nothing이 여기 오지 않는다 (`§3.4` MUST)
+ *
+ * 갱신 시점에 grant 자격을 다시 판정하되, 자격을 잃은 로그는 **스코프에서 빠지고 빠진 결과가
+ * 응답 `scope`에 그대로 실린다.** 전부 거부하면 아직 자격이 남은 로그로의 flush 경로까지
+ * 끊기고, 미flush 기억을 잃는 쪽이 더 나쁘다. **응답이 실제 스코프를 말하지 않으면 그게 조용한
+ * 좁힘이다.** 재판정 결과가 전부 비면 갱신하지 않고 `403 not_grantable`이다 (MUST) — 스코프가
+ * 빈 토큰을 만들 수 있는 경로는 존재하지 않는다 (`§3.6`).
+ *
+ * **폐기된 로그를 위한 분기가 여기 없다** (`§3.4` MUST NOT). 폐기는 `isGranted`의 **입력**이므로
+ * (#92) 이 재판정이 그대로 처리한다 — {@link handleOpenWorkspace}가 같은 이유로 두지 않은 분기다.
+ *
+ * ## 재판정의 입력은 개시 시 스코프이고, 좁아진 결과는 저장하지 않는다
+ *
+ * 토큰에 실렸던 스코프를 서버가 보관하지 않으므로(`§3.8`), 입력은 `WorkspaceRecord.logs`
+ * (개시 시 스코프, `§4.6`)다. 좁아진 결과를 되쓰지 않는 것은 스토어에 그 자리가 없어서만이
+ * 아니다 — `§4.6`이 *"갱신으로 좁아진 현재 스코프는 조회에 싣지 않는다"*로 이미 답했다.
+ * **매 갱신이 개시 시 스코프를 다시 판정한다.**
+ *
+ * ## `403`은 전이를 남기지 않는다 — 그래서 재판정이 전이보다 먼저다
+ *
+ * 뒤집으면 자격을 전부 잃은 런처가 하트비트를 보낼 때마다 `lastHeartbeatAt`이 앞으로 가고,
+ * 그 작업공간은 **토큰도 못 받으면서 영영 `abandoned`가 되지 않는다** — `§4.7`이 보이게 하려던
+ * «flush 없이 죽은 작업공간»이 정확히 그 자리에서 안 보이게 된다.
+ *
+ * 대가는 상태 판정이 두 번 일어난다는 것이다(`getWorkspace`의 조회 시각 판정 + `heartbeat`의
+ * 원자적 판정). **원본은 `heartbeat`다** — 그 사이 작업공간이 종단으로 갔으면 `heartbeat`가
+ * `workspace_not_active`를 던지고 그것이 `409`가 된다. 아래 `getWorkspace`의 판정은 재판정
+ * 대상(`logs`)을 얻기 위한 읽기이지 게이트가 아니다.
+ */
+async function handleHeartbeatWorkspace(
+  options: ControlServerOptions,
+  request: Extract<ControlRequest, { route: 'heartbeatWorkspace' }>,
+  response: ResponseWriter,
+): Promise<void> {
+  const { subject, workspaceId } = request
+  const gracePeriodMs = options.config.gracePeriodSeconds * MS_PER_SECOND
+
+  let workspace
+  try {
+    workspace = await options.workspaces.getWorkspace(subject, workspaceId, { gracePeriodMs })
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+  if (workspace === undefined) {
+    writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
+    return
+  }
+  if (workspace.state !== 'active') {
+    writeJson(response, 409, errorResponse(ErrorCodes.workspace_not_active, 'this workspace is no longer active'))
+    return
+  }
+
+  let scope: readonly string[]
+  let dropped: string[]
+  try {
+    const granted = await Promise.all(workspace.logs.map((logId) => options.store.isGranted(subject, logId)))
+    // 순서 보존 — 좁아진 스코프도 개시 시 스코프의 부분열이다.
+    scope = workspace.logs.filter((_, index) => granted[index] === true)
+    dropped = workspace.logs.filter((_, index) => granted[index] !== true)
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+  if (scope.length === 0) {
+    // 여기서 끝난다 — `heartbeat`를 부르지 않으므로 `lastHeartbeatAt`이 옮겨지지 않는다(위 doc).
+    // `details.logIds`의 모양은 `§4.2` 개시의 `403`과 같다: 빠진 로그를 **전부** 싣는다.
+    writeJson(
+      response,
+      403,
+      errorResponse(ErrorCodes.not_grantable, 'the requested scope contains logs this subject cannot grant', {
+        logIds: dropped,
+      }),
+    )
+    return
+  }
+
+  try {
+    await options.workspaces.heartbeat(subject, workspaceId, { gracePeriodMs })
+  } catch (error) {
+    if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_found') {
+      writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
+      return
+    }
+    if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_active') {
+      // 위 `getWorkspace`가 `active`를 봤어도 여기 닿을 수 있다 — 그 사이 종단으로 갔거나
+      // 이 호출이 유기를 확정한 경우다. 새 매핑을 만들지 않는다: 조회 경로와 같은 `409`다.
+      writeJson(response, 409, errorResponse(ErrorCodes.workspace_not_active, 'this workspace is no longer active'))
+      return
+    }
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  let issued: IssuedToken
+  try {
+    // 발급 경로는 하나다 — `§4.2`가 세운 {@link issueToken}을 그대로 쓴다. 좁아진 `scope`가
+    // 토큰의 클레임과 응답에 **같이** 실려야 클라이언트가 토큰을 파싱하지 않고도 실제 권한을 안다.
+    issued = issueToken(options.config, workspaceId, scope)
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  writeJson(response, 200, {
+    workspaceId,
+    state: 'active',
+    token: issued.token,
+    tokenId: issued.tokenId,
+    scope,
+    expiresAt: issued.expiresAt,
+    heartbeatIntervalSeconds: options.config.heartbeatIntervalSeconds,
+  })
+}
+
+/**
  * 게이트 → 라우트. 본문을 **`POST`일 때만** 읽는 것은 전송 평면과 같은 규율이다(GET 라우트는
  * 본문을 쓰지 않는다). 이 분기는 라우트 판별이 아니다 — 경로·메서드·문법의 판정은 그 아래
  * {@link verifyControlRequest}가 처음부터 다시 전부 한다.
@@ -776,11 +903,13 @@ async function handleRequest(
       await handleOpenWorkspace(options, gate.request, response)
       return
     case 'heartbeatWorkspace':
+      await handleHeartbeatWorkspace(options, gate.request, response)
+      return
     case 'closeWorkspace':
     case 'revokeWorkspace':
-      // 판별은 `./request.js`가 이미 끝냈다(mori-nest #112) — 이 셋의 스토어 배선
-      // (`WorkspaceStore.heartbeat`·`closeWorkspace`·`revokeWorkspace`)은 각각 다음 조각이
-      // 가져간다. 그때까지는 `503 unavailable`로 답한다: `§1.3`에 "아직 구현되지 않음"을 뜻하는
+      // 판별은 `./request.js`가 이미 끝냈다(mori-nest #112) — 이 둘의 스토어 배선
+      // (`WorkspaceStore.closeWorkspace`·`revokeWorkspace`)은 각각 다음 조각이 가져간다.
+      // 그때까지는 `503 unavailable`로 답한다: `§1.3`에 "아직 구현되지 않음"을 뜻하는
       // code가 없고(`501`은 이 스펙에 없다), `503`이 "지금은 답할 수 없다"의 유일한 뜻이다.
       writeJson(response, 503, errorResponse(ErrorCodes.unavailable, 'this route is not wired yet'), RETRY_AFTER)
       return

@@ -20,10 +20,10 @@ import { createVerificationKeySet, verifyWorkspaceToken } from '../src/transport
 import { KEY_ID, issuer } from './workspace-token.js'
 
 /**
- * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`, mori-nest #84·#93·#103).
+ * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`·`§4.3`, mori-nest #84·#93·#103·#113).
  *
  * **동작 하나당 하나 — #84가 일곱 건, #93이 그 위에 세 건(`§2.6` revoke), #103이 다섯 건
- * (`§4.2` 개시)을 더한다** (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·
+ * (`§4.2` 개시), #113이 네 건(`§4.3` 하트비트)을 더한다** (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·
  * 커서 형식)의 케이스는 여기서 다시 세우지 않는다 — `#83`·`#93`·`#102`가
  * `test/control-request.test.ts`에 이미 세웠고, 이 파일이 보는 것은 **판정 결과가 스토어
  * 호출로 이어진 뒤의 관찰 가능한 응답**이다. 토큰 와이어 형식의 재검증도 하지 않는다
@@ -99,6 +99,9 @@ type OpenReply = {
   heartbeatIntervalSeconds: number
 }
 
+/** `§4.3` 응답 — 개시의 여섯에 `state`가 더해진 일곱 필드. */
+type HeartbeatReply = OpenReply & { state: string }
+
 /**
  * 시험용 발급 설정 — `§3.4`의 네 제약을 만족한다 (`parseControlConfig`가 강제하는 그것).
  * 검증 키 집합(`keys`)이 이 `keyId`의 공개키를 갖고 있어 아래 ⑪의 라운드트립이 성립한다.
@@ -114,7 +117,7 @@ const CONFIG: ControlConfig = {
 /** `issuer`의 공개키 하나만 주입된 집합 — 전송 평면이 받는 절반(`§3.3`)이다. */
 const VERIFICATION_KEYS = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
 
-describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2)', () => {
+describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3)', () => {
   let dir: string
   let store: ControlStore
   let idempotency: IdempotencyStore
@@ -155,6 +158,19 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2)', () 
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'Idempotency-Key': key },
         body,
+      },
+      at,
+    )
+  }
+
+  /** `§4.3` 하트비트. 본문은 `{}`뿐이고 `Idempotency-Key`를 쓰지 않는다 (`§4.3`). */
+  function heartbeat(workspaceId: string, token: string, at: string = origin): Promise<Reply> {
+    return send(
+      `/v1/workspaces/${workspaceId}/heartbeat`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: '{}',
       },
       at,
     )
@@ -544,5 +560,111 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2)', () 
     expect(bodyOf(reply)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
     // 남의 유기 기록을 덮어쓰는 쓰기가 되지 않게, 이 실패는 작업공간을 만들지 않는다.
     expect(storedWorkspaceCount('subject-a')).toBe(0)
+  })
+
+  it('⑯ 하트비트 → 200 + 일곱 필드, 새 tokenId·앞으로 간 expiresAt, 그 토큰이 검증자를 통과한다 (§4.3)', async () => {
+    const logs = [await mintedLogId(tokenA, 'hb-log-1'), await mintedLogId(tokenA, 'hb-log-2')]
+    const opened = bodyOf(await openWorkspace(tokenA, 'hb-key-1', JSON.stringify({ logs }))) as OpenReply
+
+    // `expiresAt`은 초 해상도다 (§3.2) — 같은 초 안에서 갱신하면 값이 같을 수밖에 없다.
+    await delay(1100)
+    const reply = await heartbeat(opened.workspaceId, tokenA)
+
+    expect(reply.status).toBe(200)
+    const body = bodyOf(reply) as HeartbeatReply
+    expect(Object.keys(body).sort()).toEqual(
+      ['expiresAt', 'heartbeatIntervalSeconds', 'scope', 'state', 'token', 'tokenId', 'workspaceId'].sort(),
+    )
+    expect(body.workspaceId).toBe(opened.workspaceId)
+    expect(body.state).toBe('active')
+    expect(body.scope).toEqual(logs)
+    expect(body.heartbeatIntervalSeconds).toBe(CONFIG.heartbeatIntervalSeconds)
+    // 갱신은 **새 발급**이다 (§3.4) — 저장된 토큰의 재생이 아니다. `expiresAt`이 앞으로 가지
+    // 않으면 하트비트를 아무리 보내도 수명이 늘지 않아 §3.5의 수렴이 성립하지 않는다.
+    expect(body.tokenId).not.toBe(opened.tokenId)
+    expect(body.token).not.toBe(opened.token)
+    expect(Date.parse(body.expiresAt)).toBeGreaterThan(Date.parse(opened.expiresAt))
+
+    const verified = verifyWorkspaceToken(body.token, VERIFICATION_KEYS)
+    expect(verified.ok).toBe(true)
+    if (!verified.ok) return
+    expect(verified.token.claims.workspaceId).toBe(body.workspaceId)
+    expect(verified.token.claims.scope).toEqual(body.scope)
+  })
+
+  it('⑰ 자격을 잃은 로그는 scope에서 빠지고, 전부 빠지면 403이며 lastHeartbeatAt이 안 옮겨진다 (§3.4 MUST)', async () => {
+    const kept = await mintedLogId(tokenA, 'hb-narrow-keep')
+    const lost = await mintedLogId(tokenA, 'hb-narrow-lost')
+    const opened = bodyOf(
+      await openWorkspace(tokenA, 'hb-key-narrow', JSON.stringify({ logs: [lost, kept] })),
+    ) as OpenReply
+
+    expect((await revokeLog(lost, tokenA)).status).toBe(200)
+    const narrowed = await heartbeat(opened.workspaceId, tokenA)
+
+    // 좁힘은 all-or-nothing이 아니다 — 남은 로그로의 flush 경로를 끊지 않는다. 그리고 좁아진
+    // 결과가 **응답에 그대로 실린다**: 응답이 실제 스코프를 말하지 않으면 그게 조용한 좁힘이다.
+    expect(narrowed.status).toBe(200)
+    const narrowedBody = bodyOf(narrowed) as HeartbeatReply
+    expect(narrowedBody.scope).toEqual([kept])
+    // 토큰의 클레임도 같이 좁아져야 전송 평면이 실제 권한대로 판정한다 (§3.2).
+    const verified = verifyWorkspaceToken(narrowedBody.token, VERIFICATION_KEYS)
+    expect(verified.ok).toBe(true)
+    if (verified.ok) expect(verified.token.claims.scope).toEqual([kept])
+
+    const gracePeriodMs = CONFIG.gracePeriodSeconds * 1000
+    const before = await workspaces.getWorkspace('subject-a', opened.workspaceId, { gracePeriodMs })
+    // 좁아진 스코프는 저장되지 않는다 — 매 갱신이 **개시 시 스코프**를 다시 판정한다 (§4.6).
+    expect(before?.logs).toEqual([lost, kept])
+
+    expect((await revokeLog(kept, tokenA)).status).toBe(200)
+    // `lastHeartbeatAt`은 초 해상도일 수 있다 — 초를 넘겨야 "안 옮겨졌다"가 관찰된다.
+    await delay(1100)
+    const denied = await heartbeat(opened.workspaceId, tokenA)
+
+    expect(denied.status).toBe(403)
+    expect(bodyOf(denied)).toEqual({
+      error: {
+        code: 'not_grantable',
+        message: expect.any(String),
+        // 빠진 로그를 **전부** 싣는다 — §4.2 개시의 403과 같은 모양이다.
+        details: { logIds: [lost, kept] },
+      },
+    })
+    // 403이 전이를 남기면, 자격을 전부 잃은 런처가 하트비트를 보낼 때마다 유기 시계가 뒤로
+    // 밀려 그 작업공간은 토큰도 못 받으면서 영영 `abandoned`가 되지 않는다 (§4.7).
+    const after = await workspaces.getWorkspace('subject-a', opened.workspaceId, { gracePeriodMs })
+    expect(after?.lastHeartbeatAt).toBe(before?.lastHeartbeatAt)
+  })
+
+  it(
+    '⑱ 종단 상태(gracePeriod 경과로 abandoned)의 하트비트는 409 workspace_not_active다 (§4.1)',
+    async () => {
+      // ⑭와 같은 이유·같은 최솟값의 서버다 (§3.4: gracePeriod > tokenTtl ≥ 3 × heartbeat).
+      const impatient = await startServer({ heartbeatIntervalSeconds: 1, tokenTtlSeconds: 3, gracePeriodSeconds: 4 })
+      const logs = [await mintedLogId(tokenA, 'hb-terminal-log')]
+      const opened = bodyOf(
+        await openWorkspace(tokenA, 'hb-key-terminal', JSON.stringify({ logs }), impatient),
+      ) as OpenReply
+
+      await delay(4200)
+      const reply = await heartbeat(opened.workspaceId, tokenA, impatient)
+
+      expect(reply.status).toBe(409)
+      expect(bodyOf(reply)).toEqual({ error: { code: 'workspace_not_active', message: expect.any(String) } })
+    },
+    20_000,
+  )
+
+  it('⑲ 다른 주체의 workspaceId면 404 workspace_not_found다 (§4.6 MUST — 열거 오라클 방지)', async () => {
+    const othersLogs = [await mintedLogId(tokenB, 'hb-others-log')]
+    const others = bodyOf(
+      await openWorkspace(tokenB, 'hb-key-others', JSON.stringify({ logs: othersLogs })),
+    ) as OpenReply
+
+    const reply = await heartbeat(others.workspaceId, tokenA)
+
+    expect(reply.status).toBe(404)
+    expect(bodyOf(reply)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
   })
 })
