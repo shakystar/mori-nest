@@ -1,8 +1,9 @@
 /**
- * 제어 평면 요청 판정 (`verifyControlRequest`, mori-nest #83 — #68 라우트 조각 1/2).
+ * 제어 평면 요청 판정 (`verifyControlRequest`, mori-nest #83·#93 — #68 라우트 조각 1/2).
  *
- * 이슈 본문이 못박은 **아홉 건**이고, 그 이상 만들지 않는다. HTTP 서버·라우트 실행(스토어를
- * 실제로 부르는 배선)은 라우트 조각 2/2다 — 여기서는 다루지 않는다.
+ * #83 이슈 본문이 못박은 아홉 건 + #93 이슈 본문이 못박은 두 건(`§2.6` revoke 판정)이고,
+ * 그 이상 만들지 않는다. HTTP 서버·라우트 실행(스토어를 실제로 부르는 배선)은 라우트
+ * 조각 2/2다 — 여기서는 다루지 않는다.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -127,6 +128,39 @@ describe('verifyControlRequest — GET /v1/logs', () => {
     if (result.ok) return
     expect(result.status).toBe(405)
     expect(result.error.error.code).toBe('method_not_allowed')
+  })
+})
+
+describe('verifyControlRequest — POST /v1/logs/{logId}/revoke', () => {
+  function revokeReq(token: string, logId: string): RawRequest {
+    return { method: 'POST', url: `/v1/logs/${logId}/revoke`, headers: { authorization: `Bearer ${token}` } }
+  }
+
+  it('⑩ 유효 자격증명 + reason 문자열 → revokeLog 판정, reason이 실린다 (§2.6)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-i')
+
+    const result = await verifyControlRequest(revokeReq(token, 'log-1'), JSON.stringify({ reason: 'stale' }), store)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.request.route).toBe('revokeLog')
+    if (result.request.route !== 'revokeLog') return
+    expect(result.request.subject).toBe('subject-i')
+    expect(result.request.logId).toBe('log-1')
+    expect(result.request.reason).toBe('stale')
+  })
+
+  it('⑪ reason이 문자열이 아니면 → 400 malformed_request (§2.6)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-j')
+
+    const result = await verifyControlRequest(revokeReq(token, 'log-1'), JSON.stringify({ reason: 123 }), store)
+
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(400)
+    expect(result.error.error.code).toBe('malformed_request')
   })
 })
 
