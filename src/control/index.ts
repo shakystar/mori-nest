@@ -16,9 +16,12 @@
  *
  * `0003 §8-2`(런처 자격증명의 형태)·`§8-3`(grant 판정 규칙)이 아직 열려 있어 제어 평면
  * 6 라우트는 착수할 수 없다. 그래서 이 엔트리는 **설정 스키마와 모듈 경계까지**다 —
- * 라우트도 서버도 스토어도 여기 없고, 그것들은 후속 조각(mori-nest #68 조각 3·4·5)이
- * 이 자리 위에 세운다. 발급에 필요한 나머지 설정(서명 키의 `keyId`, 토큰 수명 등)도
- * 그것을 쓰는 라우트와 함께 온다 — 쓰는 코드가 없는 필드를 스키마에 미리 만들지 않는다.
+ * 라우트도 서버도 라우트가 쓸 스토어(제어 평면 자원 스토어, 조각 3/5)도 여기 없고,
+ * 그것들은 후속 조각(mori-nest #68 조각 3·5)이 이 자리 위에 세운다. `idempotency.js`
+ * (조각 4/5, `0003 §1.4`)만 먼저 왔다 — 두 라우트(`POST /v1/logs`·`POST /v1/workspaces`)가
+ * 공유해서 탈 재사용 가능한 계층이고, 라우트·자원 스토어와 독립이라 먼저 설 수 있다.
+ * 발급에 필요한 나머지 설정(서명 키의 `keyId`, 토큰 수명 등)도 그것을 쓰는 라우트와 함께
+ * 온다 — 쓰는 코드가 없는 필드를 스키마에 미리 만들지 않는다.
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
@@ -30,6 +33,17 @@
  */
 
 import { KeyObject } from 'node:crypto'
+
+export {
+  parseIdempotencyKey,
+  openIdempotencyStore,
+  IdempotencyStoreError,
+  type IdempotencyKeyResult,
+  type IdempotencyRecord,
+  type IdempotencyReservation,
+  type IdempotencyStore,
+  type IdempotencyStoreFailure,
+} from './idempotency.js'
 
 /** 이 평면의 설정 스키마가 정의한 최상위 필드 **전부**. */
 const CONTROL_CONFIG_FIELDS = ['signingKey'] as const
