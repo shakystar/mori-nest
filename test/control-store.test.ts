@@ -119,23 +119,19 @@ describe('ControlStore.revoke', () => {
 
   it('revoke 후 listLogsForSubject에서 그 로그가 빠지고, 남은 건수·hasMore가 폐기분을 제외한 값이다', async () => {
     const store = await openControlStore(':memory:')
-    const { logId: keptA } = await store.createLog('subject')
-    const { logId: keptB } = await store.createLog('subject')
+    const { logId: kept } = await store.createLog('subject')
     const { logId: revokedA } = await store.createLog('subject')
     const { logId: revokedB } = await store.createLog('subject')
-    const { logId: revokedC } = await store.createLog('subject')
 
-    // 3건 중 1건만 폐기한다 — 남은 4건(kept 2 + 미폐기 2) 기준으로 hasMore를 판정한다는 것을
-    // 확인하려면 폐기가 WHERE에서 일어나야 한다(라우트나 스토어 바깥에서 나중에 거르면 이
-    // 페이지가 폐기된 로그로 채워지거나 hasMore가 거짓말이 된다).
+    // 3건 중 2건을 폐기해 적격을 1건으로 만든다. 거르는 자리가 WHERE면 이 질의가 읽어 오는
+    // 행이 1건뿐이라 hasMore가 false다. 읽어 온 뒤(= LIMIT+1행을 받은 뒤) 밖에서 거르는
+    // 구현이면 2행을 읽어 hasMore가 true가 된다 — 그 거짓말이 여기서 빨개져야 한다.
     await store.revoke('subject', revokedA)
+    await store.revoke('subject', revokedB)
 
     const page = await store.listLogsForSubject('subject', { limit: 1 })
-    expect(page.logs.map((log) => log.logId)).not.toContain(revokedA)
-    expect(page.hasMore).toBe(true)
-
-    const remaining = (await store.listLogsForSubject('subject')).logs.map((log) => log.logId)
-    expect(remaining.sort()).toEqual([keptA, keptB, revokedB, revokedC].sort())
+    expect(page.logs.map((log) => log.logId)).toEqual([kept])
+    expect(page.hasMore).toBe(false)
   })
 
   it('같은 (주체, 로그) revoke 2회가 같은 revokedAt을 돌려준다 — 멱등', async () => {
