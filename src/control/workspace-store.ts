@@ -6,8 +6,20 @@
  *
  * 이 파일이 세우는 것은 **개시**(`openWorkspace`) · **단건 조회**(`getWorkspace`) · **하트비트**
  * (`heartbeat`, `§4.3`) · **종료 선언**(`closeWorkspace`, `§4.4`) · **폐기**(`revokeWorkspace`,
- * `§4.5`)다. `state`·`after`·`limit`로 거르는 목록 조회(`§4.6`)는 조각 3/3이고, HTTP 라우트·
- * 상태코드·토큰 갱신은 어느 조각에도 아직 없다 — 이 스토어는 토큰을 모른다.
+ * `§4.5`) · `state`·`after`·`limit`로 거르는 **목록 조회**(`listWorkspaces`, `§4.6`, 조각 3/3)다.
+ * HTTP 라우트·상태코드·토큰 갱신은 어느 조각에도 아직 없다 — 이 스토어는 토큰을 모른다.
+ *
+ * ## 목록 조회의 `state` 필터는 `WHERE`에서 계산된다 — `resolveActiveState`와 같은 임계
+ *
+ * `abandoned`는 저장 컬럼이 아니라 파생값이므로(위 "abandoned는 파생값이다"), `state=abandoned`나
+ * `state=active`로 거르려면 그 계산이 SQL 질의 층에서 일어나야 한다(`§4.6` MUST: 필터 → 정렬 →
+ * `limit` 순서, 읽어 온 뒤 애플리케이션에서 거르면 `hasMore`가 거짓말이 된다). {@link
+ * resolveActiveState}는 `now.getTime() >= lastHeartbeatAt.getTime() + gracePeriodMs`일 때
+ * 유기로 판정한다 — 이 부등식을 그대로 옮기면 `lastHeartbeatAt <= now.getTime() - gracePeriodMs`이고,
+ * 우변(`now - gracePeriod`)은 질의당 한 번만 계산되는 상수이므로 SQL이 각 행마다 재계산할 필요가
+ * 없다. {@link SqliteWorkspaceStore.listWorkspaces}가 이 상수 하나(`abandonThresholdIso`)를
+ * 계산해 넘기고, SQL의 `CASE`가 `resolveActiveState`와 **같은 부등식**(단지 좌우가 뒤집힌 대수적
+ * 동치)을 적용한다 — 다른 임계를 새로 적지 않는다.
  *
  * ## `closeWorkspace`라는 이름 — 이슈가 적은 `close`가 아닌 이유
  *
@@ -94,7 +106,7 @@
 import { randomBytes as nodeRandomBytes } from 'node:crypto'
 import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
 
-import { readEntropy, type RandomBytesFn } from './store.js'
+import { DEFAULT_PAGE_LIMIT, readEntropy, type RandomBytesFn } from './store.js'
 
 /** `SQLITE_CONSTRAINT_PRIMARYKEY`. `workspaces.workspace_id` 충돌 — mint가 이미 있는 id를 뽑았다. */
 const SQLITE_CONSTRAINT_PRIMARYKEY = 1555
@@ -118,6 +130,19 @@ const WORKSPACE_ID_PREFIX = 'ws_'
 
 /** 접두사 + base64url(16바이트) 모양. */
 const WORKSPACE_ID_PATTERN = /^ws_[A-Za-z0-9_-]{1,128}$/
+
+/** `resolveLimit`이 받아들이는 상한. 근거는 `src/control/store.ts`의 같은 값과 같다
+ * (음수 `LIMIT`은 SQLite에서 "무제한"으로 읽힌다). */
+const MAX_ACCEPTED_LIMIT = 0x7fffffff
+
+/** `§4.1`의 다섯 이름 전부 — `listWorkspaces`의 `state` 필터가 이 안에 있는지만 검사한다. */
+const WORKSPACE_STATE_NAMES: readonly string[] = [
+  'active',
+  'closed_flushed',
+  'closed_discarded',
+  'revoked',
+  'abandoned',
+]
 
 /**
  * 이 스토어의 스키마. `terminal_state`·`ended_at`은 세 전이(조각 2/3)가 채운다.
@@ -143,6 +168,10 @@ CREATE TABLE IF NOT EXISTS workspaces (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS workspaces_supersedes ON workspaces (supersedes);
+
+-- listWorkspaces(§4.6)의 정렬·커서 축과 같은 열 순서 — 필터 → 정렬 → limit(§4.6 MUST)이 이
+-- 인덱스 하나로 서비스된다(subject로 좁히고, opened_at·workspace_id로 정렬·커서 비교).
+CREATE INDEX IF NOT EXISTS workspaces_subject_opened_at ON workspaces (subject, opened_at, workspace_id);
 `
 
 /**
@@ -183,6 +212,15 @@ export type WorkspaceStoreFailure =
   | 'workspace_not_active'
   /** mint 재시도가 {@link MAX_MINT_ATTEMPTS}를 넘었다 */
   | 'mint_exhausted'
+  /** `listWorkspaces`의 `state`가 `§4.1`의 다섯 이름 중 하나가 아니다 — 호출자가 `400
+   * invalid_state_filter`로 옮기는 자리다. 빈 문자열·알 수 없는 값도 "필터 없음"으로
+   * 떨어지지 않고 여기 든다 (`§4.6` MUST NOT). */
+  | 'invalid_state_filter'
+  /** `listWorkspaces`의 `after`가 이 스토어가 발급한 커서 모양이 아니다 — 호출자가 `400
+   * invalid_cursor`로 옮기는 자리다. 처음부터 주지 않는다 (`§4.6` MUST). */
+  | 'invalid_cursor'
+  /** `listWorkspaces`의 `limit`이 양의 안전 정수가 아니다. */
+  | 'invalid_page_limit'
   /** DB가 돌려준 행의 모양이 스키마와 다르다 */
   | 'unexpected_row_shape'
 
@@ -258,6 +296,32 @@ export type WorkspaceTerminalResult = {
   readonly endedAt: string
 }
 
+/** {@link WorkspaceStore.listWorkspaces}의 요청 모양 (`§4.6`의 쿼리 셋, HTTP 유효성 검증
+ * 이전의 스토어 표면 — 라우트가 `state`·`after`를 그대로 문자열로 넘기면 된다). */
+export type ListWorkspacesOptions = {
+  /** `§4.1`의 다섯 이름 중 하나가 아니면 실패한다 (`invalid_state_filter`) — 부재만
+   * "필터 없음"이다. 타입을 `string`으로 둔 것은 검증을 이 스토어가 하기 때문이다
+   * (`§4.6` MUST NOT: 타입 불일치를 "필터 없음"으로 떨어뜨리지 않는다). */
+  readonly state?: string
+  /** 이 스토어가 {@link WorkspaceStore.listWorkspaces}로 발급한 불투명 커서. 해석되지
+   * 않으면 실패한다 (`invalid_cursor`) — 부재만 "처음부터"다. */
+  readonly after?: string
+  /** 페이지 크기. 부재면 `DEFAULT_PAGE_LIMIT`. 근거는 `listLogsForSubject`의 같은 필드와 같다. */
+  readonly limit?: number
+  /** 유기 판정의 grace 창, 밀리초. {@link GetWorkspaceOptions}의 같은 필드와 같은 값이어야
+   * 단건 조회와 목록 조회의 판정이 갈리지 않는다. */
+  readonly gracePeriodMs: number
+  /** 조회 기준 시각. 부재면 현재 시각. */
+  readonly now?: Date
+}
+
+export type ListWorkspacesPage = {
+  readonly workspaces: readonly WorkspaceRecord[]
+  /** `workspaces`의 마지막 항목 커서. `workspaces`가 비면 없다 (`§4.6`). */
+  readonly cursor?: string
+  readonly hasMore: boolean
+}
+
 export type WorkspaceStore = {
   /**
    * 작업공간을 개시한다 (`§4.2`). `lastHeartbeatAt`은 `openedAt`으로 초기화된다 (MUST).
@@ -329,6 +393,19 @@ export type WorkspaceStore = {
     workspaceId: string,
     options: WorkspaceTransitionOptions,
   ): Promise<WorkspaceTerminalResult>
+
+  /**
+   * 목록 조회 (`§4.6`). **요청 주체가 연 작업공간만** 실린다 — 다른 주체를 지정하거나
+   * 스코프를 끄는 인자는 없다 (MUST NOT, 파일 상단 doc). **필터 → 정렬 → `limit`** 순서로
+   * 적용된다 (MUST): `state`가 있으면 파생 상태 계산이 `WHERE`에서 일어나고(`resolveActiveState`와
+   * 같은 임계, 파일 상단 doc), 정렬은 `openedAt` 오름차순 + `workspaceId` 사전순 안정화다.
+   * `hasMore`는 필터 적용 **후** 건수를 말한다 (`listLogsForSubject`의 `LIMIT`+1 관례와 같다).
+   *
+   * @throws {WorkspaceStoreError} `state`가 `§4.1`의 다섯 이름 밖이면 (`invalid_state_filter`);
+   *   `after`가 이 스토어가 발급한 커서 모양이 아니면 (`invalid_cursor`); `limit`이 양의 안전
+   *   정수가 아니면 (`invalid_page_limit`).
+   */
+  listWorkspaces(subject: string, options: ListWorkspacesOptions): Promise<ListWorkspacesPage>
 
   /** 연결을 닫는다. 두 번 불러도 안전하다. 작업공간을 닫는 것은 {@link
    * WorkspaceStore.closeWorkspace}다 (파일 상단 doc). */
@@ -414,8 +491,8 @@ function rowToRecord(
   const storedEndedAt = columnAsNullableString(row['ended_at'])
 
   // `terminal_state`가 있으면 조각 2/3이 확정한 종단 상태를 그대로 낸다 — 재판정하지
-  // 않는다(`§4.1` MUST NOT: abandoned에서도 종단 상태에서도 부활이 없다). 오늘은 이 분기가
-  // 죽은 코드다 — 이 파일의 쓰기 경로가 그 컬럼을 채우지 않는다(파일 상단 doc).
+  // 않는다(`§4.1` MUST NOT: abandoned에서도 종단 상태에서도 부활이 없다). 이 분기를 채우는
+  // 쓰기 경로는 `heartbeat`의 유기 확정 · `closeWorkspace` · `revokeWorkspace`다(`§4.3`~`§4.5`).
   const { state, endedAt } =
     storedTerminalState === undefined
       ? resolveActiveState(lastHeartbeatAt, options)
@@ -437,6 +514,62 @@ function rowToRecord(
   }
 }
 
+/** `limit` 부재/유효성 판정. 근거는 `src/control/store.ts`의 `resolveLimit`과 같다(음수
+ * `LIMIT`은 SQLite에서 "무제한"으로 읽힌다). */
+function resolveLimit(limit: number | undefined): number {
+  if (limit === undefined) {
+    return DEFAULT_PAGE_LIMIT
+  }
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_ACCEPTED_LIMIT) {
+    throw new WorkspaceStoreError('invalid_page_limit')
+  }
+  return limit
+}
+
+/** `listWorkspaces`의 `state` 필터 판정 (`§4.6` MUST NOT: 빈 문자열·알 수 없는 값·타입
+ * 불일치를 "필터 없음"으로 떨어뜨리지 않는다). 부재만 "필터 없음"이다. */
+function resolveStateFilter(state: string | undefined): WorkspaceState | undefined {
+  if (state === undefined) {
+    return undefined
+  }
+  if (!WORKSPACE_STATE_NAMES.includes(state)) {
+    throw new WorkspaceStoreError('invalid_state_filter')
+  }
+  return state as WorkspaceState
+}
+
+/**
+ * `listWorkspaces`가 발급·해석하는 불투명 커서 — 정렬 키(`openedAt`, `workspaceId`) 두 값을
+ * JSON 배열로 담아 base64url로 감싼다. 불투명하기만 하면 되므로(`§4.6`) 인코딩은 이 파일의
+ * 판단이다 — JSON을 고른 이유는 이 스토어가 이미 `logs` 컬럼에 같은 방식(JSON 문자열)을 쓰고
+ * 있어 새 직렬화 관례를 늘리지 않기 때문이다.
+ */
+function encodeCursor(openedAt: string, workspaceId: string): string {
+  return Buffer.from(JSON.stringify([openedAt, workspaceId]), 'utf8').toString('base64url')
+}
+
+/** {@link encodeCursor}의 역. 모양이 어긋나면 `invalid_cursor`다 — 해석 불가 커서를 처음부터
+ * 주는 것은 `§4.6` MUST가 막는다. */
+function decodeCursor(raw: string): { readonly openedAt: string; readonly workspaceId: string } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
+  } catch {
+    throw new WorkspaceStoreError('invalid_cursor')
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 2 ||
+    typeof parsed[0] !== 'string' ||
+    typeof parsed[1] !== 'string' ||
+    Number.isNaN(new Date(parsed[0]).getTime()) ||
+    !WORKSPACE_ID_PATTERN.test(parsed[1])
+  ) {
+    throw new WorkspaceStoreError('invalid_cursor')
+  }
+  return { openedAt: parsed[0], workspaceId: parsed[1] }
+}
+
 function applyPragmas(db: DatabaseSync): void {
   db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
   db.exec('PRAGMA journal_mode = WAL')
@@ -456,6 +589,7 @@ class SqliteWorkspaceStore implements WorkspaceStore {
   readonly #selectSupersededBy: StatementSync
   readonly #moveHeartbeat: StatementSync
   readonly #writeTerminal: StatementSync
+  readonly #selectPage: StatementSync
   #closed = false
 
   constructor(db: DatabaseSync, randomBytes: RandomBytesFn) {
@@ -481,6 +615,28 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     this.#writeTerminal = db.prepare(
       `UPDATE workspaces SET terminal_state = ?, ended_at = ?
        WHERE workspace_id = ? AND terminal_state IS NULL AND last_heartbeat_at = ?`,
+    )
+    // `scored`가 파생 상태를 한 번만 계산한다(파일 상단 doc "목록 조회의 state 필터는
+    // WHERE에서 계산된다") — `derived_state = ?`가 `§4.6`의 판정 → 정렬 → limit 중 판정
+    // 자리다. 커서 부재는 호출부가 `('', '')`를 넘겨 표현한다 — `opened_at`은 항상 비어
+    // 있지 않은 ISO 문자열이라 `(opened_at, workspace_id) > ('', '')`가 항상 참이다. `state`
+    // 필터 부재도 호출부가 두 자리 모두 `null`을 넘겨 `? IS NULL`이 참이 되게 한다.
+    this.#selectPage = db.prepare(
+      `WITH scored AS (
+         SELECT workspace_id, opened_at, last_heartbeat_at, logs, supersedes, replica_id, terminal_state, ended_at,
+           CASE
+             WHEN terminal_state IS NOT NULL THEN terminal_state
+             WHEN last_heartbeat_at <= ? THEN 'abandoned'
+             ELSE 'active'
+           END AS derived_state
+         FROM workspaces
+         WHERE subject = ?
+       )
+       SELECT workspace_id, opened_at, last_heartbeat_at, logs, supersedes, replica_id, terminal_state, ended_at
+       FROM scored
+       WHERE (opened_at, workspace_id) > (?, ?) AND (? IS NULL OR derived_state = ?)
+       ORDER BY opened_at ASC, workspace_id ASC
+       LIMIT ?`,
     )
   }
 
@@ -615,6 +771,43 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     options: WorkspaceTransitionOptions,
   ): Promise<WorkspaceTerminalResult> {
     return this.#transitionToTerminal(subject, workspaceId, 'revoked', options)
+  }
+
+  async listWorkspaces(subject: string, options: ListWorkspacesOptions): Promise<ListWorkspacesPage> {
+    const limit = resolveLimit(options.limit)
+    const stateFilter = resolveStateFilter(options.state)
+    const cursor = options.after === undefined ? undefined : decodeCursor(options.after)
+    const now = options.now ?? new Date()
+
+    // `resolveActiveState`와 같은 부등식의 대수적 동치 — 파일 상단 doc "목록 조회의 state
+    // 필터는 WHERE에서 계산된다". 질의당 한 번만 계산되는 상수라 `#selectPage`에 그대로 싣는다.
+    const abandonThresholdIso = new Date(now.getTime() - options.gracePeriodMs).toISOString()
+
+    const rows = this.#selectPage.all(
+      abandonThresholdIso,
+      subject,
+      cursor?.openedAt ?? '',
+      cursor?.workspaceId ?? '',
+      stateFilter ?? null,
+      stateFilter ?? null,
+      limit + 1,
+    )
+    const hasMore = rows.length > limit
+    const page = hasMore ? rows.slice(0, limit) : rows
+
+    const workspaces = page.map((row) => {
+      const workspaceId = columnAsString(row['workspace_id'])
+      const supersededByRow = this.#selectSupersededBy.get(workspaceId)
+      const supersededBy = supersededByRow === undefined ? undefined : columnAsString(supersededByRow['workspace_id'])
+      return rowToRecord(workspaceId, row, { gracePeriodMs: options.gracePeriodMs, now, supersededBy })
+    })
+
+    const last = workspaces.at(-1)
+    return {
+      workspaces,
+      ...(last === undefined ? {} : { cursor: encodeCursor(last.openedAt, last.workspaceId) }),
+      hasMore,
+    }
   }
 
   /**
