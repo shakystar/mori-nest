@@ -1,85 +1,54 @@
 /**
- * 두 평면(전송 · 제어)이 공유하는 계약과, 전송 평면의 HTTP 서버.
+ * 두 평면(전송 · 제어)이 **공유하는** 계약.
  *
- * 여기 있는 것 대부분은 **어느 평면에도 속하지 않고 라우트를 하나도 모르는 것들뿐이다.**
+ * ## 셋으로 갈린 자리
  *
- * 예외는 `token.js`·`request.js`·`event.js`·`sse.js`·`pull.js`다 — 전송 평면의 게이트와 직렬화
- * (0003 §3.3 · 0002 §1.2 · §1.3·§2.1 · §4.3 · §3.1)이므로 평면에 속하지만, 서버도 저장소도 모르는
- * 순수 함수라 여기서 함께 나간다 (mori-nest #11 · #14 · #17 · #21 · #23). `request.js`는 라우트
- * **표**를 갖지만 라우트 **핸들러**는 갖지 않는다 — 판정 결과를 반환할 뿐 HTTP 응답을 쓰지
- * 않는다. `event.js`는 append **본문**의 게이트이고, 그 둘을 잇는 것(요청 게이트 → 본문
- * 게이트)은 서버 조각의 몫이다. `sse.js`는 subscribe 스트림의 프레임을 **문자열로** 만들 뿐
- * 연결도 타이머도 갖지 않는다 — 언제 보낼지는 연결을 가진 조각이 안다. `pull.js`도 같다:
- * 저장소가 고른 페이지를 **JSON 텍스트로** 만들 뿐, 페이지를 고르는 일(커서 해석·정렬·`limit`·
- * `hasMore` 판정)은 로그를 읽는 쪽의 것이다.
+ * ```
+ * src/transport/…   전송 평면 엔트리 — 자기 설정 스키마: keyId → 공개키 집합
+ * src/control/…     제어 평면 엔트리 — 자기 설정 스키마: private key
+ * src/…             양쪽이 import하는 것 (이 파일이 그 목록이다)
+ * ```
  *
- * `store.js`는 그 *"로그를 읽는 쪽"* 이다 (mori-nest #27). 위의 순수 함수들과 달리 파일과
- * 프로세스를 갖지만, **라우트는 여전히 모른다** — HTTP도 서버도 여기 없고, 이벤트를 붙이고
- * 페이지를 고르는 것까지가 전부다.
+ * 경계는 **배포 단위**에 그어져 있고, 코드에서 그것을 표현하는 최소 단위가 엔트리
+ * 모듈이다 (mori-nest #68 사람 결정 ① 정정 · #71). 패키지 분리·리포 분리는 그 위의
+ * 선택적 포장으로 남는다 — 독립 버저닝·별도 릴리즈 주기·운영 주체 분리 중 하나라도
+ * 실제로 생기면 그때 올린다.
  *
- * `server.js`가 그 둘(게이트 → 본문 게이트 → 스토어 → 응답)을 처음 잇는 조각이다
- * (mori-nest #28). `append`·`pull`·`subscribe` 세 라우트가 모두 배선돼 있다 (mori-nest #29·#30).
+ * ## 무엇이 여기 남았고, 왜 나머지는 나갔는가
+ *
+ * 판단 기준은 이 머리말이 이전부터 그어 둔 선 그대로다 — *"어느 평면에도 속하지 않고
+ * 라우트를 하나도 모르는 것"* 이 여기, *"전송 평면의 게이트와 직렬화"* 가 저기.
+ *
+ * 남은 것:
+ * - `errors.js` — 에러 봉투와 `code` 상수 (`0002 §1.5` · `0003 §1.3`). 두 평면의 실패
+ *   응답이 같은 모양인 것이 계약이므로, 이것이 갈리면 계약이 갈린다.
+ * - `body.js` — 최상위 필드 검증 (`0003 §1.3` MUST NOT). 라우트를 모르고, 어느 평면의
+ *   본문에도 같은 규율로 쓰인다 — 허용 필드 목록은 호출자가 준다.
+ * - `method.js` — `405` 판정. 라우트 표가 아니라 **메서드 대조**만 한다.
+ *
+ * 나간 것 (전부 `src/transport/`):
+ * - `token.js` (`0003 §3.2`·`§3.3`) — 작업공간 토큰 검증. 전송 평면이 자기 앞으로 온
+ *   토큰을 보는 게이트다. 제어 평면은 이 토큰을 **발급**하지 검증하지 않는다.
+ * - `request.js` (`0002 §1.2`) — 전송 3 라우트의 표와 요청 게이트.
+ * - `event.js` (`0002 §1.3`·`§2.1`) — append 본문 게이트.
+ * - `sse.js` (`0002 §4.3`) · `pull.js` (`0002 §3.1`) — 전송 응답 직렬화.
+ * - `store.js` — 전송 로그 저장소. 제어 평면은 자기 스토어를 따로 갖는다 (조각 3·4·5).
+ * - `server.js` — 위를 잇는 전송 HTTP 서버.
+ *
+ * 이 여섯이 순수 함수이거나 라우트를 모른다는 사실은 **평면 소속을 바꾸지 않는다.**
+ * 이전 머리말은 그 둘을 같은 축으로 다뤄 *"평면에 속하지만 … 여기서 함께 나간다"*고
+ * 적었는데, 축이 둘이다: 「어느 평면인가」와 「무엇을 아는가」. 자리를 정하는 것은 앞의
+ * 축이고, 뒤의 축은 그 평면 **안에서** 파일이 갈리는 방식이다.
+ *
+ * ## 여기서 전송 평면을 re-export하지 않는 이유
+ *
+ * 이 파일이 `src/transport/`를 re-export하면 이 파일이 곧 세 번째 엔트리가 되고, 제어
+ * 평면만 띄우려는 부트스트랩도 이것 하나를 import하는 순간 전송 평면 전체를 끌어온다 —
+ * 배포 단위에 그은 경계가 코드에서 다시 지워진다. 전송 표면은
+ * `src/transport/index.ts`가, 제어 표면은 `src/control/index.ts`가 낸다.
+ * `package.json`의 `exports`도 그 셋(`.` · `./transport` · `./control`)을 그대로 낸다.
  */
 
 export { ErrorCodes, errorResponse, type ErrorCode, type ErrorResponse } from './errors.js'
 export { parseBody, type BodyParseResult } from './body.js'
-export {
-  parseAppendRequest,
-  type AppendEvent,
-  type AppendRequestErrorStatus,
-  type AppendRequestResult,
-} from './event.js'
 export { checkMethod, type MethodCheckResult } from './method.js'
-export {
-  createVerificationKeySet,
-  verifyWorkspaceToken,
-  checkLogScope,
-  type VerificationKeySet,
-  type WorkspaceTokenClaims,
-  type VerifiedWorkspaceToken,
-  type TokenVerificationResult,
-  type ScopeCheckResult,
-} from './token.js'
-export {
-  verifyTransportRequest,
-  type RawRequest,
-  type CursorStart,
-  type TransportRoute,
-  type TransportRequest,
-  type TransportErrorStatus,
-  type TransportRequestResult,
-} from './request.js'
-export {
-  serializeOpenFrame,
-  serializeAppendFrame,
-  serializeHeartbeatFrame,
-  serializeResetFrame,
-  type OpenFrom,
-  type AppendFrameEvent,
-  type AppendFrameFailure,
-  type AppendFrameResult,
-} from './sse.js'
-export {
-  serializePullResponse,
-  type PullEvent,
-  type PullPage,
-  type PullResponseFailure,
-  type PullResponseResult,
-} from './pull.js'
-export {
-  openEventStore,
-  eventProvenanceOf,
-  EventStoreError,
-  DEFAULT_PAGE_LIMIT,
-  type AppendResult,
-  type EventProvenance,
-  type EventStore,
-  type EventStoreFailure,
-  type StoredEventRef,
-} from './store.js'
-export {
-  createTransportServer,
-  type TransportDiagnostic,
-  type TransportDiagnosticSite,
-  type TransportServerOptions,
-} from './server.js'

@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { OnceSignal } from '../src/server.js'
+import { OnceSignal } from '../src/transport/server.js'
 
 describe('OnceSignal — fire()는 대기자를 전부 비우고, 그 뒤 재호출로 다시 쌓이지 않는다', () => {
   it('fire() 이후에는 대기자가 전부 비워지고, 그 뒤 wait()는 즉시 resolve되며 쌓이지 않는다', async () => {

@@ -81,7 +81,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 
-import { ErrorCodes, errorResponse } from './errors.js'
+import { ErrorCodes, errorResponse } from '../errors.js'
 import { MIN_MAX_EVENT_BYTES, parseAppendRequest } from './event.js'
 import { serializePullResponse, type PullPage } from './pull.js'
 import { verifyTransportRequest, type CursorStart, type RawRequest } from './request.js'

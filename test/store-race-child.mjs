@@ -16,7 +16,7 @@
 
 import { writeSync } from 'node:fs'
 
-import { openEventStore } from '../src/store.ts'
+import { openEventStore } from '../src/transport/store.ts'
 
 const [dbPath, logId, startAtMs, idList] = process.argv.slice(2)
 if (dbPath === undefined || logId === undefined || startAtMs === undefined || idList === undefined) {

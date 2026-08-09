@@ -17,8 +17,8 @@ import type { Server } from 'node:http'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { createTransportServer } from '../src/server.js'
-import { openEventStore, type EventStore } from '../src/store.js'
+import { createTransportServer } from '../src/transport/server.js'
+import { openEventStore, type EventStore } from '../src/transport/store.js'
 import { NOW, baseClaims, keys, mint } from './workspace-token.js'
 
 const LOG_ID = 'log_append-route'

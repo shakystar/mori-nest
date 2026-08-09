@@ -25,8 +25,8 @@
  * 깨뜨릴 자리가 없다 — 자르기만 한다.
  */
 
-import { ErrorCodes, errorResponse, type ErrorResponse } from './errors.js'
-import { parseBody } from './body.js'
+import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
+import { parseBody } from '../body.js'
 
 /**
  * `0002 §1.3` L86: `id := ^[A-Za-z0-9_.:-]{1,256}$`.
