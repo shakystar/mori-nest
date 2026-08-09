@@ -40,11 +40,11 @@
  * 참이다 — 서명 **능력**이 이 평면에 들어왔지만, 오늘 서 있는 라우트 중 그것을 부르는
  * 것은 없다.
  *
- * 같은 이유로 작업공간 생애 추적의 스토어(`./workspace-store.js` · #97, `§4` 조각 1/3)도
- * 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)와 단건 조회(`getWorkspace`)뿐이고, 하트비트·
- * 종료·폐기 전이(조각 2/3)와 목록 조회(조각 3/3)는 아직 없다. `gracePeriod`·조회 시각도
- * 이 스토어의 메서드 인자이지 `parseControlConfig`의 필드가 아니다 — 그 값을 정하는
- * 라우트가 아직 없다.
+ * 같은 이유로 작업공간 생애 추적의 스토어(`./workspace-store.js` · #97 조각 1/3, #98 조각
+ * 2/3)도 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)·단건 조회(`getWorkspace`)·세
+ * 전이(`heartbeat`·`closeWorkspace`·`revokeWorkspace`)까지고, 목록 조회(조각 3/3)는 아직
+ * 없다. `gracePeriod`·조회 시각·전이 시각도 이 스토어의 메서드 인자이지 `parseControlConfig`의
+ * 필드가 아니다 — 그 값을 정하는 라우트가 아직 없다.
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
@@ -105,6 +105,7 @@ export {
   openWorkspaceStore,
   resolveActiveState,
   WorkspaceStoreError,
+  type CloseOutcome,
   type GetWorkspaceOptions,
   type OpenWorkspaceRequest,
   type WorkspaceRecord,
@@ -112,6 +113,8 @@ export {
   type WorkspaceStore,
   type WorkspaceStoreFailure,
   type WorkspaceStoreOptions,
+  type WorkspaceTerminalResult,
+  type WorkspaceTransitionOptions,
 } from './workspace-store.js'
 
 export {
