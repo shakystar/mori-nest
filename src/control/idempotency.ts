@@ -37,6 +37,8 @@ import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqli
 /** `0003 §1.4`: `Idempotency-Key := ^[A-Za-z0-9_.:-]{1,128}$`. */
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
 
+export type IdempotencyKeyResult = { readonly ok: true; readonly key: string } | { readonly ok: false }
+
 /**
  * `Idempotency-Key` 헤더 값의 형식 판정.
  *
@@ -48,8 +50,6 @@ const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
  * @param headerValue 이미 단일 값으로 좁혀진 헤더 값 (중복 헤더 판정은 부르는 쪽의 몫이다 —
  *   `request.ts`의 `atMostOne`이 그 선례다).
  */
-export type IdempotencyKeyResult = { readonly ok: true; readonly key: string } | { readonly ok: false }
-
 export function parseIdempotencyKey(headerValue: string | null | undefined): IdempotencyKeyResult {
   if (headerValue === null || headerValue === undefined || !IDEMPOTENCY_KEY_PATTERN.test(headerValue)) {
     return { ok: false }
@@ -241,8 +241,11 @@ class SqliteIdempotencyStore implements IdempotencyStore {
       'UPDATE idempotency_keys SET request_hash = ?, status = NULL, response_body = NULL, created_at = ? ' +
         'WHERE subject = ? AND key = ? AND created_at = ?',
     )
+    // `status IS NULL`을 걸어 이미 완료된 예약을 다시 덮지 않는다 — 이 계층이 세운 «재시도는
+    // 첫 결과 그대로»(§1.4 MUST)를 지키는 마지막 방어선이 라우트 배선(다음 조각)이 아니라
+    // 여기 있어야, 자원 생성 코드의 실수로 `complete`가 두 번 불려도 첫 응답이 살아남는다.
     this.#complete = db.prepare(
-      'UPDATE idempotency_keys SET status = ?, response_body = ? WHERE subject = ? AND key = ?',
+      'UPDATE idempotency_keys SET status = ?, response_body = ? WHERE subject = ? AND key = ? AND status IS NULL',
     )
   }
 
@@ -288,7 +291,10 @@ class SqliteIdempotencyStore implements IdempotencyStore {
     }
 
     if (row.requestHash !== requestHash) {
-      // `§1.4` MUST: 같은 키·다른 본문 → 조용히 첫 결과를 주지 않는다.
+      // `§1.4` MUST: 같은 키·다른 본문 → 조용히 첫 결과를 주지 않는다. 본문 불일치는 완료
+      // 여부보다 먼저 판정한다 — 만료 후 재예약(claim) 경쟁에서 진 쪽이 이긴 쪽과 다른
+      // 본문이면, 이긴 쪽의 `complete` 호출 전(아직 `status`가 없는 시점)이라도 최초 삽입
+      // 경쟁 때와 같은 규율로 `conflict`를 받는다 — `in_progress`로 완화하지 않는다.
       return { kind: 'conflict' }
     }
     if (row.status === null) {

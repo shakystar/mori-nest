@@ -12,6 +12,9 @@ import { openIdempotencyStore, parseIdempotencyKey, type IdempotencyStore } from
  * `0003 §1.4`의 MUST 줄마다 하나 — 다섯 건, 그 이상 만들지 않는다 (mori-nest #73 완료 조건).
  * 키 형식 정규식의 문자별 케이스는 여기서 별도 시험을 두지 않고 ①에 유효·무효 대표값
  * 하나씩으로 접는다 (완료 조건의 "만들지 않는 것" 절).
+ *
+ * ⑥은 완료 조건 밖 — PR #79 owner 수정요청이 요구한 회귀 시험이다 (`complete()`가
+ * `status IS NULL` 없이 무조건 `UPDATE`했을 때 이미 완료된 예약을 조용히 덮어쓰던 결함).
  */
 
 const RACE_CHILD = fileURLToPath(new URL('./idempotency-race-child.mjs', import.meta.url))
@@ -146,5 +149,20 @@ describe('제어 평면 멱등성 계층 (0003 §1.4)', () => {
     const afterRetention = new Date(t0.getTime() + RETENTION_MS)
     const freshResource = await store.reserve('subject-a', 'retention-key', body, afterRetention)
     expect(freshResource).toEqual({ kind: 'reserved' })
+  })
+
+  it('⑥ 이미 완료된 예약에 complete를 두 번 부르면 두 번째는 실패하고 첫 응답이 그대로 남는다', async () => {
+    await store.reserve('subject-a', 'double-complete-key', '{"logs":["a"]}')
+    await store.complete('subject-a', 'double-complete-key', { status: 201, body: '{"logId":"log_first"}' })
+
+    await expect(
+      store.complete('subject-a', 'double-complete-key', { status: 201, body: '{"logId":"log_second"}' }),
+    ).rejects.toMatchObject({ reason: 'reservation_not_found' })
+
+    const replay = await store.reserve('subject-a', 'double-complete-key', '{"logs":["a"]}')
+    expect(replay).toEqual({
+      kind: 'replay',
+      record: { status: 201, body: '{"logId":"log_first"}' },
+    })
   })
 })
