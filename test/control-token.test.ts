@@ -46,6 +46,20 @@ function expectFailure(run: () => string, reason: WorkspaceTokenIssueFailure): W
   return error
 }
 
+/**
+ * 거부가 **어느 검사**에서 났는지까지 꺼낸다.
+ *
+ * 「서명이 그 바이트를 덮는다」를 `ok === false`로만 단언하면 다른 검사가 대신
+ * 떨어뜨려도 초록이 된다 — `audience` 바이트를 뒤집은 토큰은 서명이 그 바이트를 전혀
+ * 덮지 않아도 `§3.3` 검사 2에서 떨어지므로, 그 초록은 아무것도 증명하지 않는다.
+ */
+function failedCheckOf(result: ReturnType<typeof verifyWorkspaceToken>): unknown {
+  if (result.ok) {
+    throw new Error('expected the token to be rejected, but it verified')
+  }
+  return result.error.error.details?.['failedCheck']
+}
+
 /** 클레임 세그먼트 안의 `needle` 첫 바이트를 뒤집는다. ASCII 안에서 움직이므로 길이는 그대로다. */
 function flipByteInClaims(token: string, needle: string): string {
   const [version = '', keyId = '', claimsSegment = '', signature = ''] = token.split('.')
@@ -101,7 +115,9 @@ describe('issueWorkspaceToken', () => {
       [tamperedKeyId, issuer.publicKey],
     ])
 
-    expect(verifyWorkspaceToken(tampered, keysWithBoth, { now: NOW }).ok).toBe(false)
+    expect(failedCheckOf(verifyWorkspaceToken(tampered, keysWithBoth, { now: NOW }))).toBe(
+      'signature',
+    )
   })
 
   // 3 — 같은 성질의 나머지 절반: 클레임 블록도 전부 서명에 덮인다. 변조 경로가 되기
@@ -111,7 +127,11 @@ describe('issueWorkspaceToken', () => {
 
     for (const needle of ['agent/developer', 'transport']) {
       const tampered = flipByteInClaims(token, needle)
-      expect(verifyWorkspaceToken(tampered, keys, { now: NOW }).ok, needle).toBe(false)
+      // 검사 이름까지 본다 — `audience`는 검사 2로도 떨어지므로 `ok === false`만으로는
+      // 서명이 그 바이트를 덮는다는 증거가 되지 않는다.
+      expect(failedCheckOf(verifyWorkspaceToken(tampered, keys, { now: NOW })), needle).toBe(
+        'signature',
+      )
     }
   })
 
