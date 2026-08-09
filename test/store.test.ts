@@ -110,6 +110,19 @@ function isSubsequence(needle: readonly string[], haystack: readonly string[]): 
   return index === needle.length
 }
 
+/**
+ * Node의 프로세스 경고는 자식이 정상일 때도 stderr에 찍힌다 — 이 자식은 `node:sqlite`를
+ * import하므로 CI 핀(22.23.1)에서 `ExperimentalWarning` 두 줄이 항상 먼저 나온다.
+ * 크래시 신호(예외 스택)와 구분하려면 걷어내고 봐야 한다.
+ */
+function crashSignal(stderr: string): string {
+  return stderr
+    .split('\n')
+    .filter((line) => !/^\(node:\d+\) \w*Warning:/.test(line) && !line.startsWith('(Use `node --trace-warnings'))
+    .join('\n')
+    .trim()
+}
+
 /** 자식을 띄워 append를 돌리다 임의 시점에 SIGKILL하고, 그때까지 ack된 id들을 돌려준다. */
 function runDurabilityRound(dbPath: string, logId: string, round: number): Promise<string[]> {
   return new Promise((resolve, reject) => {
@@ -145,10 +158,14 @@ function runDurabilityRound(dbPath: string, logId: string, round: number): Promi
       if (killTimer !== undefined) {
         clearTimeout(killTimer)
       }
-      if (acks.length === 0) {
+      if (acks.length === 0 && crashSignal(stderr) !== '') {
+        // 경고를 걷어내고도 남는 stderr가 있으면 자식이 예외로 죽은 것 — 이건 병리이므로 실패로 남긴다.
         reject(new Error(`라운드 ${round}: 자식이 ack를 하나도 남기지 않았다\n${stderr}`))
         return
       }
+      // ack 0건인데 크래시 신호도 없으면 첫 append 전에 SIGKILL을 맞은 것뿐이다.
+      // "ack된 것은 전량이 같은 상대 순서로 남는다"는 ack이 0건인 라운드에서 공허하게
+      // 참이므로 실패가 아니다 — 표본 부족은 루프 밖의 집계 단언(`acked.length > ROUNDS`)이 잡는다.
       resolve(acks)
     })
   })
