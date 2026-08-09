@@ -12,17 +12,26 @@
  * {@link parseControlConfig} 하나다. 전송 쪽(`src/transport/index.ts`)은 반대로 private
  * 키를 거부한다.
  *
- * ## 오늘 이 평면에 라우트는 0건이다
+ * ## 오늘 이 평면에 선 것은 로그 라우트 셋이다
  *
- * 닫히면서 `logId` mint와 (주체, 로그) 관계가 `./store.js`로 섰고(mori-nest #68 조각 3/5 ·
- * #72), `Idempotency-Key` 계층(조각 4/5, `0003 §1.4`)이 `./idempotency.js`로 섰다 — 두
- * 라우트(`POST /v1/logs`·`POST /v1/workspaces`)가 공유해서 탈 재사용 가능한 계층이고,
- * 자원 스토어와 독립이라 먼저 설 수 있었다. 런처 자격증명의 발급·조회 판정·즉시 폐기도
- * `./credential.js`로 섰다(조각 5/5 · #74). 그래도 제어 평면 6 라우트와 서버는 여전히
- * 여기 없다 — 라우트 배선 자체가 다음 사이클 조각이기 때문이다(#74 비범위). 발급 HTTP
- * 라우트도 이 조각의 비범위다(`§1.1` — "오늘은 운영자가 손으로 발급하는 것으로 족하다").
- * 발급에 필요한 나머지 설정(서명 키의 `keyId`, 토큰 수명 등)도 그것을 쓰는 라우트와 함께
- * 온다 — 쓰는 코드가 없는 필드를 스키마에 미리 만들지 않는다.
+ * `0003 §8-2`(런처 자격의 형태)·`§8-3`((주체, 로그) 관계)의 스펙 미결이 mori-nest #68 사람
+ * 결정으로 닫히면서, 그 위에 설 계층들이 차례로 섰다: `logId` mint와 (주체, 로그) 관계가
+ * `./store.js`로(mori-nest #68 조각 3/5 · #72), `Idempotency-Key` 계층(조각 4/5, `0003 §1.4`)이
+ * `./idempotency.js`로 — 두 라우트(`POST /v1/logs`·`POST /v1/workspaces`)가 공유해서 탈
+ * 재사용 가능한 계층이고, 자원 스토어와 독립이라 먼저 설 수 있었다 —, 런처 자격증명의
+ * 발급·조회 판정·즉시 폐기가 `./credential.js`로(조각 5/5 · #74) 섰다.
+ *
+ * 그 위에 요청 판정(`./request.js`, 라우트 조각 1/2 · #83)과 HTTP 서버·라우트 배선
+ * (`./server.js`, 라우트 조각 2/2 · #84)이 얹히면서 **로그 라우트 셋이 실제로 응답한다** —
+ * `POST /v1/logs`(`§2.1`) · `GET /v1/logs` · `GET /v1/logs/{logId}`(`§2.4`). `§0` 표의 여덟
+ * 행 중 둘(로그 발급·로그 조회)이 이것이다.
+ *
+ * 나머지 여섯 행은 아직 없다 — 로그 폐기(`§2.6`·`§3.5`)와 작업공간 계열 다섯(개시·하트비트·
+ * 종료·폐기·조회, `§4`). 자격증명의 **발급 HTTP 라우트**도 여전히 없다(`§1.1` — "오늘은
+ * 운영자가 손으로 발급하는 것으로 족하다"). 발급에 필요한 나머지 설정(서명 키의 `keyId`,
+ * 토큰 수명 등)도 그것을 쓰는 라우트와 함께 온다 — 쓰는 코드가 없는 필드를 스키마에 미리
+ * 만들지 않는다. 그래서 아래 {@link parseControlConfig}가 오늘 아는 필드는 여전히
+ * `signingKey` 하나다: 라우트가 셋 섰어도 그 셋 중 서명하는 것은 없다.
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
@@ -69,6 +78,17 @@ export {
   type LauncherCredentialStoreOptions,
   type LauncherCredentialVerification,
 } from './credential.js'
+
+export {
+  verifyControlRequest,
+  type ControlErrorStatus,
+  type ControlRequest,
+  type ControlRequestResult,
+  type ControlRoute,
+  type RawRequest,
+} from './request.js'
+
+export { createControlServer, type ControlServerOptions } from './server.js'
 
 /** 이 평면의 설정 스키마가 정의한 최상위 필드 **전부**. */
 const CONTROL_CONFIG_FIELDS = ['signingKey'] as const
