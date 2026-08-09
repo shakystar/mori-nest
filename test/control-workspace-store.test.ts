@@ -1,14 +1,15 @@
 /**
  * 작업공간 생애 추적 — 개시 + 단건 조회 + 파생 상태 (mori-nest #97, #68 범위 5번 조각 1/3),
- * 하트비트·종료·폐기 전이 (#98 조각 2/3), 그리고 목록 조회 (#99 조각 3/3, #109가 배치
- * `supersededBy` 해소 검증 1건을 얹었다).
+ * 하트비트·종료·폐기 전이 (#98 조각 2/3), 목록 조회 (#99 조각 3/3, #109가 배치
+ * `supersededBy` 해소 검증 1건을 얹었다), 그리고 포크 판정 (#117, `§4.10` advisory 조각 1/2).
  *
- * 세 이슈 본문이 못박은 대로 **다섯 건 + 여섯 건 + 다섯 건**(+ #109의 1건)이고, 그 이상
- * 만들지 않는다.
+ * 세 이슈 본문이 못박은 대로 **다섯 건 + 여섯 건 + 다섯 건**(+ #109의 1건 + #117의 세 건)이고,
+ * 그 이상 만들지 않는다.
  *
- * 목록 조회 테스트는 `openedAt` 순서를 검증해야 하는데 `openWorkspace`는 `new Date()`로
- * `openedAt`을 정하므로(주입 지점이 없다), 같은 밀리초에 걸리면 순서 단언이 들쭉날쭉해진다.
- * `vi.useFakeTimers()` + `vi.setSystemTime`으로 각 개시 사이의 시각을 고정해 결정적으로 만든다.
+ * 목록 조회·포크 판정 테스트는 `openedAt` 순서/겹침을 검증해야 하는데 `openWorkspace`는
+ * `new Date()`로 `openedAt`을 정하므로(주입 지점이 없다), 같은 밀리초에 걸리면 순서·경계
+ * 단언이 들쭉날쭉해진다. `vi.useFakeTimers()` + `vi.setSystemTime`으로 각 개시 사이의 시각을
+ * 고정해 결정적으로 만든다.
  */
 
 import { describe, expect, it, vi } from 'vitest'
@@ -394,5 +395,96 @@ describe('WorkspaceStore.listWorkspaces', () => {
     await expectFailure(store.listWorkspaces('alice', { state: 'bogus', gracePeriodMs }), 'invalid_state_filter')
     await expectFailure(store.listWorkspaces('alice', { state: '', gracePeriodMs }), 'invalid_state_filter')
     await expectFailure(store.listWorkspaces('alice', { after: 'not-a-cursor', gracePeriodMs }), 'invalid_cursor')
+  })
+})
+
+/** 고정 시각에 `replicaId`를 신고하며 개시한다 — `openSequenced`와 같은 이유(파일 상단 doc)로
+ * `openedAt`을 결정적으로 만든다. 호출 전에 `vi.useFakeTimers()`가 이미 걸려 있어야 한다. */
+async function openReplicaAt(
+  store: WorkspaceStore,
+  subject: string,
+  replicaId: string | undefined,
+  atMs: number,
+): Promise<string> {
+  vi.setSystemTime(atMs)
+  const { workspaceId } = await store.openWorkspace(subject, { logs: ['log-a'], ...(replicaId === undefined ? {} : { replicaId }) })
+  return workspaceId
+}
+
+describe('WorkspaceStore.findForkAdvisory (§4.10 포크 판정, advisory 조각 1/2)', () => {
+  it('겹치면 advisory가 나온다 — 같은 replicaId의 두 active, 그리고 abandoned(파생) ↔ active', async () => {
+    // 모양 1: 같은 replicaId의 두 active 작업공간.
+    const store1 = await openWorkspaceStore(':memory:')
+    vi.useFakeTimers()
+    const a1 = await openReplicaAt(store1, 'alice', 'r1', 0)
+    const b1 = await openReplicaAt(store1, 'alice', 'r1', 1_000)
+    vi.useRealTimers()
+
+    expect(await store1.findForkAdvisory('alice', a1, { gracePeriodMs: 60_000, now: new Date(2_000) })).toEqual({
+      replicaId: 'r1',
+      overlappingWorkspaceId: b1,
+    })
+
+    // 모양 2: a2는 하트비트 없이 방치돼 조회 시각(1_400)엔 이미 파생 abandoned(deadline 1_000)다
+    // — 그래도 b2가 열린 시각(500)엔 a2가 아직 안 닫혀 있었으므로 두 활성 구간이 겹친다.
+    // a2 구간 [0, 1_000), b2 구간 [500, 1_400)(b2는 조회 시각에도 아직 active).
+    const store2 = await openWorkspaceStore(':memory:')
+    const gracePeriodMs2 = 1_000
+    vi.useFakeTimers()
+    const a2 = await openReplicaAt(store2, 'alice', 'r1', 0)
+    const b2 = await openReplicaAt(store2, 'alice', 'r1', 500)
+    vi.useRealTimers()
+
+    expect(await store2.findForkAdvisory('alice', b2, { gracePeriodMs: gracePeriodMs2, now: new Date(1_400) })).toEqual({
+      replicaId: 'r1',
+      overlappingWorkspaceId: a2,
+    })
+  })
+
+  it('안 겹치면 undefined다 — close 뒤에 열린 경우와, endedAt과 openedAt이 정확히 맞닿는 경계 접촉', async () => {
+    const gracePeriodMs = 60_000
+
+    // close 뒤에 열린 경우: b의 openedAt(200)이 a의 endedAt(100)보다 뒤다.
+    const store1 = await openWorkspaceStore(':memory:')
+    vi.useFakeTimers()
+    const a1 = await openReplicaAt(store1, 'alice', 'r1', 0)
+    vi.setSystemTime(100)
+    await store1.closeWorkspace('alice', a1, 'flushed', { gracePeriodMs, now: new Date(100) })
+    const b1 = await openReplicaAt(store1, 'alice', 'r1', 200)
+    vi.useRealTimers()
+
+    expect(await store1.findForkAdvisory('alice', b1, { gracePeriodMs, now: new Date(300) })).toBeUndefined()
+
+    // 경계 접촉: c의 openedAt이 a2의 endedAt과 정확히 같다 — 반열린 구간이라 겹침이 아니다.
+    const store2 = await openWorkspaceStore(':memory:')
+    vi.useFakeTimers()
+    const a2 = await openReplicaAt(store2, 'alice', 'r1', 0)
+    vi.setSystemTime(100)
+    await store2.closeWorkspace('alice', a2, 'flushed', { gracePeriodMs, now: new Date(100) })
+    const c = await openReplicaAt(store2, 'alice', 'r1', 100)
+    vi.useRealTimers()
+
+    expect(await store2.findForkAdvisory('alice', c, { gracePeriodMs, now: new Date(200) })).toBeUndefined()
+  })
+
+  it('제외 규칙 — 자기 자신뿐인 경우, 다른 주체의 같은 replicaId, 상대의 replicaId 미신고는 모두 undefined다', async () => {
+    const store = await openWorkspaceStore(':memory:')
+    const gracePeriodMs = 60_000
+    vi.useFakeTimers()
+    const self = await openReplicaAt(store, 'alice', 'r1', 0)
+    vi.useRealTimers()
+    expect(await store.findForkAdvisory('alice', self, { gracePeriodMs, now: new Date(1_000) })).toBeUndefined()
+
+    // 다른 주체가 같은 replicaId·겹치는 시간으로 열려도, subject가 다르면 비교되지 않는다.
+    vi.useFakeTimers()
+    await openReplicaAt(store, 'mallory', 'r1', 500)
+    vi.useRealTimers()
+    expect(await store.findForkAdvisory('alice', self, { gracePeriodMs, now: new Date(1_000) })).toBeUndefined()
+
+    // 같은 주체·겹치는 시간이라도 상대가 replicaId를 신고하지 않았으면 비교되지 않는다.
+    vi.useFakeTimers()
+    await openReplicaAt(store, 'alice', undefined, 600)
+    vi.useRealTimers()
+    expect(await store.findForkAdvisory('alice', self, { gracePeriodMs, now: new Date(1_000) })).toBeUndefined()
   })
 })
