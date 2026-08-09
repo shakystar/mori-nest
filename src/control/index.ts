@@ -14,11 +14,12 @@
  *
  * ## 오늘 이 평면에 라우트는 0건이다
  *
- * `0003 §8-2`(런처 자격증명의 형태)·`§8-3`(grant 판정 규칙)이 아직 열려 있어 제어 평면
- * 6 라우트는 착수할 수 없다. 그래서 이 엔트리는 **설정 스키마와 모듈 경계까지**다 —
- * 라우트도 서버도 스토어도 여기 없고, 그것들은 후속 조각(mori-nest #68 조각 3·4·5)이
- * 이 자리 위에 세운다. 발급에 필요한 나머지 설정(서명 키의 `keyId`, 토큰 수명 등)도
- * 그것을 쓰는 라우트와 함께 온다 — 쓰는 코드가 없는 필드를 스키마에 미리 만들지 않는다.
+ * `0003 §8-2`(런처 자격증명의 형태)·`§8-3`(grant 판정 규칙)이 mori-nest #68의 사람 결정으로
+ * 닫히면서 `logId` mint와 (주체, 로그) 관계가 `./store.js`로 섰다(mori-nest #68 조각 3/5 ·
+ * #72). 그래도 제어 평면 6 라우트와 서버는 여전히 여기 없다 — 자격증명 인증(조각 5/5)과
+ * `Idempotency-Key` 계층(조각 4/5)이 아직 없어 라우트를 배선할 수 없기 때문이다. 발급에
+ * 필요한 나머지 설정(서명 키의 `keyId`, 토큰 수명 등)도 그것을 쓰는 라우트와 함께 온다 —
+ * 쓰는 코드가 없는 필드를 스키마에 미리 만들지 않는다.
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
@@ -30,6 +31,20 @@
  */
 
 import { KeyObject } from 'node:crypto'
+
+export {
+  mintLogId,
+  openControlStore,
+  ControlStoreError,
+  DEFAULT_PAGE_LIMIT,
+  type ControlStore,
+  type ControlStoreFailure,
+  type ControlStoreOptions,
+  type ListLogsForSubjectOptions,
+  type ListLogsForSubjectPage,
+  type LogRecord,
+  type RandomBytesFn,
+} from './store.js'
 
 /** 이 평면의 설정 스키마가 정의한 최상위 필드 **전부**. */
 const CONTROL_CONFIG_FIELDS = ['signingKey'] as const
