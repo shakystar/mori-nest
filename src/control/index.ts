@@ -33,6 +33,13 @@
  * 만들지 않는다. 그래서 아래 {@link parseControlConfig}가 오늘 아는 필드는 여전히
  * `signingKey` 하나다: 라우트가 셋 섰어도 그 셋 중 서명하는 것은 없다.
  *
+ * `§4` 라우트의 **선행 조각**으로 작업공간 토큰 발급자(`./token.js` · #94)가 먼저 섰다 —
+ * `0003 §3.2`의 와이어 형식으로 토큰 문자열을 짓는 함수 하나이고, 작업공간을 모른다.
+ * 그것이 `keyId`와 두 시각을 **인자로** 받는 이유가 바로 위 관례다: 그 값을 정하는
+ * 라우트(`POST /v1/workspaces`)가 아직 없으므로 설정 자리도 아직 없다. 위 문장은 그대로
+ * 참이다 — 서명 **능력**이 이 평면에 들어왔지만, 오늘 서 있는 라우트 중 그것을 부르는
+ * 것은 없다.
+ *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
  * 전송 엔트리와 같은 이유로 이 모듈도 **프로세스를 모른다** — env를 읽지 않고,
@@ -78,6 +85,14 @@ export {
   type LauncherCredentialStoreOptions,
   type LauncherCredentialVerification,
 } from './credential.js'
+
+export {
+  issueWorkspaceToken,
+  WorkspaceTokenIssueError,
+  type WorkspaceTokenClaims,
+  type WorkspaceTokenIssueFailure,
+  type WorkspaceTokenIssueInput,
+} from './token.js'
 
 export {
   verifyControlRequest,

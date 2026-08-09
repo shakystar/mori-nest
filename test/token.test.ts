@@ -9,6 +9,7 @@
  */
 
 import { Buffer } from 'node:buffer'
+import { sign } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -17,16 +18,32 @@ import {
   verifyWorkspaceToken,
   type VerifiedWorkspaceToken,
 } from '../src/transport/token.js'
-import {
-  KEY_ID,
-  NOW,
-  baseClaims,
-  encodeClaimBlock,
-  issuer,
-  keys,
-  mint,
-  otherIssuer,
-} from './workspace-token.js'
+import { KEY_ID, NOW, baseClaims, issuer, keys, mint, otherIssuer } from './workspace-token.js'
+
+// ── 위조기 ───────────────────────────────────────────────────────────────────
+//
+// 아래 두 함수는 **발급자가 만들기를 거부하는 토큰**을 만든다 (빈 스코프·잉여 바이트·
+// 다른 `version`). 검증자의 엄격 파싱(`§3.2`)을 시험하려면 그런 바이트열이 필요한데,
+// 정의상 프로덕션 발급자(`src/control/token.ts`)로는 만들 수 없다 — 그것을 거부하는
+// 것이 발급자의 계약이기 때문이다 (mori-nest #94).
+//
+// 그래도 **형식을 여기서 다시 구현하지는 않는다.** 위조는 발급자가 지은 정상 토큰에서
+// 클레임 블록을 꺼내 필요한 만큼만 손대는 방식이고, 그래서 형식의 정본은 여전히 한
+// 곳(`§3.2` 표 → `src/control/token.ts`)뿐이다.
+
+/** 정상 발급된 토큰에서 클레임 블록 바이트를 꺼낸다. */
+function claimBlockOf(token: string): Buffer {
+  const [, , claimsSegment = ''] = token.split('.')
+  return Buffer.from(claimsSegment, 'base64url')
+}
+
+/** 임의의 바이트열을 클레임 블록 자리에 넣고 `§3.2`의 서명 메시지로 서명한다. */
+function forge(claimBlock: Buffer, options: { version?: string } = {}): string {
+  const version = options.version ?? 'mnw1'
+  const claimsSegment = claimBlock.toString('base64url')
+  const message = Buffer.from(`${version}.${KEY_ID}.${claimsSegment}`, 'latin1')
+  return `${version}.${KEY_ID}.${claimsSegment}.${sign(null, message, issuer.privateKey).toString('base64url')}`
+}
 
 /** 실패 응답에서 code를 꺼낸다 — 통과했으면 테스트가 그 자리에서 깨져야 한다. */
 function rejectionOf(result: ReturnType<typeof verifyWorkspaceToken>): string {
@@ -125,9 +142,14 @@ describe('verifyWorkspaceToken', () => {
 
   // 9 — §3.2: 원소 수 0은 이 형식에 존재하지 않으므로 파싱에서 떨어진다.
   it('rejects a claim block whose scope element count is zero', () => {
-    const token = mint(baseClaims(), { claimBlock: encodeClaimBlock(baseClaims({ scope: [] })) })
+    // 원소가 하나뿐인 블록의 꼬리는 `u16 원소 수(2) + u8 길이(1) + 그 1바이트`다.
+    // 꼬리를 잘라내고 원소 수 0을 다시 붙이면 발급자가 만들 수 없는 블록이 된다.
+    const single = claimBlockOf(mint(baseClaims({ scope: ['x'] })))
+    const emptyScope = Buffer.concat([single.subarray(0, single.length - 4), Buffer.alloc(2)])
 
-    expect(rejectionOf(verifyWorkspaceToken(token, keys, { now: NOW }))).toBe('unauthenticated')
+    expect(rejectionOf(verifyWorkspaceToken(forge(emptyScope), keys, { now: NOW }))).toBe(
+      'unauthenticated',
+    )
   })
 
   // 11 — §3.2 "파싱은 엄격하다". 네 가지가 모두 401이다.
@@ -135,13 +157,11 @@ describe('verifyWorkspaceToken', () => {
     const minted = mint(baseClaims())
     const [, , claimsSegment = '', signature = ''] = minted.split('.')
     const paddedClaims = `${claimsSegment}=` // 패딩 문자는 이 형식에 없다 (§3.2)
-    const trailing = mint(baseClaims(), {
-      claimBlock: Buffer.concat([encodeClaimBlock(baseClaims()), Buffer.from([0x00])]),
-    })
+    const trailing = forge(Buffer.concat([claimBlockOf(minted), Buffer.from([0x00])]))
 
     const cases: ReadonlyArray<readonly [string, string]> = [
       ['five segments', `${minted}.extra`],
-      ['unknown version', mint(baseClaims(), { version: 'mnw2' })],
+      ['unknown version', forge(claimBlockOf(minted), { version: 'mnw2' })],
       ['base64url padding', `mnw1.${KEY_ID}.${paddedClaims}.${signature}`],
       ['trailing bytes after the claim block', trailing],
     ]
