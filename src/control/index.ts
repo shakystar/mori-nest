@@ -15,11 +15,13 @@
  * ## 오늘 이 평면에 라우트는 0건이다
  *
  * `0003 §8-2`(런처 자격증명의 형태)·`§8-3`(grant 판정 규칙)이 mori-nest #68의 사람 결정으로
- * 닫히면서 `logId` mint와 (주체, 로그) 관계가 `./store.js`로 섰다(mori-nest #68 조각 3/5 ·
- * #72). 그래도 제어 평면 6 라우트와 서버는 여전히 여기 없다 — 자격증명 인증(조각 5/5)과
- * `Idempotency-Key` 계층(조각 4/5)이 아직 없어 라우트를 배선할 수 없기 때문이다. 발급에
- * 필요한 나머지 설정(서명 키의 `keyId`, 토큰 수명 등)도 그것을 쓰는 라우트와 함께 온다 —
- * 쓰는 코드가 없는 필드를 스키마에 미리 만들지 않는다.
+ * 닫히면서 `logId` mint와 (주체, 로그) 관계가 `./store.js`로 섰고(mori-nest #68 조각 3/5 ·
+ * #72), 런처 자격증명의 발급·조회 판정·즉시 폐기가 `./credential.js`로 섰다(조각 5/5 · #74).
+ * 그래도 제어 평면 6 라우트와 서버는 여전히 여기 없다 — `Idempotency-Key` 계층(조각 4/5,
+ * #73)이 아직 없어 라우트를 배선할 수 없기 때문이다. 발급 HTTP 라우트도 이 조각의
+ * 비범위다(`§1.1` — "오늘은 운영자가 손으로 발급하는 것으로 족하다"). 발급에 필요한 나머지
+ * 설정(서명 키의 `keyId`, 토큰 수명 등)도 그것을 쓰는 라우트와 함께 온다 — 쓰는 코드가
+ * 없는 필드를 스키마에 미리 만들지 않는다.
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
@@ -45,6 +47,16 @@ export {
   type LogRecord,
   type RandomBytesFn,
 } from './store.js'
+
+export {
+  openLauncherCredentialStore,
+  LauncherCredentialError,
+  type IssuedCredential,
+  type LauncherCredentialFailure,
+  type LauncherCredentialStore,
+  type LauncherCredentialStoreOptions,
+  type LauncherCredentialVerification,
+} from './credential.js'
 
 /** 이 평면의 설정 스키마가 정의한 최상위 필드 **전부**. */
 const CONTROL_CONFIG_FIELDS = ['signingKey'] as const
