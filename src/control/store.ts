@@ -60,10 +60,31 @@ const MAX_ACCEPTED_LIMIT = 0x7fffffff
 /** `logId` 모양 — `0002 §1.1`. */
 const LOG_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
 
-/** 이 스토어의 스키마. `PRAGMA foreign_keys = ON`이 걸려 있어야 `REFERENCES`가 강제된다. */
+/**
+ * 이 스토어의 스키마. `PRAGMA foreign_keys = ON`이 걸려 있어야 `REFERENCES`가 강제된다.
+ *
+ * ## `revoked_at`은 `logs`에 있다 — `log_subjects`가 아니다 (mori-nest #92)
+ *
+ * `§2.6`이 정한 폐기는 **로그 단위**이지 관계 단위가 아니다. `RevokeLogResponse`가
+ * `{ logId, state, revokedAt }`으로 주체를 싣지 않는 것이 그 힌트다 — 폐기는 "이 주체가 이
+ * 로그를 더 보지 않는다"가 아니라 "이 로그 자체가 죽었다"는 사실이고, `§2.6` 본문도 "효력은
+ * §3.5의 대가를 그대로 상속한다: 이후 갱신이 전부 거부되고"라고 적어 **모든** 주체에게
+ * 미치는 효과로 서술한다. `§8-3`이 관계를 다대다로 열어 두긴 했지만, 오늘 그 관계에 행을
+ * 더하는 경로는 `createLog` 하나뿐이라 "누가 폐기를 요청했는지"와 "누구에게 효력이
+ * 미치는지"가 갈리는 요청(예: 공유받은 주체 하나만 손을 떼는 것)은 이 스펙 절이 아예
+ * 다루지 않는다. 그래서 `revoked_at`을 `log_subjects`(관계)가 아니라 `logs`(로그 그 자체)에
+ * 둔다 — 관계 행이 여럿이어도 폐기는 하나의 사실이다.
+ *
+ * `revoked_at`이 `NULL`인 것이 "폐기되지 않았다"이고, 값이 있으면 그 값이 최초 폐기 시각이다
+ * (RFC 3339 UTC). `NOT NULL`을 걸지 않는 이유는 아래 {@link addMissingRevocationColumn}에
+ * 있다 — 기존 DB 파일이 이 컬럼 없이 만들어졌을 수 있고, `STRICT` 테이블에 기본값 없는
+ * `NOT NULL` 컬럼은 `ALTER TABLE ADD COLUMN`으로 붙지 않는다(`src/transport/store.ts`의
+ * v1→v2 이주 doc과 같은 SQLite 제약).
+ */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS logs (
-  log_id TEXT PRIMARY KEY
+  log_id     TEXT PRIMARY KEY,
+  revoked_at TEXT
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS log_subjects (
@@ -74,6 +95,47 @@ CREATE TABLE IF NOT EXISTS log_subjects (
 
 CREATE INDEX IF NOT EXISTS log_subjects_subject ON log_subjects (subject, log_id);
 `
+
+/** `revoked_at`을 모르는 채 만들어진 `logs` 테이블에 뒤늦게 붙일 컬럼. 이름·선언은
+ * {@link SCHEMA}의 것과 같아야 한다. */
+const REVOCATION_COLUMN = { name: 'revoked_at', declaration: 'revoked_at TEXT' } as const
+
+/**
+ * `revoked_at` 없이 만들어진 `logs`에 그 컬럼을 붙인다 (`src/transport/store.ts`의
+ * `addMissingProvenanceColumns`와 같은 관례 — 이 리포에 이미 있는 마이그레이션 패턴을
+ * 그대로 재사용한다). 새로 만든 DB에서는 {@link SCHEMA}의 `CREATE TABLE`이 이미 컬럼을
+ * 세웠으므로 아무것도 하지 않는다.
+ *
+ * `BEGIN IMMEDIATE`로 감싸는 이유도 그 파일과 같다 — 같은 구 DB 파일을 두 프로세스가
+ * 동시에 여는 창에서 `ALTER TABLE`이 중복 실행되는 것을 막는다. `PRAGMA user_version`류의
+ * 스키마 버전 추적은 이 스토어에 아직 없어서 들이지 않는다 — `openControlStore`를 부를
+ * 때마다 컬럼 존재 여부를 직접 확인하는 이 함수 하나로 충분하다(호출 빈도가 연결을 열 때
+ * 뿐이라 비용도 무시할 수 있다).
+ */
+function addMissingRevocationColumn(db: DatabaseSync): void {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const existing = new Set(
+      db
+        .prepare('PRAGMA table_info(logs)')
+        .all()
+        .map((row) => row['name']),
+    )
+    if (!existing.has(REVOCATION_COLUMN.name)) {
+      // 상수 문자열이고 클라이언트 입력이 아니다 (`ALTER TABLE`은 식별자를 바인딩할 수 없다).
+      db.exec(`ALTER TABLE logs ADD COLUMN ${REVOCATION_COLUMN.declaration}`)
+    }
+    db.exec('COMMIT')
+  } catch (error) {
+    // 예외 경로에서 트랜잭션을 반드시 놓는다 — 붙잡은 채로 올라가면 이 연결은 쓸 수 없다.
+    try {
+      db.exec('ROLLBACK')
+    } catch {
+      // 트랜잭션이 이미 열려 있지 않다.
+    }
+    throw error
+  }
+}
 
 /** {@link mintLogId}가 받는 난수원의 모양. 테스트가 고정할 수 있도록 주입 지점을 둔다. */
 export type RandomBytesFn = (size: number) => Buffer
@@ -134,7 +196,9 @@ export type ControlStoreFailure =
   | 'random_source_too_short'
   /** `log_subjects.subject`가 빈 문자열이다 (`grant`·`createLog` 공통) */
   | 'blank_subject'
-  /** `grant`가 가리킨 `logId`가 존재하지 않는다 */
+  /** `grant`가 가리킨 `logId`가 존재하지 않는다. `revoke`도 이 이유를 낸다 — 없는 로그와
+   *  이 주체가 애초에 grant받지 못한 로그를 구분하지 않는 것은 `§2.6`도 `grant`와 같다
+   *  (존재 자체를 새는 것도 유출이다). */
   | 'log_not_found'
   /** mint 재시도가 {@link MAX_MINT_ATTEMPTS}를 넘었다 — 난수원이 고장났다고 본다 */
   | 'mint_exhausted'
@@ -171,8 +235,8 @@ export type ListLogsForSubjectPage = {
 }
 
 /**
- * 제어 평면 스토어. 표면이 넷인 것은 §72 이슈 범위 그대로다 — 라우트가 아직 없으므로
- * HTTP 표현(에러 봉투·상태코드)은 이 표면에 없다.
+ * 제어 평면 스토어. 원래 넷(#72)에 `revoke`가 더해져 다섯이다(#92, `§2.6`) — 라우트가
+ * 아직 없으므로 HTTP 표현(에러 봉투·상태코드)은 이 표면에 없다.
  */
 export type ControlStore = {
   /**
@@ -213,6 +277,31 @@ export type ControlStore = {
    */
   listLogsForSubject(subject: string, options?: ListLogsForSubjectOptions): Promise<ListLogsForSubjectPage>
 
+  /**
+   * 로그를 폐기한다 (`§2.6`). **폐기는 로그 단위다** — `subject`는 이 호출을 할 자격이
+   * 있는지(폐기 이전의 grant 관계)를 판정하는 데만 쓰이고, 성공하면 그 로그는 **모든
+   * 주체**에게 폐기된 것으로 본다 (`SCHEMA` doc "`revoked_at`은 `logs`에 있다" 참고).
+   *
+   * **이 판정 자체는 폐기를 입력으로 삼지 않는다** (`§2.6` MUST) — 이미 폐기된 로그에
+   * 대한 재호출도 `subject`가 폐기 이전에 grant받은 관계만 있으면 실패하지 않는다. 그래야
+   * 아래 멱등이 성립한다: 같은 (`subject`, `logId`)에 대한 반복 호출은 **첫 폐기 시각**을
+   * 그대로 돌려준다 (갱신하지 않는다).
+   *
+   * 전이는 이 호출이 반환하기 전에 내구화된다 — `openControlStore`가 여는 연결에
+   * `synchronous = FULL`이 걸려 있다({@link applyPragmas}). 갱신 자체는 `UPDATE ...
+   * RETURNING` 한 문장이라(`COALESCE(revoked_at, ?)` — 이미 값이 있으면 덮지 않는다),
+   * 같은 (`subject`, `logId`)를 겨눈 동시 호출 여럿이 있어도(같은 프로세스든 다른
+   * 프로세스든) 그 문장 자체의 원자성이 "첫 값이 이긴다"를 보장한다 — 별도 트랜잭션으로
+   * 감쌀 필요가 없다. 내구성을 보장할 수 없을 때(디스크 I/O 실패 등) `node:sqlite`가
+   * 던지는 예외는 그대로 위로 올라간다 — 이 스토어를 감싸는 라우트 계층이 그 예외의
+   * SQLite 결과코드로 `503 not_durable`을 판단한다(`src/control/server.ts`의
+   * `storeFailure`와 같은 자리, `grant`·`createLog`가 이미 쓰는 것과 같은 경로).
+   *
+   * @throws {ControlStoreError} `subject`가 이 `logId`에 대해 (폐기 이전에도) grant받은
+   *   적이 없으면 (`log_not_found`) — 존재하지 않는 로그와 구분하지 않는다.
+   */
+  revoke(subject: string, logId: string): Promise<{ readonly revokedAt: string }>
+
   /** 연결을 닫는다. 두 번 불러도 안전하다. */
   close(): Promise<void>
 }
@@ -240,6 +329,15 @@ function isForeignKeyViolation(error: unknown): boolean {
 }
 
 function columnAsLogId(value: SQLOutputValue | undefined): string {
+  if (typeof value !== 'string') {
+    throw new ControlStoreError('unexpected_row_shape')
+  }
+  return value
+}
+
+/** `#revokeLog`가 돌려준 `revoked_at`을 좁힌다. `COALESCE`가 항상 값을 채우므로(호출 전에
+ * 이미 있었거나, 이 호출이 막 채웠거나) `NULL`이 나오면 스키마와 어긋난 것이다. */
+function columnAsRevokedAt(value: SQLOutputValue | undefined): string {
   if (typeof value !== 'string') {
     throw new ControlStoreError('unexpected_row_shape')
   }
@@ -277,8 +375,10 @@ class SqliteControlStore implements ControlStore {
   readonly #randomBytes: RandomBytesFn
   readonly #insertLog: StatementSync
   readonly #insertSubject: StatementSync
+  readonly #selectMembership: StatementSync
   readonly #selectGrant: StatementSync
   readonly #selectPage: StatementSync
+  readonly #revokeLog: StatementSync
   #closed = false
 
   constructor(db: DatabaseSync, randomBytes: RandomBytesFn) {
@@ -286,9 +386,26 @@ class SqliteControlStore implements ControlStore {
     this.#randomBytes = randomBytes
     this.#insertLog = db.prepare('INSERT INTO logs (log_id) VALUES (?)')
     this.#insertSubject = db.prepare('INSERT INTO log_subjects (log_id, subject) VALUES (?, ?)')
-    this.#selectGrant = db.prepare('SELECT 1 AS ok FROM log_subjects WHERE subject = ? AND log_id = ?')
+    // 관계 행의 존재만 본다 — 폐기 여부는 이 질의의 입력이 아니다. `revoke`의 「폐기 이전의
+    // 자격만 본다」(§2.6 MUST)가 이 질의를 쓴다.
+    this.#selectMembership = db.prepare('SELECT 1 AS ok FROM log_subjects WHERE subject = ? AND log_id = ?')
+    // 공개 grant 판정(§3.6) — 관계 행이 있어도 로그가 폐기됐으면 통과하지 못한다 (§2.4·§3.6
+    // MUST: 폐기는 이 판정의 입력이다). `isGranted`가 이 질의를 쓴다.
+    this.#selectGrant = db.prepare(
+      'SELECT 1 AS ok FROM log_subjects ls JOIN logs l ON l.log_id = ls.log_id ' +
+        'WHERE ls.subject = ? AND ls.log_id = ? AND l.revoked_at IS NULL',
+    )
+    // WHERE에서 폐기된 로그를 먼저 거른다 — ORDER BY·LIMIT보다 앞이어야 hasMore가 폐기분을
+    // 제외한 값이 된다 (§2.4 MUST: 판정 → 정렬 → limit).
     this.#selectPage = db.prepare(
-      'SELECT log_id FROM log_subjects WHERE subject = ? AND log_id > ? ORDER BY log_id ASC LIMIT ?',
+      'SELECT ls.log_id AS log_id FROM log_subjects ls JOIN logs l ON l.log_id = ls.log_id ' +
+        'WHERE ls.subject = ? AND ls.log_id > ? AND l.revoked_at IS NULL ORDER BY ls.log_id ASC LIMIT ?',
+    )
+    // 이미 값이 있으면 덮지 않는다 — 재폐기가 최초 폐기 시각을 그대로 돌려주는 멱등이
+    // 여기서 성립한다(§2.6 MUST). `RETURNING`으로 갱신과 읽기를 한 문장에 묶어, 동시
+    // 호출이 있어도 그 문장의 원자성이 "첫 값이 이긴다"를 보장한다(별도 트랜잭션 불필요).
+    this.#revokeLog = db.prepare(
+      'UPDATE logs SET revoked_at = COALESCE(revoked_at, ?) WHERE log_id = ? RETURNING revoked_at',
     )
   }
 
@@ -369,6 +486,17 @@ class SqliteControlStore implements ControlStore {
     }
   }
 
+  async revoke(subject: string, logId: string): Promise<{ readonly revokedAt: string }> {
+    if (this.#selectMembership.get(subject, logId) === undefined) {
+      // 존재하지 않는 로그와, 존재하지만 이 주체가 애초에 grant받지 못한 로그를 구분하지
+      // 않는다 (§2.6 — §2.4의 같은 규율). 폐기 상태는 이 판정에 들어가지 않는다: 이미
+      // 폐기된 로그라도 폐기 이전에 관계 행이 있었다면 여기를 통과한다.
+      throw new ControlStoreError('log_not_found')
+    }
+    const row = this.#revokeLog.get(new Date().toISOString(), logId)
+    return { revokedAt: columnAsRevokedAt(row?.['revoked_at']) }
+  }
+
   async close(): Promise<void> {
     if (this.#closed) {
       return
@@ -403,6 +531,7 @@ export async function openControlStore(path: string, options: ControlStoreOption
   try {
     applyPragmas(db)
     db.exec(SCHEMA)
+    addMissingRevocationColumn(db)
   } catch (error) {
     db.close()
     throw error
