@@ -414,8 +414,8 @@ function rowToRecord(
   const storedEndedAt = columnAsNullableString(row['ended_at'])
 
   // `terminal_state`가 있으면 조각 2/3이 확정한 종단 상태를 그대로 낸다 — 재판정하지
-  // 않는다(`§4.1` MUST NOT: abandoned에서도 종단 상태에서도 부활이 없다). 오늘은 이 분기가
-  // 죽은 코드다 — 이 파일의 쓰기 경로가 그 컬럼을 채우지 않는다(파일 상단 doc).
+  // 않는다(`§4.1` MUST NOT: abandoned에서도 종단 상태에서도 부활이 없다). 이 분기를 채우는
+  // 쓰기 경로는 `heartbeat`의 유기 확정 · `closeWorkspace` · `revokeWorkspace`다(`§4.3`~`§4.5`).
   const { state, endedAt } =
     storedTerminalState === undefined
       ? resolveActiveState(lastHeartbeatAt, options)
