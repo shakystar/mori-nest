@@ -34,10 +34,13 @@
  * 저장분도 그것을 싣지 않는다(멱등 저장분이 무엇을 담는지는
  * {@link OpenWorkspaceReservation} doc).
  *
- * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 이슈 본문)
+ * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 이슈 본문)
  *
- * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간의 하트비트·종료·폐기·
- * 조회 라우트(`§4.3`~`§4.6`)와 폐기 사유(`reason`)의 저장. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
+ * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간의 하트비트·종료·폐기
+ * **배선**과 조회 라우트(`§4.6`) 전부, 폐기 사유(`reason`)의 저장. 하트비트·종료·폐기는
+ * `./request.js`가 이미 판별하지만(#112), 이 파일의 `switch`는 그 셋을 아직 `503 unavailable`로
+ * 묶어 답한다({@link handleRequest} 안의 주석) — 스토어 호출(`WorkspaceStore.heartbeat`·
+ * `closeWorkspace`·`revokeWorkspace`)을 여는 것은 각각 다음 조각이다. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
  * 뜻이다** — 전송 평면의 `maxRequestBytes`(`0002 §1.3` L103)에 해당하는 자리가 이 평면에는
  * 아직 배선되지 않았다(`0003 §1.3` 표에 `413 request_too_large`가 있으므로 자리는 열려 있고,
  * 값을 정하는 것은 이 조각이 아니다). 그 라우트를 여는 다음 조각이 이 함수에 상한을 준다.
@@ -771,6 +774,15 @@ async function handleRequest(
       return
     case 'openWorkspace':
       await handleOpenWorkspace(options, gate.request, response)
+      return
+    case 'heartbeatWorkspace':
+    case 'closeWorkspace':
+    case 'revokeWorkspace':
+      // 판별은 `./request.js`가 이미 끝냈다(mori-nest #112) — 이 셋의 스토어 배선
+      // (`WorkspaceStore.heartbeat`·`closeWorkspace`·`revokeWorkspace`)은 각각 다음 조각이
+      // 가져간다. 그때까지는 `503 unavailable`로 답한다: `§1.3`에 "아직 구현되지 않음"을 뜻하는
+      // code가 없고(`501`은 이 스펙에 없다), `503`이 "지금은 답할 수 없다"의 유일한 뜻이다.
+      writeJson(response, 503, errorResponse(ErrorCodes.unavailable, 'this route is not wired yet'), RETRY_AFTER)
       return
     default: {
       // **도달 불가**다 — 위 case들이 `ControlRoute`를 망라한다. 이 분기를 두는 이유는
