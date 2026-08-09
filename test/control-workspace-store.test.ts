@@ -1,8 +1,10 @@
 /**
  * 작업공간 생애 추적 — 개시 + 단건 조회 + 파생 상태 (mori-nest #97, #68 범위 5번 조각 1/3),
- * 하트비트·종료·폐기 전이 (#98 조각 2/3), 그리고 목록 조회 (#99 조각 3/3).
+ * 하트비트·종료·폐기 전이 (#98 조각 2/3), 그리고 목록 조회 (#99 조각 3/3, #109가 배치
+ * `supersededBy` 해소 검증 1건을 얹었다).
  *
- * 세 이슈 본문이 못박은 대로 **다섯 건 + 여섯 건 + 다섯 건**이고, 그 이상 만들지 않는다.
+ * 세 이슈 본문이 못박은 대로 **다섯 건 + 여섯 건 + 다섯 건**(+ #109의 1건)이고, 그 이상
+ * 만들지 않는다.
  *
  * 목록 조회 테스트는 `openedAt` 순서를 검증해야 하는데 `openWorkspace`는 `new Date()`로
  * `openedAt`을 정하므로(주입 지점이 없다), 같은 밀리초에 걸리면 순서 단언이 들쭉날쭉해진다.
@@ -363,6 +365,25 @@ describe('WorkspaceStore.listWorkspaces', () => {
     const seen = [...firstPage.workspaces, ...secondPage.workspaces, ...thirdPage.workspaces].map((w) => w.workspaceId)
     expect(seen).toEqual(ids)
     expect(new Set(seen).size).toBe(ids.length)
+  })
+
+  it('mori-nest #109: 승계자가 둘 이상인 작업공간을 포함한 목록 조회에서 supersededBy가 getWorkspace와 같은 값(workspaceId 사전순 최소)이고, 승계되지 않은 행에는 그 필드가 없다', async () => {
+    const store = await openWorkspaceStore(':memory:')
+    const gracePeriodMs = 60_000
+
+    const [target] = await openSequenced(store, 'alice', [0])
+    const [untouched] = await openSequenced(store, 'alice', [1_000])
+    await store.openWorkspace('alice', { logs: ['log-a'], supersedes: target! })
+    await store.openWorkspace('alice', { logs: ['log-a'], supersedes: target! })
+
+    const targetFromGet = await store.getWorkspace('alice', target!, { gracePeriodMs })
+    const page = await store.listWorkspaces('alice', { gracePeriodMs })
+
+    const targetFromList = page.workspaces.find((w) => w.workspaceId === target)
+    const untouchedFromList = page.workspaces.find((w) => w.workspaceId === untouched)
+    expect(targetFromList?.supersededBy).toBeDefined()
+    expect(targetFromList?.supersededBy).toBe(targetFromGet?.supersededBy)
+    expect('supersededBy' in (untouchedFromList ?? {})).toBe(false)
   })
 
   it('state가 다섯 이름 밖이면 실패하고, 해석 불가 커서도 실패한다 (둘 다 «전부 반환»으로 떨어지지 않는다)', async () => {
