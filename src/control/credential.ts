@@ -220,23 +220,19 @@ class SqliteLauncherCredentialStore implements LauncherCredentialStore {
   }
 
   async rotate(credentialId: string): Promise<IssuedCredential> {
+    // mint를 BEGIN IMMEDIATE 이전에 한다 — issue()·store.ts의 createLog와 같은 이유:
+    // mintCredentialToken은 던질 수 있고(readEntropy가 짧은 난수원을 거부), 트랜잭션
+    // 안에서 던지면 그 예외를 잡는 catch가 없어 예약 락이 커밋도 롤백도 되지 않은 채
+    // 커넥션에 남는다.
+    const token = mintCredentialToken(this.#randomBytes)
+    const newCredentialId = hashCredential(token)
     this.#db.exec('BEGIN IMMEDIATE')
-    let subject: string
     try {
       const row = this.#selectSubject.get(credentialId)
       if (row === undefined) {
         throw new LauncherCredentialError('credential_not_found')
       }
-      subject = columnAsSubject(row['subject'])
-    } catch (error) {
-      this.#rollbackQuietly()
-      throw error
-    }
-
-    const token = mintCredentialToken(this.#randomBytes)
-    const newCredentialId = hashCredential(token)
-    try {
-      this.#insert.run(newCredentialId, subject)
+      this.#insert.run(newCredentialId, columnAsSubject(row['subject']))
       this.#delete.run(credentialId)
       // 커밋이 돌아온 시점에 새 자격증명이 있고 옛 것은 없다 — 회전이 한 번의 호출로
       // 표현된다(§1.1). 삽입이 실패하면 옛 자격증명은 롤백으로 그대로 남는다: 회전
