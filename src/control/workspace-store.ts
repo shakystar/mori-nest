@@ -607,7 +607,7 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     this.#selectSupersededBy = db.prepare(
       'SELECT workspace_id FROM workspaces WHERE supersedes = ? ORDER BY workspace_id ASC LIMIT 1',
     )
-    // `listWorkspaces`(N+1 회피, 이 클래스 doc 참고)가 페이지 전체의 `workspaceId` 목록을
+    // `listWorkspaces`가 페이지 전체의 `workspaceId` 목록을
     // 한 번에 넘겨 쓴다. `IN (...)`을 페이지 크기별로 동적 생성하지 않고 `json_each(?)`를
     // 쓴 이유: 이 생성자가 문장을 준비해 재사용하는 관례상 자리표 개수가 호출마다 달라지는
     // 문장을 만들 수 없고, 이 파일이 이미 `logs` 컬럼에 JSON 직렬화를 쓰고 있어(`#insert`)
@@ -809,7 +809,7 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     const hasMore = rows.length > limit
     const page = hasMore ? rows.slice(0, limit) : rows
 
-    // 페이지당 최대 1회의 질의로 `supersededBy`를 해소한다 (파일 상단 doc, mori-nest #109) —
+    // 페이지당 최대 1회의 질의로 `supersededBy`를 해소한다 (mori-nest #109) —
     // `getWorkspace`의 행당 1회 조회(`#selectSupersededBy`)와 달리, 여기는 페이지 전체의
     // workspaceId를 한 번에 묶어 `#selectSupersededByBatch`에 넘긴다. 페이지가 비면 그 질의도
     // 돌지 않는다.

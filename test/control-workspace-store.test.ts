@@ -373,8 +373,8 @@ describe('WorkspaceStore.listWorkspaces', () => {
 
     const [target] = await openSequenced(store, 'alice', [0])
     const [untouched] = await openSequenced(store, 'alice', [1_000])
-    await store.openWorkspace('alice', { logs: ['log-a'], supersedes: target })
-    await store.openWorkspace('alice', { logs: ['log-a'], supersedes: target })
+    await store.openWorkspace('alice', { logs: ['log-a'], supersedes: target! })
+    await store.openWorkspace('alice', { logs: ['log-a'], supersedes: target! })
 
     const targetFromGet = await store.getWorkspace('alice', target!, { gracePeriodMs })
     const page = await store.listWorkspaces('alice', { gracePeriodMs })
