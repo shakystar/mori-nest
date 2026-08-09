@@ -42,7 +42,7 @@ const CLIENT_MINTED_ID_FIELDS = new Set(['logId', 'id', 'name'])
 /** `/v1/logs` 경로의 세그먼트. */
 const PATH_PREFIX = ['', 'v1', 'logs'] as const
 
-/** Node 표준 HTTP 서버의 `IncomingMessage`와 모양만 맞는 요청 입력. `src/transport/request.ts`의
+/** Node 표준 HTTP 서버가 넘겨주는 요청 객체와 모양만 맞는 요청 입력. `src/transport/request.ts`의
  * `RawRequest`와 같은 모양이지만 독립적으로 정의한다 — import하면 그 자체로 평면 경계가 깨진다. */
 export type RawRequest = {
   readonly method: string
@@ -268,7 +268,7 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  * - **본문의 필드 타입을 검증하지 않는다** — `CreateLogRequest`는 필드가 없으므로 볼
  *   타입이 없다.
  *
- * @param request `IncomingMessage`와 모양이 같은 요청.
+ * @param request Node 표준 HTTP 서버의 요청 객체와 모양이 같은 요청.
  * @param body 요청 본문 원문. GET 라우트에는 쓰이지 않으므로 부르는 쪽이 빈 문자열을
  *   줘도 안전하다.
  * @param credentials 런처 자격증명 스토어. `verify`만 쓴다.
