@@ -1,9 +1,11 @@
 /**
  * `0003 §3.2` 와이어 파서 + `§3.3` 검사 1~5.
  *
- * 유효 키쌍 생성과 서명은 **`test/` 안에만 있다** — 발급자 흉내는 `./workspace-token.js`로
- * 뺐다 (mori-nest #14가 같은 헬퍼를 쓴다). `src/`는 검증만 하고 서명 능력을 갖지 않는다
- * (`§3.2` — HMAC을 기각한 이유가 그것이다). 그 헬퍼가 `src/`로 새어 나가면 그 성질이 깨진다.
+ * 발급자 흉내는 `./workspace-token.js`로 뺐다 (mori-nest #14가 같은 헬퍼를 쓴다).
+ * 그 파일이 `test/`에 있는 이유는 방어선이어서가 아니라 **발급자가 전송 평면이 아니기
+ * 때문**이다 — 성질을 지키는 것은 코드 배치가 아니라 키 배포이고, 실제 명제는
+ * «전송 엔트리가 서명자에 닿지 않는다»이다 (mori-nest #71 —
+ * `./workspace-token.ts` 머리말과 `./entry-boundary.test.ts`가 그 자리다).
  */
 
 import { Buffer } from 'node:buffer'
@@ -14,7 +16,7 @@ import {
   createVerificationKeySet,
   verifyWorkspaceToken,
   type VerifiedWorkspaceToken,
-} from '../src/token.js'
+} from '../src/transport/token.js'
 import {
   KEY_ID,
   NOW,
@@ -149,6 +151,26 @@ describe('verifyWorkspaceToken', () => {
         'unauthenticated',
       )
     }
+  })
+})
+
+// 13 — §3.3 MUST: 회전은 집합 전체 교체다. 그러려면 만들어진 집합이 원본과 끊겨 있어야
+// 한다 — `createVerificationKeySet`의 doc이 진술만 하고 테스트가 없던 자리다 (#71).
+describe('createVerificationKeySet', () => {
+  it('snapshots its entries — mutating the source collection afterwards changes nothing', () => {
+    const entries: [string, typeof issuer.publicKey][] = [[KEY_ID, issuer.publicKey]]
+    const set = createVerificationKeySet(entries)
+
+    entries.push(['k-late', otherIssuer.publicKey])
+    entries.length = 0
+
+    expect(set.size).toBe(1)
+    expect(set.get(KEY_ID)).toBe(issuer.publicKey)
+    expect(set.get('k-late')).toBeUndefined()
+
+    // 스냅샷이므로 뒤늦게 넣은 키로 서명한 토큰도 이 집합에서는 통과하지 못한다.
+    const late = mint(baseClaims(), { keyId: 'k-late', privateKey: otherIssuer.privateKey })
+    expect(rejectionOf(verifyWorkspaceToken(late, set, { now: NOW }))).toBe('unauthenticated')
   })
 })
 
