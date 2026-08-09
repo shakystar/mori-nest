@@ -9,16 +9,18 @@
  * 평면에는 [내구성 단일 장애점] 제약이 없다"), 이 함수는 async이고 {@link LauncherCredentialStore}를
  * 주입받는다.
  *
- * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 중 다섯이다 — `POST /v1/logs`(`§2.1`),
+ * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 경로 중 일곱이다 — `POST /v1/logs`(`§2.1`),
  * `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`), `POST /v1/logs/{logId}/revoke`(`§2.6`),
- * `POST /v1/workspaces`(`§4.2`, 컬렉션 경로만 — 하위 경로는 비범위, mori-nest #102 이슈 본문).
- * 나머지 넷(작업공간 하트비트·종료·폐기·조회)은 이 조각의 비범위다.
+ * `POST /v1/workspaces`(`§4.2`, 컬렉션 경로만 — 하위 경로는 비범위, mori-nest #102 이슈 본문),
+ * `POST /v1/workspaces/{workspaceId}/heartbeat`·`/close`·`/revoke`(`§4.3`~`§4.5`, mori-nest
+ * #112). 나머지 하나(작업공간 목록 조회, `§4.6`)만 이 조각의 비범위다.
  *
  * 이 파일에는 HTTP 서버도 스토어 호출(`isGranted`·`createLog`·`revoke`·`openWorkspace`·
- * `issueWorkspaceToken`)도 없다 — 그것은 라우트 배선(`./server.js`, mori-nest #83 이슈 본문
- * "후속")의 몫이다. `src/transport/`를 import하지 않는 것도 같은 경계 규율이다
- * (`src/control/index.ts` 상단 doc) — 아래 헬퍼들이 `src/transport/request.ts`의 것과 모양이
- * 겹치는 것은 우연이 아니라 같은 문제를 각 평면이 독립적으로 풀기 때문이다.
+ * `issueWorkspaceToken`·`heartbeat`·`closeWorkspace`·`revokeWorkspace`)도 없다 — 그것은 라우트
+ * 배선(`./server.js`, mori-nest #83 이슈 본문 "후속")의 몫이다. `src/transport/`를 import하지
+ * 않는 것도 같은 경계 규율이다 (`src/control/index.ts` 상단 doc) — 아래 헬퍼들이
+ * `src/transport/request.ts`의 것과 모양이 겹치는 것은 우연이 아니라 같은 문제를 각 평면이
+ * 독립적으로 풀기 때문이다.
  */
 
 import { parseBody } from '../body.js'
@@ -55,12 +57,33 @@ const REVOKE_SUFFIX = 'revoke'
 /** `§2.6`의 `RevokeLogRequest` 본문에서 게이트가 아는 최상위 필드. */
 const REVOKE_BODY_FIELDS = ['reason']
 
-/** `/v1/workspaces` 경로의 세그먼트(`§4.2`). 컬렉션 경로 하나만 판별한다 — 하위 경로
- * (하트비트·종료·폐기·조회, `§4.3`~`§4.6`)는 이 조각의 비범위다(mori-nest #102 이슈 본문). */
+/** `/v1/workspaces` 경로의 세그먼트(`§4.2`). 컬렉션 경로와 하위 경로(하트비트·종료·폐기,
+ * `§4.3`~`§4.5`, mori-nest #112) 판별 둘 다 이 접두사를 쓴다 — 목록 조회(`§4.6`)만 이 조각의
+ * 비범위다(mori-nest #102 이슈 본문). */
 const WORKSPACE_PATH_PREFIX = ['', 'v1', 'workspaces'] as const
 
 /** `§4.2`의 `OpenWorkspaceRequest` 본문에서 게이트가 아는 최상위 필드. */
 const OPEN_WORKSPACE_BODY_FIELDS = ['logs', 'supersedes', 'replicaId']
+
+/** `POST /v1/workspaces/{workspaceId}/heartbeat`(`§4.3`)의 마지막 세그먼트. */
+const HEARTBEAT_SUFFIX = 'heartbeat'
+
+/** `POST /v1/workspaces/{workspaceId}/close`(`§4.4`)의 마지막 세그먼트. */
+const CLOSE_SUFFIX = 'close'
+
+/** `POST /v1/workspaces/{workspaceId}/revoke`(`§4.5`)의 마지막 세그먼트. `REVOKE_SUFFIX`와
+ * 값은 같지만(둘 다 `'revoke'`) 축이 다른 경로(로그 대 작업공간)를 판별하므로 별도 상수로
+ * 옮겨 적는다 — `REPLICA_ID_PATTERN`이 `LOG_ID_PATTERN`과 같은 이유로 분리된 것과 같다. */
+const WORKSPACE_REVOKE_SUFFIX = 'revoke'
+
+/** `§4.4`의 `CloseWorkspaceRequest` 본문에서 게이트가 아는 최상위 필드. */
+const CLOSE_WORKSPACE_BODY_FIELDS = ['outcome']
+
+/** `§4.4` MUST: 종료 선언의 `outcome`이 가질 수 있는 값 둘. */
+const CLOSE_OUTCOMES = new Set(['flushed', 'discarded'])
+
+/** `§4.5`의 `RevokeWorkspaceRequest` 본문에서 게이트가 아는 최상위 필드. */
+const REVOKE_WORKSPACE_BODY_FIELDS = ['reason']
 
 /** Node 표준 HTTP 서버가 넘겨주는 요청 객체와 모양만 맞는 요청 입력. `src/transport/request.ts`의
  * `RawRequest`와 같은 모양이지만 독립적으로 정의한다 — import하면 그 자체로 평면 경계가 깨진다. */
@@ -71,8 +94,17 @@ export type RawRequest = {
 }
 
 /** 이 게이트가 판별하는 라우트 셋. `ControlStore`의 메서드 이름과 나란히 둔다
- * (`createLog`·`listLogsForSubject`). */
-export type ControlRoute = 'createLog' | 'listLogs' | 'getLog' | 'revokeLog' | 'openWorkspace'
+ * (`createLog`·`listLogsForSubject`). 셋 중 `heartbeatWorkspace`만 `WorkspaceStore`의 메서드
+ * 이름(`heartbeat`)과 다르다 — 라우트 이름은 이슈(mori-nest #112)가 적은 그대로 옮긴다. */
+export type ControlRoute =
+  | 'createLog'
+  | 'listLogs'
+  | 'getLog'
+  | 'revokeLog'
+  | 'openWorkspace'
+  | 'heartbeatWorkspace'
+  | 'closeWorkspace'
+  | 'revokeWorkspace'
 
 /**
  * 게이트를 통과한 요청. `subject`는 항상 런처 자격증명 조회로만 해석된다(`§1.2` MUST NOT —
@@ -118,6 +150,22 @@ export type ControlRequest =
        *  `IdempotencyStore.reserve(subject, key, requestBody)`에 넘길 값이고, 다이제스트는
        *  **바이트**에 대한 것이라 파싱된 필드로 되짓지 못한다 (`§1.4`의 «같은 키·다른 본문»). */
       readonly requestBody: string
+    }
+  | {
+      readonly route: 'heartbeatWorkspace'
+      readonly subject: string
+      readonly workspaceId: string
+    }
+  | {
+      readonly route: 'closeWorkspace'
+      readonly subject: string
+      readonly workspaceId: string
+      readonly outcome: 'flushed' | 'discarded'
+    }
+  | {
+      readonly route: 'revokeWorkspace'
+      readonly subject: string
+      readonly workspaceId: string
     }
 
 /** 이 게이트가 낼 수 있는 상태코드. 전부 `0003 §1.3` 표에 있는 것뿐이다. */
@@ -350,6 +398,59 @@ function checkOpenWorkspaceBody(
   }
 }
 
+/**
+ * `POST /v1/workspaces/{workspaceId}/heartbeat`의 본문 (`§4.3`) — `Record<string, never>`.
+ * 정의된 필드가 없으므로 필드가 하나라도 있으면 `400 malformed_request`다. `createLog`와
+ * 달리 `client_minted_id` 재판정이 없다 — 갱신 라우트가 스코프를 넓힐 수 없다는 것을 규칙이
+ * 아니라 «받는 자리 자체가 없다»는 구조로 지킨다(`§3.4`·`§4.3`, 이슈 #112 본문).
+ */
+function checkHeartbeatBody(raw: string): { readonly ok: true } | { readonly ok: false; readonly error: ErrorResponse } {
+  const parsed = parseBody(raw, [])
+  return parsed.ok ? { ok: true } : { ok: false, error: parsed.error }
+}
+
+/**
+ * `POST /v1/workspaces/{workspaceId}/close`의 본문 (`§4.4`) — `{ outcome: 'flushed' | 'discarded' }`.
+ * `outcome`이 없거나 두 값 밖(타입 불일치 포함)이면 `400 malformed_request`(`§4.4` 실패표) —
+ * 표에 이 판정을 위한 전용 code가 없다.
+ */
+function checkCloseWorkspaceBody(
+  raw: string,
+): { readonly ok: true; readonly outcome: 'flushed' | 'discarded' } | { readonly ok: false; readonly error: ErrorResponse } {
+  const parsed = parseBody(raw, CLOSE_WORKSPACE_BODY_FIELDS)
+  if (!parsed.ok) {
+    return { ok: false, error: parsed.error }
+  }
+  const outcome = parsed.body['outcome']
+  if (typeof outcome !== 'string' || !CLOSE_OUTCOMES.has(outcome)) {
+    return {
+      ok: false,
+      error: errorResponse(ErrorCodes.malformed_request, 'outcome must be "flushed" or "discarded"'),
+    }
+  }
+  return { ok: true, outcome: outcome as 'flushed' | 'discarded' }
+}
+
+/**
+ * `POST /v1/workspaces/{workspaceId}/revoke`의 본문 (`§4.5`) — `{ reason?: string }`. `reason`이
+ * 있는데 문자열이 아니면 `400 malformed_request`; 없으면(필드 자체가 없어도) 통과한다 —
+ * {@link checkRevokeLogBody}(`§2.6`, mori-nest #93)와 같은 문법을 재사용하지만 **반환값에
+ * `reason`을 싣지 않는다**: 스토어의 `WorkspaceStore.revokeWorkspace`가 이 값을 받지 않으므로
+ * (이슈 #112 본문 — `ControlRequest`에 `reason` 필드를 만들지 않는다는 완료 조건), 문법만
+ * 보고 버린다.
+ */
+function checkRevokeWorkspaceBody(raw: string): { readonly ok: true } | { readonly ok: false; readonly error: ErrorResponse } {
+  const parsed = parseBody(raw, REVOKE_WORKSPACE_BODY_FIELDS)
+  if (!parsed.ok) {
+    return { ok: false, error: parsed.error }
+  }
+  const reason = parsed.body['reason']
+  if (reason !== undefined && typeof reason !== 'string') {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'reason must be a string') }
+  }
+  return { ok: true }
+}
+
 /** 자격 부재·형식 오류의 고정 `401`. `src/transport/request.ts`의 같은 이름 함수와 같은
  * 이유로 `details`가 없다 — 받은 헤더 값을 되비추지 않는다. */
 function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }> {
@@ -360,7 +461,7 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
 }
 
 /**
- * 제어 평면 네 라우트의 공통 게이트. 통과하면 해석된 요청을, 아니면 `§1.3`의 봉투와
+ * 제어 평면 여덟 라우트의 공통 게이트. 통과하면 해석된 요청을, 아니면 `§1.3`의 봉투와
  * 상태코드를 반환한다.
  *
  * ## 검사 순서
@@ -368,7 +469,8 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  * `src/transport/request.ts`와 같은 원칙(문법 검사가 자격 검사보다 앞선다 — 응답이
  * 알려주는 것이 스펙을 읽은 사람이 이미 아는 것뿐이게 한다)을 따른다:
  *
- * 1. **라우트 해석** — 경로가 `/v1/logs`·`/v1/logs/{logId}`·`/v1/logs/{logId}/revoke`
+ * 1. **라우트 해석** — 경로가 `/v1/logs`·`/v1/logs/{logId}`·`/v1/logs/{logId}/revoke`·
+ *    `/v1/workspaces`·`/v1/workspaces/{workspaceId}/heartbeat`·`.../close`·`.../revoke`
  *    중 하나인가. 아니면 `400 malformed_request`.
  * 2. **메서드** — `checkMethod`. 아니면 `405` + `Allow`.
  * 3. **라우트별 문법**:
@@ -383,6 +485,15 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *    - `openWorkspace`: 본문 형태(`§4.2` — `client_minted_id` → `logs`(`empty_scope`·
  *      `invalid_log_id`) → `replicaId`(`invalid_replica_id`, `§4.9`) → `supersedes`(타입만,
  *      `malformed_request`)) 그다음 `Idempotency-Key` 형식(`§1.4`).
+ *    - `heartbeatWorkspace`: 본문 형태(`§4.3` — 정의되지 않은 필드가 하나라도 있으면
+ *      `400 malformed_request`). `Idempotency-Key`를 요구하지 않는다(`§1.4` — 그 두 라우트
+ *      밖이다).
+ *    - `closeWorkspace`: 본문 형태(`§4.4` — `outcome`이 없거나 `'flushed'`·`'discarded'`
+ *      밖이면 `400 malformed_request`). `Idempotency-Key`를 요구하지 않는다.
+ *    - `revokeWorkspace`: 본문 형태(`§4.5` — `reason`이 있는데 문자열이 아니면
+ *      `400 malformed_request`, `revokeLog`와 같은 문법). `Idempotency-Key`를 요구하지 않는다.
+ *    - **셋 다 `workspaceId` 형식을 검사하지 않는다** — 없는 id·다른 주체의 id는 스토어가
+ *      `404 workspace_not_found`로 답한다(`§4.6` MUST — 열거 오라클 방지, 이슈 #112 본문).
  * 4. **자격** — `Authorization: Bearer <런처 자격증명>` → `credentials.verify`. 아니면 `401`.
  *    작업공간 토큰이 이 자리에서 걸린다: 그 값은 이 스토어에 조회되는 해시와 절대
  *    일치하지 않으므로 `verify`가 그대로 `401`을 낸다(`§1.1`) — 이 파일에 작업공간 토큰을
@@ -391,12 +502,13 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  * ## 이 게이트가 하지 않는 것
  *
  * - **스토어를 보지 않는다** (자격증명 조회는 예외 — `§1.1`이 그 형태를 요구한다).
- *   `isGranted`·`createLog`·`listLogsForSubject`·`revoke`는 라우트 배선의 것이다.
+ *   `isGranted`·`createLog`·`listLogsForSubject`·`revoke`·`heartbeat`·`closeWorkspace`·
+ *   `revokeWorkspace`는 라우트 배선의 것이다.
  * - **`limit` 상한을 적용하지 않는다.** 형식이 유효한 값을 그대로 싣는다 — 서버 상한이
  *   생기면 그 판정도 다음 조각의 것이다(이 조각의 비범위, `§3.1`급 `maxLimit` 개념이
  *   `0003`에는 아직 없다).
- * - **본문의 필드 타입을 검증하지 않는다** — `CreateLogRequest`는 필드가 없으므로 볼
- *   타입이 없다.
+ * - **본문의 필드 타입을 검증하지 않는다** — `CreateLogRequest`·`HeartbeatWorkspaceRequest`는
+ *   필드가 없으므로 볼 타입이 없다.
  *
  * @param request Node 표준 HTTP 서버의 요청 객체와 모양이 같은 요청.
  * @param body 요청 본문 원문. GET 라우트에는 쓰이지 않으므로 부르는 쪽이 빈 문자열을
@@ -411,8 +523,9 @@ export async function verifyControlRequest(
   const { path, query } = splitTarget(request.url)
 
   // ── 1: 라우트 해석. `/v1/logs`(셋) · `/v1/logs/{logId}`(넷) · `/v1/logs/{logId}/revoke`(다섯) ·
-  // `/v1/workspaces`(셋, 컬렉션 경로만 — 하위 경로는 세그먼트 수가 달라 아래 어느 것과도 매치되지
-  // 않고 `malformed_request`로 떨어진다)뿐이다.
+  // `/v1/workspaces`(셋, 컬렉션 경로) · `/v1/workspaces/{workspaceId}/heartbeat`·`/close`·
+  // `/revoke`(다섯, mori-nest #112)뿐이다. 그 밖의 세그먼트 수·이름은 아래 어느 것과도 매치되지
+  // 않고 `malformed_request`로 떨어진다.
   const segments = path.split('/')
   const prefixMatches = PATH_PREFIX.every((expected, index) => segments[index] === expected)
   const isCollection = prefixMatches && segments.length === PATH_PREFIX.length
@@ -423,16 +536,36 @@ export async function verifyControlRequest(
       ? (segments[PATH_PREFIX.length] ?? '')
       : ''
   const isRevoke = revokeLogIdSegment !== ''
-  const isOpenWorkspace =
-    WORKSPACE_PATH_PREFIX.every((expected, index) => segments[index] === expected) &&
-    segments.length === WORKSPACE_PATH_PREFIX.length
+  const workspacePrefixMatches = WORKSPACE_PATH_PREFIX.every((expected, index) => segments[index] === expected)
+  const isOpenWorkspace = workspacePrefixMatches && segments.length === WORKSPACE_PATH_PREFIX.length
+  const isWorkspaceSubRoute = workspacePrefixMatches && segments.length === WORKSPACE_PATH_PREFIX.length + 2
+  const workspaceIdSegment = isWorkspaceSubRoute ? (segments[WORKSPACE_PATH_PREFIX.length] ?? '') : ''
+  const workspaceAction = isWorkspaceSubRoute ? (segments[WORKSPACE_PATH_PREFIX.length + 1] ?? '') : ''
+  const isHeartbeatWorkspace = workspaceIdSegment !== '' && workspaceAction === HEARTBEAT_SUFFIX
+  const isCloseWorkspace = workspaceIdSegment !== '' && workspaceAction === CLOSE_SUFFIX
+  const isRevokeWorkspace = workspaceIdSegment !== '' && workspaceAction === WORKSPACE_REVOKE_SUFFIX
 
-  if (!isCollection && !hasLogId && !isRevoke && !isOpenWorkspace) {
+  if (
+    !isCollection &&
+    !hasLogId &&
+    !isRevoke &&
+    !isOpenWorkspace &&
+    !isHeartbeatWorkspace &&
+    !isCloseWorkspace &&
+    !isRevokeWorkspace
+  ) {
     return reject(400, errorResponse(ErrorCodes.malformed_request, 'request target is not a control route'))
   }
 
   // ── 2: 메서드.
-  const allowedMethods = isRevoke ? ['POST'] : hasLogId ? ['GET'] : isOpenWorkspace ? ['POST'] : ['POST', 'GET']
+  const allowedMethods =
+    isRevoke || isHeartbeatWorkspace || isCloseWorkspace || isRevokeWorkspace
+      ? ['POST']
+      : hasLogId
+        ? ['GET']
+        : isOpenWorkspace
+          ? ['POST']
+          : ['POST', 'GET']
   const allowHeader: Readonly<Record<string, string>> = { Allow: allowedMethods.join(', ') }
   const methodCheck = checkMethod(request.method, allowedMethods)
   if (!methodCheck.ok) {
@@ -440,6 +573,59 @@ export async function verifyControlRequest(
   }
 
   // ── 3: 라우트별 문법.
+  if (isHeartbeatWorkspace) {
+    const bodyCheck = checkHeartbeatBody(body)
+    if (!bodyCheck.ok) {
+      return reject(400, bodyCheck.error)
+    }
+
+    const authResult = await authenticate(request, credentials)
+    if (!authResult.ok) {
+      return authResult
+    }
+    return {
+      ok: true,
+      request: { route: 'heartbeatWorkspace', subject: authResult.subject, workspaceId: workspaceIdSegment },
+    }
+  }
+
+  if (isCloseWorkspace) {
+    const bodyCheck = checkCloseWorkspaceBody(body)
+    if (!bodyCheck.ok) {
+      return reject(400, bodyCheck.error)
+    }
+
+    const authResult = await authenticate(request, credentials)
+    if (!authResult.ok) {
+      return authResult
+    }
+    return {
+      ok: true,
+      request: {
+        route: 'closeWorkspace',
+        subject: authResult.subject,
+        workspaceId: workspaceIdSegment,
+        outcome: bodyCheck.outcome,
+      },
+    }
+  }
+
+  if (isRevokeWorkspace) {
+    const bodyCheck = checkRevokeWorkspaceBody(body)
+    if (!bodyCheck.ok) {
+      return reject(400, bodyCheck.error)
+    }
+
+    const authResult = await authenticate(request, credentials)
+    if (!authResult.ok) {
+      return authResult
+    }
+    return {
+      ok: true,
+      request: { route: 'revokeWorkspace', subject: authResult.subject, workspaceId: workspaceIdSegment },
+    }
+  }
+
   if (isOpenWorkspace) {
     const bodyCheck = checkOpenWorkspaceBody(body)
     if (!bodyCheck.ok) {

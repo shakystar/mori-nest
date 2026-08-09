@@ -1,8 +1,9 @@
 /**
- * 제어 평면 요청 판정 (`verifyControlRequest`, mori-nest #83·#93·#102 — #68 라우트 조각 1/2).
+ * 제어 평면 요청 판정 (`verifyControlRequest`, mori-nest #83·#93·#102·#112 — #68 라우트 조각 1/2).
  *
  * #83 이슈 본문이 못박은 아홉 건 + #93 이슈 본문이 못박은 두 건(`§2.6` revoke 판정) + #102
- * 이슈 본문이 못박은 네 건(`§4.2` openWorkspace 판정)이고, 그 이상 만들지 않는다. HTTP
+ * 이슈 본문이 못박은 네 건(`§4.2` openWorkspace 판정) + #112 이슈 본문이 못박은 세 건
+ * (`§4.3`~`§4.5` 작업공간 전이 판정)이고, 그 이상 만들지 않는다. HTTP
  * 서버·라우트 실행(스토어를 실제로 부르는 배선)은 라우트 조각 2/2다 — 여기서는 다루지 않는다.
  */
 
@@ -232,6 +233,73 @@ describe('verifyControlRequest — POST /v1/workspaces', () => {
     expect(result.status).toBe(405)
     expect(result.error.error.code).toBe('method_not_allowed')
     expect(result.headers['Allow']).toBe('POST')
+  })
+})
+
+describe('verifyControlRequest — POST /v1/workspaces/{workspaceId}/heartbeat|close|revoke (§4.3~§4.5)', () => {
+  function subReq(token: string, workspaceId: string, action: string): RawRequest {
+    return { method: 'POST', url: `/v1/workspaces/${workspaceId}/${action}`, headers: { authorization: `Bearer ${token}` } }
+  }
+
+  it('⑯ 세 경로가 각각 자기 route로 판별되고 workspaceId가 뽑힌다 (§4.3~§4.5)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-n')
+
+    const heartbeat = await verifyControlRequest(subReq(token, 'ws-1', 'heartbeat'), '{}', store)
+    expect(heartbeat.ok).toBe(true)
+    if (!heartbeat.ok) return
+    expect(heartbeat.request.route).toBe('heartbeatWorkspace')
+    if (heartbeat.request.route !== 'heartbeatWorkspace') return
+    expect(heartbeat.request.subject).toBe('subject-n')
+    expect(heartbeat.request.workspaceId).toBe('ws-1')
+
+    const close = await verifyControlRequest(subReq(token, 'ws-2', 'close'), JSON.stringify({ outcome: 'flushed' }), store)
+    expect(close.ok).toBe(true)
+    if (!close.ok) return
+    expect(close.request.route).toBe('closeWorkspace')
+    if (close.request.route !== 'closeWorkspace') return
+    expect(close.request.subject).toBe('subject-n')
+    expect(close.request.workspaceId).toBe('ws-2')
+    expect(close.request.outcome).toBe('flushed')
+
+    const revoke = await verifyControlRequest(subReq(token, 'ws-3', 'revoke'), '{}', store)
+    expect(revoke.ok).toBe(true)
+    if (!revoke.ok) return
+    expect(revoke.request.route).toBe('revokeWorkspace')
+    if (revoke.request.route !== 'revokeWorkspace') return
+    expect(revoke.request.subject).toBe('subject-n')
+    expect(revoke.request.workspaceId).toBe('ws-3')
+  })
+
+  it('⑰ close의 outcome 부재·두 값 밖·타입 불일치가 각각 400 malformed_request다 (§4.4)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-o')
+
+    for (const body of [JSON.stringify({}), JSON.stringify({ outcome: 'other' }), JSON.stringify({ outcome: 1 })]) {
+      const result = await verifyControlRequest(subReq(token, 'ws-1', 'close'), body, store)
+      expect(result.ok).toBe(false)
+      if (result.ok) continue
+      expect(result.status).toBe(400)
+      expect(result.error.error.code).toBe('malformed_request')
+    }
+  })
+
+  it('⑱ heartbeat 본문에 정의되지 않은 필드가 있으면 400, revoke의 reason은 문자열이면 통과하되 산출물에 실리지 않는다 (§4.3·§4.5)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-p')
+
+    const heartbeat = await verifyControlRequest(subReq(token, 'ws-1', 'heartbeat'), JSON.stringify({ zzz: 1 }), store)
+    expect(heartbeat.ok).toBe(false)
+    if (heartbeat.ok) return
+    expect(heartbeat.status).toBe(400)
+    expect(heartbeat.error.error.code).toBe('malformed_request')
+
+    const revoke = await verifyControlRequest(subReq(token, 'ws-1', 'revoke'), JSON.stringify({ reason: 'stale' }), store)
+    expect(revoke.ok).toBe(true)
+    if (!revoke.ok) return
+    expect(revoke.request.route).toBe('revokeWorkspace')
+    if (revoke.request.route !== 'revokeWorkspace') return
+    expect('reason' in revoke.request).toBe(false)
   })
 })
 
