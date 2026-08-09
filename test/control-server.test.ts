@@ -4,22 +4,35 @@ import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { openLauncherCredentialStore, type LauncherCredentialStore } from '../src/control/credential.js'
 import { openIdempotencyStore, type IdempotencyStore } from '../src/control/idempotency.js'
+import type { ControlConfig } from '../src/control/index.js'
 import { createControlServer } from '../src/control/server.js'
 import { openControlStore, type ControlStore } from '../src/control/store.js'
+import { openWorkspaceStore, type WorkspaceStore } from '../src/control/workspace-store.js'
+import { createVerificationKeySet, verifyWorkspaceToken } from '../src/transport/token.js'
+import { KEY_ID, issuer } from './workspace-token.js'
 
 /**
- * 제어 평면 로그 라우트 셋 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`, mori-nest #84·#93).
+ * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`, mori-nest #84·#93·#103).
  *
- * **동작 하나당 하나 — #84가 일곱 건, #93이 그 위에 세 건(`§2.6` revoke)을 더한다**
- * (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·커서 형식)의 케이스는
- * 여기서 다시 세우지 않는다 — `#83`·`#93`이 `test/control-request.test.ts`에 이미 세웠고,
- * 이 파일이 보는 것은 **판정 결과가 스토어 호출로 이어진 뒤의 관찰 가능한 응답**이다.
+ * **동작 하나당 하나 — #84가 일곱 건, #93이 그 위에 세 건(`§2.6` revoke), #103이 다섯 건
+ * (`§4.2` 개시)을 더한다** (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·
+ * 커서 형식)의 케이스는 여기서 다시 세우지 않는다 — `#83`·`#93`·`#102`가
+ * `test/control-request.test.ts`에 이미 세웠고, 이 파일이 보는 것은 **판정 결과가 스토어
+ * 호출로 이어진 뒤의 관찰 가능한 응답**이다. 토큰 와이어 형식의 재검증도 하지 않는다
+ * (`test/control-token.test.ts`가 덮는다) — 아래 ⑪이 검증자를 부르는 것은 형식을 다시
+ * 보기 위해서가 아니라 **이 라우트가 실제로 쓸 수 있는 토큰을 내는가**를 보기 위해서다.
+ *
+ * 두 평면을 함께 import하는 것(`src/transport/token.js`)은 경계 위반이 아니다 —
+ * `test/`는 두 평면을 마주 세우는 자리이고, `test/control-token.test.ts`(#94)가 세운
+ * 선례 그대로다.
  *
  * 기존 서버 테스트(`test/server*.test.ts`)를 복사해 변형하지 않는다 — 전송 평면 라우트와
  * 이 라우트는 계약이 다르다(이슈 본문).
@@ -76,19 +89,86 @@ function runRaceChild(
   })
 }
 
-describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4·§2.6)', () => {
+/** `§4.2` 응답 `OpenWorkspaceResponse`의 여섯 필드. */
+type OpenReply = {
+  workspaceId: string
+  token: string
+  tokenId: string
+  scope: string[]
+  expiresAt: string
+  heartbeatIntervalSeconds: number
+}
+
+/**
+ * 시험용 발급 설정 — `§3.4`의 네 제약을 만족한다 (`parseControlConfig`가 강제하는 그것).
+ * 검증 키 집합(`keys`)이 이 `keyId`의 공개키를 갖고 있어 아래 ⑪의 라운드트립이 성립한다.
+ */
+const CONFIG: ControlConfig = {
+  signingKey: issuer.privateKey,
+  keyId: KEY_ID,
+  tokenTtlSeconds: 300,
+  heartbeatIntervalSeconds: 30,
+  gracePeriodSeconds: 600,
+}
+
+/** `issuer`의 공개키 하나만 주입된 집합 — 전송 평면이 받는 절반(`§3.3`)이다. */
+const VERIFICATION_KEYS = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
+
+describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2)', () => {
   let dir: string
   let store: ControlStore
   let idempotency: IdempotencyStore
   let credentials: LauncherCredentialStore
+  let workspaces: WorkspaceStore
   let server: Server
   let origin: string
   let tokenA: string
   let tokenB: string
+  /** ⑭가 여는 두 번째 서버 — grace 창만 다르다. `afterEach`가 함께 닫는다. */
+  const extraServers: Server[] = []
 
-  async function send(path: string, init: RequestInit = {}): Promise<Reply> {
-    const response = await fetch(`${origin}${path}`, init)
+  async function send(path: string, init: RequestInit = {}, at: string = origin): Promise<Reply> {
+    const response = await fetch(`${at}${path}`, init)
     return { status: response.status, text: await response.text() }
+  }
+
+  /** 설정만 갈아 끼운 서버 하나를 더 띄운다 — 스토어(= DB 파일)는 그대로 공유한다. */
+  async function startServer(overrides: Partial<ControlConfig>): Promise<string> {
+    const extra = createControlServer({
+      store,
+      idempotency,
+      credentials,
+      workspaces,
+      config: { ...CONFIG, ...overrides },
+    })
+    await new Promise<void>((resolve) => {
+      extra.listen(0, '127.0.0.1', resolve)
+    })
+    extraServers.push(extra)
+    return `http://127.0.0.1:${String((extra.address() as AddressInfo).port)}`
+  }
+
+  function openWorkspace(token: string, key: string, body: string, at: string = origin): Promise<Reply> {
+    return send(
+      '/v1/workspaces',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'Idempotency-Key': key },
+        body,
+      },
+      at,
+    )
+  }
+
+  /** 이 주체 앞으로 저장된 작업공간 수. 목록 라우트(#99)가 아직 없어 저장분을 직접 센다. */
+  function storedWorkspaceCount(subject: string): number {
+    const db = new DatabaseSync(join(dir, 'workspace.db'))
+    try {
+      const row = db.prepare('SELECT COUNT(*) AS n FROM workspaces WHERE subject = ?').get(subject)
+      return Number(row?.['n'])
+    } finally {
+      db.close()
+    }
   }
 
   function createLog(token: string, key: string, body = '{}'): Promise<Reply> {
@@ -124,10 +204,11 @@ describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4·§2.6)', () 
     store = await openControlStore(join(dir, 'control.db'))
     idempotency = await openIdempotencyStore(join(dir, 'idempotency.db'))
     credentials = await openLauncherCredentialStore(join(dir, 'credential.db'))
+    workspaces = await openWorkspaceStore(join(dir, 'workspace.db'))
     tokenA = (await credentials.issue('subject-a')).token
     tokenB = (await credentials.issue('subject-b')).token
 
-    server = createControlServer({ store, idempotency, credentials })
+    server = createControlServer({ store, idempotency, credentials, workspaces, config: CONFIG })
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', resolve)
     })
@@ -136,17 +217,21 @@ describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4·§2.6)', () 
   })
 
   afterEach(async () => {
-    // keep-alive로 살아 있는 소켓이 남으면 `close`가 끝나지 않는다 — 먼저 끊는다.
-    server.closeAllConnections()
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => {
-        if (error) reject(error)
-        else resolve()
+    for (const running of [server, ...extraServers]) {
+      // keep-alive로 살아 있는 소켓이 남으면 `close`가 끝나지 않는다 — 먼저 끊는다.
+      running.closeAllConnections()
+      await new Promise<void>((resolve, reject) => {
+        running.close((error) => {
+          if (error) reject(error)
+          else resolve()
+        })
       })
-    })
+    }
+    extraServers.length = 0
     await idempotency.close()
     await store.close()
     await credentials.close()
+    await workspaces.close()
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -334,5 +419,130 @@ describe('제어 평면 로그 라우트 (0003 §2.1·§2.4·§1.4·§2.6)', () 
     expect(listed.logs.map((log) => log.logId)).not.toContain(logId)
 
     expect((await read(`/v1/logs/${logId}`, tokenA)).status).toBe(404)
+  })
+
+  it('⑪ 개시 → 201 + 여섯 필드, scope === logs, 그 토큰이 검증자를 통과한다 (§4.2·§3.6)', async () => {
+    const logs = [await mintedLogId(tokenA, 'open-log-1'), await mintedLogId(tokenA, 'open-log-2')]
+
+    const reply = await openWorkspace(tokenA, 'open-key-1', JSON.stringify({ logs }))
+
+    expect(reply.status).toBe(201)
+    const body = bodyOf(reply) as OpenReply
+    expect(Object.keys(body).sort()).toEqual(
+      ['expiresAt', 'heartbeatIntervalSeconds', 'scope', 'token', 'tokenId', 'workspaceId'].sort(),
+    )
+    // 서버가 넓히지도 조용히 좁히지도 않는다 (§3.6 MUST) — 순서까지 요청 그대로다.
+    expect(body.scope).toEqual(logs)
+    expect(body.heartbeatIntervalSeconds).toBe(CONFIG.heartbeatIntervalSeconds)
+
+    // 이 조각의 핵심: 라우트 응답에서 꺼낸 토큰이 **전송 평면의 검증자**를 통과한다.
+    // #94의 라운드트립과 다른 것은 토큰의 출처다 — 여기서는 클레임을 라우트가 지었다.
+    const verified = verifyWorkspaceToken(body.token, VERIFICATION_KEYS)
+    expect(verified.ok).toBe(true)
+    if (!verified.ok) return
+    expect(verified.token.claims.workspaceId).toBe(body.workspaceId)
+    expect(verified.token.claims.scope).toEqual(body.scope)
+    expect(verified.token.claims.tokenId).toBe(body.tokenId)
+    // 응답의 `expiresAt`이 토큰이 실은 만료와 같다 — 클라이언트가 토큰을 파싱하지 않고도
+    // 만료를 알 수 있어야 한다는 §3.2의 전제가 이 등식이다.
+    expect(verified.token.claims.expiresAt).toBe(body.expiresAt)
+  })
+
+  it('⑫ grant 불가 로그가 섞이면 403 not_grantable이고 작업공간이 만들어지지 않는다 (§3.6 MUST)', async () => {
+    const mine = await mintedLogId(tokenA, 'grantable-log')
+    const others = await mintedLogId(tokenB, 'not-mine-log')
+    const missing = 'no-such-log'
+
+    const reply = await openWorkspace(tokenA, 'open-key-403', JSON.stringify({ logs: [mine, others, missing] }))
+
+    expect(reply.status).toBe(403)
+    const error = bodyOf(reply) as { error: { code: string; details?: { logIds?: string[] } } }
+    expect(error.error.code).toBe('not_grantable')
+    // 첫 하나에서 멈추지 않는다 — 거부된 id가 **전부** 실려야 클라이언트가 한 번에 고친다.
+    expect(error.error.details?.logIds).toEqual([others, missing])
+
+    // all-or-nothing: 부분 성공이 없다.
+    expect(storedWorkspaceCount('subject-a')).toBe(0)
+  })
+
+  it('⑬ 같은 키 재시도 → 같은 workspaceId·scope, 새 token·tokenId·expiresAt (§4.2 MUST)', async () => {
+    const logs = [await mintedLogId(tokenA, 'retry-log')]
+    const requestBody = JSON.stringify({ logs })
+
+    const first = bodyOf(await openWorkspace(tokenA, 'open-key-retry', requestBody)) as OpenReply
+    // `expiresAt`은 초 해상도다 (§3.2의 고정 20바이트) — 같은 초 안에서 재시도하면 값이
+    // 같을 수밖에 없으므로, 그 필드가 **다시 계산된다**는 것을 보려면 초를 넘겨야 한다.
+    await delay(1100)
+    const retry = await openWorkspace(tokenA, 'open-key-retry', requestBody)
+
+    expect(retry.status).toBe(201)
+    const second = bodyOf(retry) as OpenReply
+    expect(second.workspaceId).toBe(first.workspaceId)
+    expect(second.scope).toEqual(first.scope)
+    expect(second.heartbeatIntervalSeconds).toBe(first.heartbeatIntervalSeconds)
+    // 서버가 토큰 문자열을 보관하면 §3.8을 깬다 — 재시도는 저장된 응답의 재생이 아니라
+    // **새 발급**이다. `expiresAt`이 고정되면 늦은 재시도가 이미 지난 시각을 받는다.
+    expect(second.token).not.toBe(first.token)
+    expect(second.tokenId).not.toBe(first.tokenId)
+    expect(second.expiresAt).not.toBe(first.expiresAt)
+    // 새 토큰도 실제로 쓸 수 있어야 한다.
+    expect(verifyWorkspaceToken(second.token, VERIFICATION_KEYS).ok).toBe(true)
+
+    expect(storedWorkspaceCount('subject-a')).toBe(1)
+  })
+
+  it(
+    '⑭ 재시도 대상이 종단 상태면 409 workspace_not_active + details 둘이다 (§4.2 MUST)',
+    async () => {
+      const logs = [await mintedLogId(tokenA, 'terminal-log')]
+      const requestBody = JSON.stringify({ logs })
+
+      // 오늘 도달 가능한 종단 경로는 `gracePeriod` 경과로 계산되는 `abandoned` 하나다
+      // (§4.1 — 저장값이 아니라 조회 시각의 파생값). grace 창만 줄인 서버를 따로 띄운다:
+      // `§3.4`가 `gracePeriod > tokenTtl ≥ 3 × heartbeat`을 요구하므로 이 넷이 최솟값이다.
+      const impatient = await startServer({
+        heartbeatIntervalSeconds: 1,
+        tokenTtlSeconds: 3,
+        gracePeriodSeconds: 4,
+      })
+
+      const first = bodyOf(await openWorkspace(tokenA, 'open-key-terminal', requestBody, impatient)) as OpenReply
+      await delay(4200)
+
+      const retry = await openWorkspace(tokenA, 'open-key-terminal', requestBody, impatient)
+
+      expect(retry.status).toBe(409)
+      // 첫 결과를 돌려주지 않는다 — 이 거부가 없으면 폐기·유기된 작업공간에 `tokenTtl`짜리
+      // 새 토큰이 나가고, §3.5가 약속한 수렴 시간이 이 경로에서 성립하지 않는다.
+      expect(bodyOf(retry)).toEqual({
+        error: {
+          code: 'workspace_not_active',
+          message: expect.any(String),
+          // 응답을 잃은 런처가 `supersedes`(§4.7)로 이을 수 있어야 한다 (MUST).
+          details: { workspaceId: first.workspaceId, state: 'abandoned' },
+        },
+      })
+    },
+    20_000,
+  )
+
+  it('⑮ supersedes가 다른 주체의 작업공간이면 404 workspace_not_found다 (§4.2 MUST)', async () => {
+    const othersLogs = [await mintedLogId(tokenB, 'supersedes-log')]
+    const others = bodyOf(
+      await openWorkspace(tokenB, 'open-key-others', JSON.stringify({ logs: othersLogs })),
+    ) as OpenReply
+
+    const mine = [await mintedLogId(tokenA, 'supersedes-mine-log')]
+    const reply = await openWorkspace(
+      tokenA,
+      'open-key-supersedes',
+      JSON.stringify({ logs: mine, supersedes: others.workspaceId }),
+    )
+
+    // "이어받음이 사실인가"는 판정할 수 없지만 "쓰는 사람이 그 기록의 주인인가"는 판정한다.
+    expect(reply.status).toBe(404)
+    expect(bodyOf(reply)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
+    // 남의 유기 기록을 덮어쓰는 쓰기가 되지 않게, 이 실패는 작업공간을 만들지 않는다.
+    expect(storedWorkspaceCount('subject-a')).toBe(0)
   })
 })

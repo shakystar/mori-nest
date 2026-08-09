@@ -49,12 +49,26 @@ const { openLauncherCredentialStore } = await import('../src/control/credential.
 const { openIdempotencyStore } = await import('../src/control/idempotency.ts')
 const { createControlServer } = await import('../src/control/server.ts')
 const { openControlStore } = await import('../src/control/store.ts')
+const { openWorkspaceStore } = await import('../src/control/workspace-store.ts')
 
 const store = await openControlStore(`${dir}/control.db`)
 const idempotency = await openIdempotencyStore(`${dir}/idempotency.db`)
 const credentials = await openLauncherCredentialStore(`${dir}/credential.db`)
+const workspaces = await openWorkspaceStore(`${dir}/workspace.db`)
 
-const server = createControlServer({ store, idempotency, credentials })
+// 이 자식이 내는 요청은 `POST /v1/logs` 하나이고 발급 경로를 지나지 않는다. 그래도 설정은
+// **선택 필드가 아니므로**(`ControlServerOptions`) 여기서도 채운다 — `§3.4`의 네 제약을
+// 만족하는 값 하나면 족하다. 키를 자식이 직접 만드는 것은 부모와 나눠 가질 이유가 없어서다.
+const { generateKeyPairSync } = await import('node:crypto')
+const config = {
+  signingKey: generateKeyPairSync('ed25519').privateKey,
+  keyId: 'k-race',
+  tokenTtlSeconds: 300,
+  heartbeatIntervalSeconds: 30,
+  gracePeriodSeconds: 600,
+}
+
+const server = createControlServer({ store, idempotency, credentials, workspaces, config })
 server.listen(0, '127.0.0.1')
 await once(server, 'listening')
 const { port } = server.address()
@@ -97,3 +111,4 @@ server.close()
 await idempotency.close()
 await store.close()
 await credentials.close()
+await workspaces.close()

@@ -3,10 +3,10 @@
  * (`0002 §4.1-3`).
  *
  * `POST /v1/logs`(`0003 §2.1`) · `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`) ·
- * `POST /v1/logs/{logId}/revoke`(`§2.6`) 넷을 배선한다.
+ * `POST /v1/logs/{logId}/revoke`(`§2.6`) · `POST /v1/workspaces`(`§4.2`) 다섯을 배선한다.
  * **판정은 이 파일에 없다** — 자격 게이트·라우트 판별·본문/쿼리 검사는 `./request.js`의
- * {@link verifyControlRequest}가 이미 끝냈고(mori-nest #83 · #93), 여기서는 그 산출물을 스토어
- * 호출로 잇는다. 페이지네이션도 마찬가지다: 판정 → 정렬 → `limit` 적용과 `hasMore` 판정은
+ * {@link verifyControlRequest}가 이미 끝냈고(mori-nest #83 · #93 · #102), 여기서는 그 산출물을
+ * 스토어 호출로 잇는다. 페이지네이션도 마찬가지다: 판정 → 정렬 → `limit` 적용과 `hasMore` 판정은
  * `listLogsForSubject`가 이미 답했으므로 이 파일이 **다시 자르지 않는다** (자르면 `hasMore`가
  * 거짓말이 된다, `§2.4`).
  *
@@ -25,10 +25,19 @@
  * 핸들러를 감싸지 않고 **핸들러가 계층을 부른다** — 응답(상태코드·본문)이 자원을 만든
  * 뒤에야 정해지기 때문이다(`./idempotency.js` 머리말).
  *
- * ## 이 조각의 비범위 (mori-nest #84 · #93 이슈 본문)
+ * 개시 라우트(`§4.2`)가 그 위에 얹히면서 이 파일은 **토큰을 발급하는 첫 배선**이 됐다
+ * (mori-nest #103). 세 계층이 한 응답 안에서 순서를 지켜야 하는 자리라 그 순서를
+ * {@link handleOpenWorkspace}의 doc이 따로 적는다: 멱등 예약(`§1.4`) → grant fail-closed
+ * (`§3.6`) → 상태 판정과 발급의 원자성(`§4.1`·`§4.2`).
  *
- * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 `§4` 작업공간 계열과 폐기 사유
- * (`reason`)의 저장. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
+ * **`§3.8`**: 토큰 문자열이 남는 곳은 개시 응답 본문 하나다 — 로그도 에러 봉투도 멱등
+ * 저장분도 그것을 싣지 않는다(멱등 저장분이 무엇을 담는지는
+ * {@link OpenWorkspaceReservation} doc).
+ *
+ * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 이슈 본문)
+ *
+ * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간의 하트비트·종료·폐기·
+ * 조회 라우트(`§4.3`~`§4.6`)와 폐기 사유(`reason`)의 저장. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
  * 뜻이다** — 전송 평면의 `maxRequestBytes`(`0002 §1.3` L103)에 해당하는 자리가 이 평면에는
  * 아직 배선되지 않았다(`0003 §1.3` 표에 `413 request_too_large`가 있으므로 자리는 열려 있고,
  * 값을 정하는 것은 이 조각이 아니다). 그 라우트를 여는 다음 조각이 이 함수에 상한을 준다.
@@ -55,8 +64,14 @@ import { createServer, type Server } from 'node:http'
 import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
 import type { LauncherCredentialStore } from './credential.js'
 import { IdempotencyStoreError, type IdempotencyStore } from './idempotency.js'
+// **타입 전용 import다** — 런타임 그래프에는 이 간선이 없다(`verbatimModuleSyntax`가 지운다).
+// 설정 스키마의 집이 `./index.js` 하나라는 것이 이 평면의 규율이라(그 파일 머리말), 그 모양을
+// 여기에 다시 적는 대신 이름으로 가리킨다.
+import type { ControlConfig } from './index.js'
 import { verifyControlRequest, type ControlRequest, type RawRequest } from './request.js'
 import { ControlStoreError, DEFAULT_PAGE_LIMIT, type ControlStore } from './store.js'
+import { issueWorkspaceToken, mintTokenId } from './token.js'
+import { WorkspaceStoreError, type WorkspaceStore } from './workspace-store.js'
 
 /**
  * `GET /v1/logs`의 `limit` 천장 ({@link handleListLogs} doc). 스토어가 `limit` 없이 쓰는
@@ -89,6 +104,14 @@ export type ControlServerOptions = {
   readonly idempotency: IdempotencyStore
   /** 런처 자격증명 조회 (`./credential.js`, #74). 게이트가 `verify`만 쓴다. */
   readonly credentials: LauncherCredentialStore
+  /** 작업공간 생애 추적 (`./workspace-store.js`, #97·#98). */
+  readonly workspaces: WorkspaceStore
+  /**
+   * `parseControlConfig`(`./index.js`)를 통과한 설정. **선택 필드가 아니다** — 발급
+   * 파라미터가 없는 채로 뜬 서버는 `POST /v1/workspaces`에 답할 수 없고, 그 사실이
+   * 첫 요청까지 미뤄지면 `§3.4` 강제를 파싱 시점에 둔 이유가 사라진다.
+   */
+  readonly config: ControlConfig
 }
 
 /**
@@ -434,6 +457,279 @@ async function handleRevokeLog(
 }
 
 /**
+ * 멱등 레코드에 저장하는 것 — **응답 본문이 아니라 재구성에 필요한 둘뿐이다.**
+ *
+ * `handleCreateLog`는 첫 응답의 바이트를 그대로 저장해 그대로 재생하지만(`§1.4` MUST),
+ * 이 라우트는 그럴 수 없다: `§4.2` MUST가 재시도에 **새 토큰**을 요구하므로
+ * (`token`·`tokenId`·`expiresAt`이 첫 응답과 달라야 한다) 저장분을 되쓰면 그 셋이 첫 값으로
+ * 굳는다 — 그리고 토큰 문자열을 저장하는 것 자체가 `§3.8` MUST NOT이다. 그래서 저장하는
+ * 것은 «어느 작업공간에·어떤 스코프로» 둘이고, 나머지는 재시도 때 다시 짓는다.
+ */
+type OpenWorkspaceReservation = {
+  readonly workspaceId: string
+  readonly scope: readonly string[]
+}
+
+/** `§3.2` 클레임 표: 이 버전에서 `audience`는 리터럴 `transport` 고정 (`§1.1`·`§3.7`). */
+const TOKEN_AUDIENCE = 'transport'
+
+const MS_PER_SECOND = 1000
+
+/**
+ * `§3.2`의 고정 20바이트 `YYYY-MM-DDTHH:MM:SSZ`.
+ *
+ * 초 미만을 **버린다**. 발급자(`./token.js`)는 그 자리를 가진 문자열을 아예 거부하므로
+ * (`timestamp_not_canonical`) 여기서 자르지 않으면 정상 요청이 `500`이 된다.
+ */
+function rfc3339Seconds(time: Date): string {
+  return `${time.toISOString().slice(0, 19)}Z`
+}
+
+/** 발급 결과 — 재시도마다 새로 나는 세 값이다 (`§4.2` MUST). */
+type IssuedToken = {
+  readonly token: string
+  readonly tokenId: string
+  readonly expiresAt: string
+}
+
+/**
+ * 작업공간 하나에 대한 토큰을 발급한다 (`§3.2`·`§3.4`).
+ *
+ * `issuedAt`을 **초로 내린 뒤에** `tokenTtl`을 더한다 — `now`를 그대로 더하고 나중에 자르면
+ * 초 미만이 잘리는 방향 때문에 실제 수명이 `tokenTtl`보다 최대 1초 길어지고, 그 1초는
+ * `§3.4`가 상한으로 못박은 값을 넘는 구간이다.
+ *
+ * `§3.4`의 네 제약은 여기서 다시 보지 않는다 — `parseControlConfig`가 파싱 시점에 이미
+ * 강제했고, 판정을 두 곳에 두면 갈린다.
+ */
+function issueToken(config: ControlConfig, workspaceId: string, scope: readonly string[]): IssuedToken {
+  const issuedAtMs = Math.floor(Date.now() / MS_PER_SECOND) * MS_PER_SECOND
+  const issuedAt = rfc3339Seconds(new Date(issuedAtMs))
+  const expiresAt = rfc3339Seconds(new Date(issuedAtMs + config.tokenTtlSeconds * MS_PER_SECOND))
+  const tokenId = mintTokenId()
+
+  const token = issueWorkspaceToken({
+    signingKey: config.signingKey,
+    keyId: config.keyId,
+    claims: { tokenId, workspaceId, audience: TOKEN_AUDIENCE, issuedAt, expiresAt, scope },
+  })
+  return { token, tokenId, expiresAt }
+}
+
+/** `§4.2`의 `OpenWorkspaceResponse` 여섯 필드. 첫 응답과 재시도가 같은 함수로 지어진다. */
+function writeOpenWorkspace(
+  response: ResponseWriter,
+  config: ControlConfig,
+  reservation: OpenWorkspaceReservation,
+  issued: IssuedToken,
+): void {
+  writeJson(response, 201, {
+    workspaceId: reservation.workspaceId,
+    token: issued.token,
+    tokenId: issued.tokenId,
+    scope: reservation.scope,
+    expiresAt: issued.expiresAt,
+    heartbeatIntervalSeconds: config.heartbeatIntervalSeconds,
+  })
+}
+
+/** 저장분을 되읽는다. 이 서버가 쓴 바이트이므로 모양이 어긋나면 서버 결함이다(`500`). */
+function readReservation(body: string): OpenWorkspaceReservation {
+  const parsed: unknown = JSON.parse(body)
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new TypeError('stored idempotency record is not an object')
+  }
+  const { workspaceId, scope } = parsed as Record<string, unknown>
+  if (typeof workspaceId !== 'string' || !Array.isArray(scope) || !scope.every((log) => typeof log === 'string')) {
+    throw new TypeError('stored idempotency record does not carry a workspace reservation')
+  }
+  return { workspaceId, scope: scope as readonly string[] }
+}
+
+/**
+ * 멱등 재시도 경로 (`§4.2`·`§1.4`) — **저장분을 그대로 되쓰지 않는다** (위
+ * {@link OpenWorkspaceReservation} doc).
+ *
+ * **발급은 언제나 상태 판정을 통과한다** (`§4.2` MUST). 그래서 새 토큰을 짓기 전에
+ * `getWorkspace`로 조회 시각 기준의 상태를 다시 묻는다 — 그 작업공간이 종단 상태(`§4.1`의
+ * `active` 아닌 넷)면 첫 결과를 돌려주지 않고 `409 workspace_not_active`다. 이 거부가 없으면
+ * 폐기된 작업공간에 `tokenTtl`짜리 새 토큰이 나가고, `§3.5`가 약속한 수렴 시간 ≤ `tokenTtl`이
+ * 이 경로에서 성립하지 않는다.
+ *
+ * `abandoned`도 종단이고, 그것은 **저장된 값이 아니라 조회 시각에 계산되는 값**이다(#97) —
+ * `gracePeriod`가 설정으로 오는 이유가 이것이다. 초→ms 환산은 이 리포에서 **이 한 줄뿐이다**
+ * (`./index.js`의 `gracePeriodSeconds` doc).
+ *
+ * 조회가 비면(`undefined`) `404 workspace_not_found`다 — 저장분이 가리키는 작업공간이 이
+ * 주체에게 더는 보이지 않는다는 뜻이고, 다른 라우트가 같은 상황에 내는 코드가 그것이다.
+ */
+async function replayOpenWorkspace(
+  options: ControlServerOptions,
+  subject: string,
+  record: { readonly body: string },
+  response: ResponseWriter,
+): Promise<void> {
+  let reservation: OpenWorkspaceReservation
+  let workspace
+  try {
+    reservation = readReservation(record.body)
+    workspace = await options.workspaces.getWorkspace(subject, reservation.workspaceId, {
+      gracePeriodMs: options.config.gracePeriodSeconds * MS_PER_SECOND,
+    })
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  if (workspace === undefined) {
+    writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
+    return
+  }
+  if (workspace.state !== 'active') {
+    // `details`의 둘은 `§4.2` MUST다. 열거 오라클이 아니다 — 같은 주체가 자기 멱등성 키로
+    // 자기가 만든 자원을 되묻는 것이고, 이것이 없으면 응답을 잃은 런처가 `supersedes`로
+    // 이어붙일 대상을 알 수 없다 (`§4.7`).
+    writeJson(
+      response,
+      409,
+      errorResponse(ErrorCodes.workspace_not_active, 'this workspace is no longer active', {
+        workspaceId: reservation.workspaceId,
+        state: workspace.state,
+      }),
+    )
+    return
+  }
+
+  let issued: IssuedToken
+  try {
+    issued = issueToken(options.config, reservation.workspaceId, reservation.scope)
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+  writeOpenWorkspace(response, options.config, reservation, issued)
+}
+
+/**
+ * `POST /v1/workspaces` (`§4.2`) — 멱등 예약(`§1.4`) → grant 판정(`§3.6`) → 개시 → 발급 → `201`.
+ *
+ * 이 순서가 계약이다. `handleCreateLog`가 세운 «계층이 핸들러를 감싸지 않고 핸들러가 계층을
+ * 부른다»를 그대로 따르고, 갈리는 것은 저장분과 재시도 경로 둘이다(위 두 doc).
+ *
+ * ## grant 판정은 all-or-nothing이다 (`§3.6` MUST)
+ *
+ * 요청한 로그 중 **하나라도** 이 주체가 grant할 수 없으면 전부 거부다 —
+ * `403 not_grantable`, **작업공간은 만들어지지 않는다.** 첫 하나에서 멈추지 않고 전부 모아
+ * `details.logIds`에 싣는 것은 클라이언트가 한 번에 고칠 수 있게 하기 위해서다.
+ *
+ * **폐기된 로그를 위한 분기가 여기 없다** (`§3.6` MUST NOT의 짝). 폐기는 `isGranted`의
+ * **입력**이므로(#92), 폐기된 로그는 이 루프에서 자연히 거부 목록에 든다.
+ *
+ * 판정이 예약보다 **뒤**인 것은 `§1.4`가 «키 기록과 자원 생성이 원자적»을 요구하기 때문이다
+ * (이슈 #103 작업 범위 2의 순서). 그래서 `403`으로 끝난 예약은 완료되지 않은 채 남고, 같은
+ * 키·같은 본문의 재시도는 `'in_progress'`로 걸린다 — 스코프를 고쳐 다시 오는 요청은 본문이
+ * 달라졌으므로 `409 idempotency_key_reused`이고, **어느 쪽도 작업공간을 만들지 않는다.**
+ */
+async function handleOpenWorkspace(
+  options: ControlServerOptions,
+  request: Extract<ControlRequest, { route: 'openWorkspace' }>,
+  response: ResponseWriter,
+): Promise<void> {
+  const { subject, idempotencyKey, requestBody, logs } = request
+
+  let reservation
+  try {
+    reservation = await options.idempotency.reserve(subject, idempotencyKey, requestBody)
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  if (reservation.kind === 'replay') {
+    await replayOpenWorkspace(options, subject, reservation.record, response)
+    return
+  }
+  if (reservation.kind === 'conflict') {
+    writeJson(
+      response,
+      409,
+      errorResponse(ErrorCodes.idempotency_key_reused, 'this Idempotency-Key was used with a different request body'),
+    )
+    return
+  }
+  if (reservation.kind === 'in_progress') {
+    // `handleCreateLog`와 같은 판단이고 근거도 같다 (그 doc의 표).
+    writeJson(
+      response,
+      503,
+      errorResponse(ErrorCodes.unavailable, 'a request with this Idempotency-Key is still in progress'),
+      RETRY_AFTER,
+    )
+    return
+  }
+
+  // `'reserved'` — 자원을 만들어도 되는 유일한 판정이다.
+  let rejected: string[]
+  try {
+    const granted = await Promise.all(logs.map((logId) => options.store.isGranted(subject, logId)))
+    rejected = logs.filter((_, index) => granted[index] !== true)
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+  if (rejected.length > 0) {
+    writeJson(
+      response,
+      403,
+      errorResponse(ErrorCodes.not_grantable, 'the requested scope contains logs this subject cannot grant', {
+        logIds: rejected,
+      }),
+    )
+    return
+  }
+
+  let opened
+  try {
+    opened = await options.workspaces.openWorkspace(subject, {
+      logs,
+      ...(request.supersedes === undefined ? {} : { supersedes: request.supersedes }),
+      ...(request.replicaId === undefined ? {} : { replicaId: request.replicaId }),
+    })
+  } catch (error) {
+    if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_found') {
+      // `supersedes`가 없는 id이거나 다른 주체의 것이다 (`§4.2` MUST). 스토어가 이미 그
+      // 판정에서 개시를 롤백했으므로 작업공간은 만들어지지 않았다.
+      writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
+      return
+    }
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  // `scope`는 요청한 `logs` 그대로다 — 서버가 넓히지도 조용히 좁히지도 않는다 (`§3.6` MUST).
+  const stored: OpenWorkspaceReservation = { workspaceId: opened.workspaceId, scope: logs }
+
+  let issued: IssuedToken
+  try {
+    issued = issueToken(options.config, stored.workspaceId, stored.scope)
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  try {
+    // `handleCreateLog`와 같은 이유로 응답보다 **먼저** 완료를 기록한다. 저장되는 바이트에
+    // 토큰이 없다는 것이 `§3.8`이 걸리는 자리다.
+    await options.idempotency.complete(subject, idempotencyKey, { status: 201, body: JSON.stringify(stored) })
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  writeOpenWorkspace(response, options.config, stored, issued)
+}
+
+/**
  * 게이트 → 라우트. 본문을 **`POST`일 때만** 읽는 것은 전송 평면과 같은 규율이다(GET 라우트는
  * 본문을 쓰지 않는다). 이 분기는 라우트 판별이 아니다 — 경로·메서드·문법의 판정은 그 아래
  * {@link verifyControlRequest}가 처음부터 다시 전부 한다.
@@ -473,6 +769,21 @@ async function handleRequest(
     case 'revokeLog':
       await handleRevokeLog(options, gate.request, response)
       return
+    case 'openWorkspace':
+      await handleOpenWorkspace(options, gate.request, response)
+      return
+    default: {
+      // **도달 불가**다 — 위 case들이 `ControlRoute`를 망라한다. 이 분기를 두는 이유는
+      // 런타임이 아니라 **컴파일**이다: case 없는 라우트 값이 생기면 이 `never` 대입이
+      // 깨지므로 `pnpm typecheck`가 그 자리에서 멈춘다. 가드가 없던 동안 `switch`는
+      // case 없는 값에 대해 `writeJson`도 `writeFailure`도 부르지 않고 그대로 반환했고
+      // (반환 타입이 `Promise<void>`라 컴파일도 통과했다), 그 요청은 응답을 받지 못한 채
+      // 연결이 걸려 있었다 (mori-nest #103 이슈 코멘트, `§4.3`~`§4.6`을 더할 때마다 재발할
+      // 클래스). 아래 `throw`는 새 에러 코드를 만들지 않는다 — 서버 배선의 마지막 `catch`가
+      // 이미 `500 internal`로 닫는 자리로 떨어진다.
+      const _exhaustive: never = gate.request
+      throw new Error(`unhandled control route: ${JSON.stringify(_exhaustive)}`)
+    }
   }
 }
 
