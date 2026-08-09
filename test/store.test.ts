@@ -145,10 +145,14 @@ function runDurabilityRound(dbPath: string, logId: string, round: number): Promi
       if (killTimer !== undefined) {
         clearTimeout(killTimer)
       }
-      if (acks.length === 0) {
+      if (acks.length === 0 && stderr !== '') {
+        // stderr가 있으면 자식이 예외로 죽은 것 — 이건 병리이므로 실패로 남긴다.
         reject(new Error(`라운드 ${round}: 자식이 ack를 하나도 남기지 않았다\n${stderr}`))
         return
       }
+      // ack 0건인데 stderr도 비어 있으면 첫 append 전에 SIGKILL을 맞은 것뿐이다.
+      // "ack된 것은 전량이 같은 상대 순서로 남는다"는 ack이 0건인 라운드에서 공허하게
+      // 참이므로 실패가 아니다 — 표본 부족은 루프 밖의 집계 단언(`acked.length > ROUNDS`)이 잡는다.
       resolve(acks)
     })
   })
