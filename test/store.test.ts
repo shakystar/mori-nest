@@ -7,10 +7,10 @@ import { fileURLToPath } from 'node:url'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { parseAppendRequest } from '../src/event.js'
-import type { PullEvent } from '../src/pull.js'
-import type { CursorStart } from '../src/request.js'
-import { EventStoreError, openEventStore, type EventProvenance, type EventStore } from '../src/store.js'
+import { parseAppendRequest } from '../src/transport/event.js'
+import type { PullEvent } from '../src/transport/pull.js'
+import type { CursorStart } from '../src/transport/request.js'
+import { EventStoreError, openEventStore, type EventProvenance, type EventStore } from '../src/transport/store.js'
 
 /**
  * 이 파일의 테스트는 **동작 하나당 하나**이고 아홉 개다 (mori-nest #27의 «테스트» 절 여섯 +

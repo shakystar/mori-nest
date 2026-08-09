@@ -21,8 +21,8 @@ import type { Server } from 'node:http'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createTransportServer, type TransportDiagnostic, type TransportServerOptions } from '../src/server.js'
-import type { EventStore } from '../src/store.js'
+import { createTransportServer, type TransportDiagnostic, type TransportServerOptions } from '../src/transport/server.js'
+import type { EventStore } from '../src/transport/store.js'
 import { NOW, baseClaims, keys, mint } from './workspace-token.js'
 
 const LOG_ID = 'log_diagnostics'

@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { verifyTransportRequest, type RawRequest, type TransportRequestResult } from '../src/request.js'
+import { verifyTransportRequest, type RawRequest, type TransportRequestResult } from '../src/transport/request.js'
 import { NOW, baseClaims, keys, mint } from './workspace-token.js'
 
 const LOG_ID = 'log_in-scope'

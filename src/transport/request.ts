@@ -17,8 +17,8 @@
  * 그 성질이고, 여기서 `logId`에 하는 일은 정규식 검증과 스코프 대조뿐이다.
  */
 
-import { ErrorCodes, errorResponse, type ErrorResponse } from './errors.js'
-import { checkMethod } from './method.js'
+import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
+import { checkMethod } from '../method.js'
 import {
   checkLogScope,
   verifyWorkspaceToken,

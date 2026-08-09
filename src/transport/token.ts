@@ -19,7 +19,7 @@ import { verify } from 'node:crypto'
 import type { KeyObject } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 
-import { ErrorCodes, errorResponse, type ErrorResponse } from './errors.js'
+import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
 
 /** `0003 §3.2` 와이어 형식의 첫 세그먼트. 이 리터럴이 Ed25519와 클레임 레이아웃을 **함께** 고정한다. */
 const TOKEN_VERSION = 'mnw1'

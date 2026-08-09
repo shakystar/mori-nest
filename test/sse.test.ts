@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseAppendRequest } from '../src/event.js'
+import { parseAppendRequest } from '../src/transport/event.js'
 import {
   serializeAppendFrame,
   serializeHeartbeatFrame,
   serializeOpenFrame,
   serializeResetFrame,
-} from '../src/sse.js'
+} from '../src/transport/sse.js'
 
 /**
  * `event.ts`가 잘라낸 **원문 조각**을 가져온다. 상수로 적어 두지 않고 실제 게이트를 통과시키는

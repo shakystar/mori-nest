@@ -12,7 +12,7 @@
  * 모르는** ack가 생긴다. 그 방향의 오차는 테스트를 느슨하게만 만들지 틀리게 만들지는 않지만
  * (부모는 "ack된 것이 남아 있는가"만 본다), 검증 표본을 이유 없이 줄일 이유가 없다.
  *
- * `.mjs`인 것은 이 파일이 `node`로 **직접 실행**되기 때문이다. 타입 스트리핑이 `../src/store.ts`
+ * `.mjs`인 것은 이 파일이 `node`로 **직접 실행**되기 때문이다. 타입 스트리핑이 `../src/transport/store.ts`
  * 쪽을 처리하므로 스토어는 소스 그대로 쓰인다 (빌드 산출물에 의존하지 않는다 — 의존하면
  * `pnpm test`만 돌렸을 때 이 테스트가 옛 `dist/`를 검증한다).
  *
@@ -21,7 +21,7 @@
 
 import { writeSync } from 'node:fs'
 
-import { openEventStore } from '../src/store.ts'
+import { openEventStore } from '../src/transport/store.ts'
 
 const [dbPath, logId, round] = process.argv.slice(2)
 if (dbPath === undefined || logId === undefined || round === undefined) {

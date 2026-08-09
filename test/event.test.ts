@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { ErrorCodes } from '../src/errors.js'
-import { parseAppendRequest } from '../src/event.js'
+import { parseAppendRequest } from '../src/transport/event.js'
 
 describe('parseAppendRequest', () => {
   it('유효한 요청은 요청 배열 순서대로 통과하고 payload 조각이 원문과 일치한다', () => {
