@@ -78,6 +78,8 @@ export const ErrorCodes = {
   missing_idempotency_key: 'missing_idempotency_key',
   /** 403 — 요청한 로그 중 이 주체가 grant할 수 없는 것이 있다 */
   not_grantable: 'not_grantable',
+  /** 404 — 없는 로그 또는 이 주체가 grant 판정을 통과하지 못하는 로그 (구분하지 않는다) */
+  log_not_found: 'log_not_found',
   /** 404 — 없는 작업공간 또는 다른 주체의 작업공간 (구분하지 않는다) */
   workspace_not_found: 'workspace_not_found',
   /** 409 — 이미 끝난 작업공간에 대한 하트비트·종료·폐기, 또는 종단 상태에서의 멱등 재시도 */
