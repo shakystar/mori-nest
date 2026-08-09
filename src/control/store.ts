@@ -83,6 +83,26 @@ export type RandomBytesFn = (size: number) => Buffer
 const MINT_ENTROPY_BYTES = 16
 
 /**
+ * 주입된 난수원이 요청한 바이트 수를 실제로 돌려줬는지 확인한다 (mori-nest #74 이슈 코멘트,
+ * #72 교차 지적을 이관).
+ *
+ * {@link mintLogId}는 결과가 `LOG_ID_PATTERN`(1자 이상)을 만족하는지만 봤는데, 그 정규식은
+ * **모양**만 보고 **양**은 보지 않는다 — 고장난 난수원이 요청보다 짧은 버퍼를 돌려줘도
+ * `base64url` 인코딩 결과가 그 정규식을 통과하면 "최소 128비트" MUST가 조용히 깨진 채
+ * 지나간다. 이 함수가 그 자리에 선다: 길이가 어긋나면 인코딩하기 전에 던진다.
+ *
+ * `src/control/credential.ts`의 런처 자격증명 발급도 같은 `RandomBytesFn` 주입 지점을
+ * 쓰므로 이 함수를 그대로 재사용한다 — 검증을 두 곳에 각각 만들지 않는다.
+ */
+export function readEntropy(randomBytes: RandomBytesFn, size: number): Buffer {
+  const bytes = randomBytes(size)
+  if (bytes.length !== size) {
+    throw new ControlStoreError('random_source_too_short')
+  }
+  return bytes
+}
+
+/**
  * `logId`를 mint한다 (`0003 §2.1`).
  *
  * - **`0002 §1.1` 정규식을 만족한다** (MUST) — base64url 알파벳(`A-Za-z0-9-_`)이 그 정규식이
@@ -97,10 +117,9 @@ const MINT_ENTROPY_BYTES = 16
  *   인가를 접두사로 표현하지 않는다)을 먼저 읽어야 한다.
  */
 export function mintLogId(randomBytes: RandomBytesFn = nodeRandomBytes): string {
-  const logId = randomBytes(MINT_ENTROPY_BYTES).toString('base64url')
-  // 방어적 확인 — 주입된 난수원이 계약(길이 `MINT_ENTROPY_BYTES`의 `Buffer`)을 어기면
-  // 여기서 잡는다. 이 정규식을 벗어난 id는 발급 즉시 전송 평면에서 쓸 수 없는 로그가
-  // 된다(§2.1 MUST) — 통과시키는 쪽으로 무너지지 않는다.
+  const logId = readEntropy(randomBytes, MINT_ENTROPY_BYTES).toString('base64url')
+  // 방어적 확인 — 길이는 위 {@link readEntropy}가 이미 확인했다. 여기서 보는 것은 인코딩
+  // 결과의 문자 집합·길이(모양)뿐이다.
   if (!LOG_ID_PATTERN.test(logId)) {
     throw new ControlStoreError('minted_id_invalid')
   }
@@ -111,6 +130,8 @@ export function mintLogId(randomBytes: RandomBytesFn = nodeRandomBytes): string 
 export type ControlStoreFailure =
   /** {@link mintLogId}이 낸 값이 `0002 §1.1`을 만족하지 못한다 — 주입된 난수원의 결함 */
   | 'minted_id_invalid'
+  /** 주입된 난수원이 요청한 바이트 수보다 짧은 버퍼를 돌려줬다 (mori-nest #74 이슈 코멘트) */
+  | 'random_source_too_short'
   /** `log_subjects.subject`가 빈 문자열이다 (`grant`·`createLog` 공통) */
   | 'blank_subject'
   /** `grant`가 가리킨 `logId`가 존재하지 않는다 */
