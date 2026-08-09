@@ -42,15 +42,27 @@
  * 표준 토큰 포맷을 쓰지 않으므로 파서도 들여오지 않는다.
  */
 
-import { sign } from 'node:crypto'
+import { randomBytes, sign } from 'node:crypto'
 import type { KeyObject } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 
 /** `0003 §3.2` 와이어 형식의 첫 세그먼트. 이 리터럴이 Ed25519와 클레임 레이아웃을 **함께** 고정한다. */
 const TOKEN_VERSION = 'mnw1'
 
-/** `0003 §3.2`: `keyId`는 `^[A-Za-z0-9_-]{1,64}$` — 구분자 `.`과 겹치지 않는다. */
-const KEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+/**
+ * `0003 §3.2`: `keyId`는 `^[A-Za-z0-9_-]{1,64}$` — 구분자 `.`과 겹치지 않는다.
+ *
+ * **설정 파서(`./index.js`)가 이 상수를 그대로 쓴다** (mori-nest #103). 그쪽이 정규식을
+ * 다시 적으면 «설정이 통과시킨 `keyId`로 발급이 던지는» 어긋남이 열리고, 그 실패는 배포가
+ * 아니라 첫 요청에서 드러난다.
+ */
+export const KEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
+/** `tokenId`의 예측 불가 성분. `mintLogId`·`mintWorkspaceId`와 같은 128비트다. */
+const TOKEN_ID_ENTROPY_BYTES = 16
+
+/** `tokenId` 접두사 — `workspaceId`의 `ws_`와 같은 자리의 값이다. */
+const TOKEN_ID_PREFIX = 'tok_'
 
 /** `0003 §3.2`: 초 미만 정밀도와 `Z` 이외의 오프셋은 이 형식에 없다 (MUST NOT). */
 const RFC3339_UTC_SECONDS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/
@@ -204,6 +216,24 @@ function encodeClaimBlock(claims: WorkspaceTokenClaims): Buffer {
     scopeCount,
     ...claims.scope.map((logId, index) => lengthPrefixedAscii(logId, `scope[${index}]`)),
   ])
+}
+
+/**
+ * 발급 건의 식별자를 mint한다 (`§3.2` 클레임 표 — *"서버 기록·감사 로그가 토큰을 가리키는
+ * 유일한 방법"*, `§3.8`).
+ *
+ * `mintLogId`(`./store.js`)·`mintWorkspaceId`(`./workspace-store.js`)와 **같은 128비트**이고,
+ * 다른 것은 접두사뿐이다. 두 mint와 달리 난수원 주입 지점을 두지 않는다: 저 둘은 스토어의
+ * 주입된 `RandomBytesFn`을 쓰므로 «주입원이 요청보다 짧은 버퍼를 돌려줬는가»를 확인해야
+ * 했지만(`readEntropy`), 여기서 부르는 것은 `node:crypto`의 `randomBytes` 자신이라 그
+ * 고장 모드가 없다. 스토어를 import하지 않는 것도 이 파일의 성질이다 — 이 모듈은 크립토
+ * 하나에만 기대고 작업공간도 DB도 모른다 (파일 상단 doc).
+ *
+ * `tokenId`는 **어디에도 저장되지 않는다** — 오늘 이 값을 쓰는 곳은 토큰 클레임과 개시
+ * 응답뿐이고(`§4.2`), 서버가 발급 건을 기록하는 자리는 아직 없다.
+ */
+export function mintTokenId(): string {
+  return `${TOKEN_ID_PREFIX}${randomBytes(TOKEN_ID_ENTROPY_BYTES).toString('base64url')}`
 }
 
 /**

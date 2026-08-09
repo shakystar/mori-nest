@@ -78,9 +78,10 @@ export type ControlRoute = 'createLog' | 'listLogs' | 'getLog' | 'revokeLog' | '
  * 게이트를 통과한 요청. `subject`는 항상 런처 자격증명 조회로만 해석된다(`§1.2` MUST NOT —
  * 본문·쿼리·헤더로 주체를 지정하는 경로가 이 파일에 없다).
  *
- * `createLog`가 `idempotencyKey`와 `requestBody`(원본 본문 문자열)를 함께 싣는 것은 다음
- * 조각이 그대로 `IdempotencyStore.reserve(subject, key, requestBody)`에 넘길 수 있게
- * 하기 위해서다 — 이 게이트가 다이제스트를 미리 계산하지 않는다.
+ * 멱등이 요구되는 두 라우트(`createLog`·`openWorkspace`, `§1.4`)가 `idempotencyKey`와
+ * `requestBody`(원본 본문 문자열)를 함께 싣는 것은 다음 조각이 그대로
+ * `IdempotencyStore.reserve(subject, key, requestBody)`에 넘길 수 있게 하기 위해서다 —
+ * 이 게이트가 다이제스트를 미리 계산하지 않는다.
  */
 export type ControlRequest =
   | {
@@ -113,6 +114,10 @@ export type ControlRequest =
       readonly supersedes?: string
       readonly replicaId?: string
       readonly idempotencyKey: string
+      /** `createLog`와 같은 이유로 원본 본문을 그대로 싣는다 — 다음 계층이
+       *  `IdempotencyStore.reserve(subject, key, requestBody)`에 넘길 값이고, 다이제스트는
+       *  **바이트**에 대한 것이라 파싱된 필드로 되짓지 못한다 (`§1.4`의 «같은 키·다른 본문»). */
+      readonly requestBody: string
     }
 
 /** 이 게이트가 낼 수 있는 상태코드. 전부 `0003 §1.3` 표에 있는 것뿐이다. */
@@ -459,6 +464,7 @@ export async function verifyControlRequest(
         ...(bodyCheck.supersedes === undefined ? {} : { supersedes: bodyCheck.supersedes }),
         ...(bodyCheck.replicaId === undefined ? {} : { replicaId: bodyCheck.replicaId }),
         idempotencyKey: parsedKey.key,
+        requestBody: body,
       },
     }
   }

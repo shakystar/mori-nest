@@ -26,25 +26,26 @@
  * `POST /v1/logs`(`§2.1`) · `GET /v1/logs` · `GET /v1/logs/{logId}`(`§2.4`). `§0` 표의 여덟
  * 행 중 둘(로그 발급·로그 조회)이 이것이다.
  *
- * 나머지 여섯 행은 아직 없다 — 로그 폐기(`§2.6`·`§3.5`)와 작업공간 계열 다섯(개시·하트비트·
- * 종료·폐기·조회, `§4`). 자격증명의 **발급 HTTP 라우트**도 여전히 없다(`§1.1` — "오늘은
- * 운영자가 손으로 발급하는 것으로 족하다"). 발급에 필요한 나머지 설정(서명 키의 `keyId`,
- * 토큰 수명 등)도 그것을 쓰는 라우트와 함께 온다 — 쓰는 코드가 없는 필드를 스키마에 미리
- * 만들지 않는다. 그래서 아래 {@link parseControlConfig}가 오늘 아는 필드는 여전히
- * `signingKey` 하나다: 라우트가 셋 섰어도 그 셋 중 서명하는 것은 없다.
+ * 그 위에 로그 폐기(`§2.6`·#93)와 **작업공간 개시**(`§4.2` · 조각 1/2 #102 판정 + 조각 2/2
+ * #103 배선)가 얹혔다 — `§0` 표 여덟 행 중 넷이 응답한다. 나머지 넷은 아직 없다(작업공간의
+ * 하트비트·종료·폐기·조회, `§4.3`~`§4.6`). 자격증명의 **발급 HTTP 라우트**도 여전히 없다
+ * (`§1.1` — "오늘은 운영자가 손으로 발급하는 것으로 족하다").
  *
  * `§4` 라우트의 **선행 조각**으로 작업공간 토큰 발급자(`./token.js` · #94)가 먼저 섰다 —
  * `0003 §3.2`의 와이어 형식으로 토큰 문자열을 짓는 함수 하나이고, 작업공간을 모른다.
- * 그것이 `keyId`와 두 시각을 **인자로** 받는 이유가 바로 위 관례다: 그 값을 정하는
- * 라우트(`POST /v1/workspaces`)가 아직 없으므로 설정 자리도 아직 없다. 위 문장은 그대로
- * 참이다 — 서명 **능력**이 이 평면에 들어왔지만, 오늘 서 있는 라우트 중 그것을 부르는
- * 것은 없다.
+ * 그것이 `keyId`와 두 시각을 **인자로** 받는 이유는 *"쓰는 코드가 없는 필드를 스키마에
+ * 미리 만들지 않는다"*였다. **그 조건이 이제 충족됐다**: `POST /v1/workspaces`(#103)가 그
+ * 값들을 실제로 쓰는 첫 코드이므로, 아래 {@link parseControlConfig}가 `signingKey` 곁에
+ * 발급 파라미터 넷(`keyId`·`tokenTtlSeconds`·`heartbeatIntervalSeconds`·`gracePeriodSeconds`)을
+ * 함께 안다. 넷의 **관계**를 강제하는 자리도 여기다 (`§3.4` — 아래 파서 doc).
  *
  * 같은 이유로 작업공간 생애 추적의 스토어(`./workspace-store.js` · #97 조각 1/3, #98 조각
  * 2/3, #99 조각 3/3)도 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)·단건 조회(`getWorkspace`)·
  * 세 전이(`heartbeat`·`closeWorkspace`·`revokeWorkspace`)·목록 조회(`listWorkspaces`)까지다.
- * `gracePeriod`·조회 시각·전이 시각도 이 스토어의 메서드 인자이지 `parseControlConfig`의
- * 필드가 아니다 — 그 값을 정하는 라우트가 아직 없다.
+ * `gracePeriod`·조회 시각·전이 시각은 여전히 그 스토어의 메서드 **인자**다 — 값을 정하는
+ * 것은 설정이고(`gracePeriodSeconds`), 그것을 ms로 환산해 넘기는 것은 라우트다
+ * (`./server.js`의 개시 핸들러 한 곳). 나머지 전이·목록에는 아직 그 값을 넘길 라우트가
+ * 없다 (`§4.3`~`§4.6`).
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
@@ -56,6 +57,8 @@
  */
 
 import { KeyObject } from 'node:crypto'
+
+import { KEY_ID_PATTERN } from './token.js'
 
 export {
   parseIdempotencyKey,
@@ -94,6 +97,7 @@ export {
 
 export {
   issueWorkspaceToken,
+  mintTokenId,
   WorkspaceTokenIssueError,
   type WorkspaceTokenClaims,
   type WorkspaceTokenIssueFailure,
@@ -131,13 +135,25 @@ export {
 export { createControlServer, type ControlServerOptions } from './server.js'
 
 /** 이 평면의 설정 스키마가 정의한 최상위 필드 **전부**. */
-const CONTROL_CONFIG_FIELDS = ['signingKey'] as const
+const CONTROL_CONFIG_FIELDS = [
+  'signingKey',
+  'keyId',
+  'tokenTtlSeconds',
+  'heartbeatIntervalSeconds',
+  'gracePeriodSeconds',
+] as const
 
 /**
  * `0003 §3.2`가 고정한 서명 알고리즘. 와이어 버전 리터럴 `mnw1`이 이것과 클레임
  * 레이아웃을 함께 고정하므로, 다른 곡선의 키는 이 평면이 쓸 수 없는 키다.
  */
 const SIGNING_KEY_TYPE = 'ed25519'
+
+/** `§3.4` 표: *"`tokenTtl` ≤ 15분"* (MUST). 폐기 수렴 시간의 상한이 곧 이 값이다 (`§3.5`). */
+const MAX_TOKEN_TTL_SECONDS = 900
+
+/** `§3.4` 표: *"`tokenTtl` ≥ 3 × `heartbeatIntervalSeconds`"* (MUST). */
+const MIN_HEARTBEATS_PER_TTL = 3
 
 /** 파싱을 통과한 제어 평면 설정. */
 export type ControlConfig = {
@@ -149,6 +165,26 @@ export type ControlConfig = {
    * 오가지 않고, 각 평면은 자기가 받은 절반만 안다.
    */
   readonly signingKey: KeyObject
+
+  /**
+   * 검증 키의 식별자 (`§3.2` 와이어 형식의 두 번째 세그먼트). `issueWorkspaceToken`이
+   * 인자로 받는 값이고, 전송 평면의 `verificationKeys`에 같은 이름으로 들어 있는 공개키를
+   * 가리킨다 (`§3.3`). 회전은 이 조각의 비범위다 — 여기 오는 것은 한 개다 (`§3.5`).
+   */
+  readonly keyId: string
+
+  /** 발급 토큰의 수명, 초 (`§3.4`). */
+  readonly tokenTtlSeconds: number
+
+  /** `§4.2` 응답에 그대로 실린다 — 런처는 **이 이하** 주기로 하트비트를 보낸다 (`§3.4`). */
+  readonly heartbeatIntervalSeconds: number
+
+  /**
+   * 유기(`abandoned`) 판정의 grace 창, 초 (`§4.1`). 스토어는 ms로 받으므로
+   * (`GetWorkspaceOptions.gracePeriodMs`) 환산은 **호출 지점 한 곳**에서만 한다
+   * (`./server.js`).
+   */
+  readonly gracePeriodSeconds: number
 }
 
 /**
@@ -159,12 +195,44 @@ export type ControlConfigResult =
   | { ok: false; problems: readonly string[] }
 
 /**
+ * 초 단위 필드 하나. 값을 못 읽으면 `null`을 돌려주고 이유를 `problems`에 적는다.
+ *
+ * **정수를 요구하지 않는다** — `§3.4`가 고정한 것은 네 관계이지 정수성이 아니고, 스펙에
+ * 없는 제약을 파서가 새로 만들면 그것도 배포를 막는 규칙이 된다. 여기서 보는 것은 뒤
+ * 산술(`× 1000`, `3 ×`, 비교)이 성립하는가뿐이다: 유한하고 양수인 수.
+ */
+function readSeconds(input: Record<string, unknown>, field: string, problems: string[]): number | null {
+  const value = input[field]
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    problems.push(`control config field "${field}" must be a positive finite number of seconds`)
+    return null
+  }
+  return value
+}
+
+/**
  * `unknown`을 제어 평면 설정으로 파싱한다.
  *
  * 전송 쪽과 같은 규율이다: **정의되지 않은 최상위 필드를 조용히 무시하지 않는다**
  * (`0003 §1.3`의 MUST NOT을 설정 로드에 적용). 여기서는 그 규율이 한 방향 더 있다 —
  * public key를 넘기면 거부한다. 넘어온 것이 공개키인데 통과시키면 이 평면은 자기가
  * 서명할 수 있다고 믿은 채로 뜨고, 실패는 첫 발급 시점까지 미뤄진다.
+ *
+ * ## `§3.4`의 네 제약은 **여기서** 강제한다 (요청 시점이 아니다)
+ *
+ * | 제약 | 근거 |
+ * |---|---|
+ * | `keyId`가 `§3.2`의 정규식을 만족한다 | 아니면 발급이 `invalid_key_id`로 던진다 — 첫 요청이 `500`이 된다 |
+ * | `tokenTtlSeconds ≤ 900` | 폐기 수렴 시간의 상한이 곧 `tokenTtl`이다 (`§3.5`) |
+ * | `tokenTtlSeconds ≥ 3 × heartbeatIntervalSeconds` | 하트비트 한 번 놓쳤다고 토큰이 죽으면 안 된다 |
+ * | `gracePeriodSeconds > tokenTtlSeconds` | 접근 상실이 유기 판정보다 **먼저** 와야 한다 |
+ *
+ * 이것을 요청 시점 판정으로 미루면 **제약을 어긴 배포가 첫 요청까지 살아 있고**, 그
+ * 사이에 이미 `§3.4`를 어긴 토큰이 나간다. 파싱을 통과한 {@link ControlConfig}는 네
+ * 제약을 만족한다는 것이 이 함수의 사후조건이고, 서버를 세우는 경로는 이 파서 하나다.
+ *
+ * **스코프 판정을 끄는 스위치는 이 스키마에 없다** (`§3.6` MUST NOT). 그런 필드를 여기에
+ * 더하지 마라 — 정의되지 않은 필드는 위 규율이 이미 거부한다.
  */
 export function parseControlConfig(input: unknown): ControlConfigResult {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) {
@@ -172,6 +240,7 @@ export function parseControlConfig(input: unknown): ControlConfigResult {
   }
 
   const problems: string[] = []
+  const fields = input as Record<string, unknown>
 
   const defined = new Set<string>(CONTROL_CONFIG_FIELDS)
   const unknownFields = Object.keys(input).filter((key) => !defined.has(key))
@@ -179,7 +248,7 @@ export function parseControlConfig(input: unknown): ControlConfigResult {
     problems.push(`control config has fields not defined by the schema: ${unknownFields.join(', ')}`)
   }
 
-  const signingKey = (input as Record<string, unknown>)['signingKey']
+  const signingKey = fields['signingKey']
   if (!(signingKey instanceof KeyObject)) {
     problems.push('control config field "signingKey" must be a KeyObject')
   } else if (signingKey.type !== 'private') {
@@ -190,9 +259,44 @@ export function parseControlConfig(input: unknown): ControlConfigResult {
     )
   }
 
+  // `keyId` 정규식은 발급자(`./token.js`)의 것을 그대로 쓴다 — 같은 문자열이 그 세그먼트로
+  // 나가므로, 여기에 정규식을 다시 적으면 두 벌이 갈릴 수 있는 자리가 생긴다.
+  const keyId = fields['keyId']
+  if (typeof keyId !== 'string' || !KEY_ID_PATTERN.test(keyId)) {
+    problems.push(`control config field "keyId" must match ${String(KEY_ID_PATTERN)} (0003 §3.2)`)
+  }
+
+  const tokenTtlSeconds = readSeconds(fields, 'tokenTtlSeconds', problems)
+  const heartbeatIntervalSeconds = readSeconds(fields, 'heartbeatIntervalSeconds', problems)
+  const gracePeriodSeconds = readSeconds(fields, 'gracePeriodSeconds', problems)
+
+  // 관계 셋은 세 값을 다 읽었을 때만 본다 — 못 읽은 값으로 만든 비교는 그 자체가 거짓말이다.
+  if (tokenTtlSeconds !== null && heartbeatIntervalSeconds !== null && gracePeriodSeconds !== null) {
+    if (tokenTtlSeconds > MAX_TOKEN_TTL_SECONDS) {
+      problems.push(`control config field "tokenTtlSeconds" must be <= ${String(MAX_TOKEN_TTL_SECONDS)} (0003 §3.4)`)
+    }
+    if (tokenTtlSeconds < MIN_HEARTBEATS_PER_TTL * heartbeatIntervalSeconds) {
+      problems.push(
+        `control config field "tokenTtlSeconds" must be >= ${String(MIN_HEARTBEATS_PER_TTL)} x "heartbeatIntervalSeconds" (0003 §3.4)`,
+      )
+    }
+    if (gracePeriodSeconds <= tokenTtlSeconds) {
+      problems.push('control config field "gracePeriodSeconds" must be > "tokenTtlSeconds" (0003 §3.4)')
+    }
+  }
+
   if (problems.length > 0) {
     return { ok: false, problems }
   }
 
-  return { ok: true, config: { signingKey: signingKey as KeyObject } }
+  return {
+    ok: true,
+    config: {
+      signingKey: signingKey as KeyObject,
+      keyId: keyId as string,
+      tokenTtlSeconds: tokenTtlSeconds as number,
+      heartbeatIntervalSeconds: heartbeatIntervalSeconds as number,
+      gracePeriodSeconds: gracePeriodSeconds as number,
+    },
+  }
 }
