@@ -154,6 +154,7 @@ type ErrorResponse = {
 | `400` | `client_minted_id` | 요청이 서버가 발급할 식별자를 제안했다 (§2.2) |
 | `400` | `empty_scope` | `logs`가 없거나 빈 배열 (§3.6) |
 | `400` | `invalid_log_id` | `logs`의 원소가 0002 §1.1 정규식에 맞지 않는다 |
+| `400` | `invalid_replica_id` | `replicaId`가 §4.9 정규식에 맞지 않는다 (§4.2) |
 | `400` | `invalid_state_filter` | `state` 쿼리가 §4.1의 상태 이름 중 하나가 아니다 (§4.6) |
 | `400` | `invalid_cursor` | 목록 조회의 `after`를 해석할 수 없다 (§2.4, §4.6) |
 | `400` | `missing_idempotency_key` | 멱등성이 요구되는 라우트에 `Idempotency-Key`가 없다 (§1.4) |
