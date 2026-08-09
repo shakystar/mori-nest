@@ -71,6 +71,15 @@ export {
   type LauncherCredentialVerification,
 } from './credential.js'
 
+export {
+  verifyControlRequest,
+  type ControlErrorStatus,
+  type ControlRequest,
+  type ControlRequestResult,
+  type ControlRoute,
+  type RawRequest,
+} from './request.js'
+
 /** 이 평면의 설정 스키마가 정의한 최상위 필드 **전부**. */
 const CONTROL_CONFIG_FIELDS = ['signingKey'] as const
 
