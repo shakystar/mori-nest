@@ -172,6 +172,10 @@ CREATE INDEX IF NOT EXISTS workspaces_supersedes ON workspaces (supersedes);
 -- listWorkspaces(§4.6)의 정렬·커서 축과 같은 열 순서 — 필터 → 정렬 → limit(§4.6 MUST)이 이
 -- 인덱스 하나로 서비스된다(subject로 좁히고, opened_at·workspace_id로 정렬·커서 비교).
 CREATE INDEX IF NOT EXISTS workspaces_subject_opened_at ON workspaces (subject, opened_at, workspace_id);
+
+-- findForkAdvisory(§4.10, mori-nest #117)가 하트비트마다 도는 경로다 — 없으면 주체 전량
+-- 스캔이 되어 #111(listWorkspaces N+1)과 같은 자리를 다시 만든다.
+CREATE INDEX IF NOT EXISTS workspaces_subject_replica_id ON workspaces (subject, replica_id);
 `
 
 /**
@@ -296,6 +300,23 @@ export type WorkspaceTerminalResult = {
   readonly endedAt: string
 }
 
+/** {@link findForkOverlap}·{@link WorkspaceStore.findForkAdvisory}가 돌려주는 판정 결과
+ * (`0003 §4.10`, mori-nest #117 조각 1/2). 이 값을 `HeartbeatResponse`에 싣는 배선은 조각
+ * 2/2의 몫이다 — 이 파일에서는 아무도 이 판정을 부르지 않는다(파일 상단 doc 비범위). */
+export type ForkOverlap = {
+  readonly replicaId: string
+  readonly overlappingWorkspaceId: string
+}
+
+/** {@link findForkOverlap}·{@link WorkspaceStore.findForkAdvisory}의 판정 인자. `now`가
+ * 필수인 것은 {@link GetWorkspaceOptions}·{@link WorkspaceTransitionOptions}와 다르다 —
+ * `findForkAdvisory`는 대상과 후보들을 각각 조회해 비교하므로, 그 사이에 시계가 움직이면
+ * 겹침 판정 자체가 흔들린다. 호출자가 한 시각을 못박아 두 조회에 같이 넘긴다. */
+export type FindForkAdvisoryOptions = {
+  readonly gracePeriodMs: number
+  readonly now: Date
+}
+
 /** {@link WorkspaceStore.listWorkspaces}의 요청 모양 (`§4.6`의 쿼리 셋, HTTP 유효성 검증
  * 이전의 스토어 표면 — 라우트가 `state`·`after`를 그대로 문자열로 넘기면 된다). */
 export type ListWorkspacesOptions = {
@@ -407,6 +428,20 @@ export type WorkspaceStore = {
    */
   listWorkspaces(subject: string, options: ListWorkspacesOptions): Promise<ListWorkspacesPage>
 
+  /**
+   * 포크 판정 — 같은 `replicaId`를 신고한 활성 구간이 겹치는 다른 작업공간을 찾는다
+   * (`§4.10`, advisory 조각 1/2). **읽기 전용이다 — 어떤 레코드도 쓰지 않는다** (`§7.2` MUST
+   * NOT: 잠금·CAS·조건부 쓰기가 아니다).
+   *
+   * 대상이 없거나 다른 주체의 것이면 `undefined`다 — 여기서 `workspace_not_found`를 던지지
+   * 않는다. 없음/다른 주체의 구분은 부르는 쪽(하트비트)이 이미 한다.
+   *
+   * 비교는 **같은 `subject`·같은 `replica_id`의 다른 레코드로만** 좁힌다 (`§4.10` MUST) — 다른
+   * 주체의 작업공간과 겹쳤다는 사실을 노출하면 그 자체가 열거 경로다. 판정 자체는
+   * {@link findForkOverlap}이다.
+   */
+  findForkAdvisory(subject: string, workspaceId: string, options: FindForkAdvisoryOptions): Promise<ForkOverlap | undefined>
+
   /** 연결을 닫는다. 두 번 불러도 안전하다. 작업공간을 닫는 것은 {@link
    * WorkspaceStore.closeWorkspace}다 (파일 상단 doc). */
   close(): Promise<void>
@@ -479,6 +514,81 @@ export function resolveActiveState(
     return { state: 'abandoned', endedAt: new Date(deadline).toISOString() }
   }
   return { state: 'active' }
+}
+
+/**
+ * 한 레코드의 활성 구간이 끝나는 시각 — {@link findForkOverlap}의 겹침 판정이 쓰는 유일한
+ * 계산 자리 (`§4.10`).
+ *
+ * - 종단 상태(`closed_flushed`·`closed_discarded`·`revoked`)는 저장된 `endedAt`을 그대로 쓴다.
+ * - `abandoned`(파생 포함)는 {@link resolveActiveState}가 내는 값을 쓴다 — 같은 계산식을
+ *   여기 다시 적지 않는다(이 함수가 부르는 두 자리가 갈라지면 유기 경계가 판정마다 달라진다).
+ * - `active`는 판정 시점(`options.now`)까지로 본다 — `§4.1`이 유기 판정에서 쓴 것과 같은 모양이다.
+ */
+function forkOverlapEndMs(
+  record: WorkspaceRecord,
+  options: { readonly gracePeriodMs: number; readonly now: Date },
+): number {
+  if (record.state === 'active') {
+    return options.now.getTime()
+  }
+  if (record.state === 'abandoned') {
+    const derived = resolveActiveState(record.lastHeartbeatAt, options)
+    if (derived.state !== 'abandoned') {
+      // `record.state`가 'abandoned'인데 같은 (gracePeriodMs, now)로 다시 재보면 아니라는
+      // 뜻이다 — 호출자가 self·others를 서로 다른 grace period·now로 조회해 넘긴 것이다.
+      throw new WorkspaceStoreError('unexpected_row_shape')
+    }
+    return new Date(derived.endedAt).getTime()
+  }
+  if (record.endedAt === undefined) {
+    throw new WorkspaceStoreError('unexpected_row_shape')
+  }
+  return new Date(record.endedAt).getTime()
+}
+
+/**
+ * 포크 판정 (`§4.10`) — 순수 함수. `self`와 같은 `replicaId`를 신고한 `others` 중, 활성
+ * 구간이 `self`와 겹치는 것을 찾는다.
+ *
+ * 활성 구간은 반열린 구간 `[openedAt, effectiveEnd)`다 — 겹침도 반열린 교차
+ * (`aOpenedAt < bEnd && bOpenedAt < aEnd`)라 경계가 맞닿는 것(앞의 `endedAt` == 뒤의
+ * `openedAt`)은 겹침이 아니다.
+ *
+ * 제외 규칙(`§4.10` MUST NOT 전부):
+ * - `self.replicaId`가 없으면 즉시 `undefined` — 미신고를 전량 일치로 떨어뜨리지 않는다.
+ * - `others` 중 `replicaId`가 없거나 `self.replicaId`와 다른 레코드는 비교하지 않는다.
+ * - `workspaceId`가 `self`와 같은 레코드는 제외한다.
+ *
+ * 겹치는 상대가 여럿이면 `openedAt` 오름차순, 동률이면 `workspaceId` 사전순으로 첫 번째를
+ * 고른다 — `forkAdvisory`가 단수 필드라 선택 규칙이 필요하다(owner가 정한 관례, 스펙 조항은
+ * 아니다).
+ */
+export function findForkOverlap(
+  self: WorkspaceRecord,
+  others: readonly WorkspaceRecord[],
+  options: { readonly gracePeriodMs: number; readonly now: Date },
+): ForkOverlap | undefined {
+  if (self.replicaId === undefined) {
+    return undefined
+  }
+  const replicaId = self.replicaId
+
+  const candidates = others
+    .filter((other) => other.workspaceId !== self.workspaceId && other.replicaId === replicaId)
+    .toSorted((a, b) => (a.openedAt !== b.openedAt ? (a.openedAt < b.openedAt ? -1 : 1) : a.workspaceId < b.workspaceId ? -1 : 1))
+
+  const selfStart = new Date(self.openedAt).getTime()
+  const selfEnd = forkOverlapEndMs(self, options)
+
+  for (const other of candidates) {
+    const otherStart = new Date(other.openedAt).getTime()
+    const otherEnd = forkOverlapEndMs(other, options)
+    if (selfStart < otherEnd && otherStart < selfEnd) {
+      return { replicaId, overlappingWorkspaceId: other.workspaceId }
+    }
+  }
+  return undefined
 }
 
 function rowToRecord(
@@ -591,6 +701,7 @@ class SqliteWorkspaceStore implements WorkspaceStore {
   readonly #moveHeartbeat: StatementSync
   readonly #writeTerminal: StatementSync
   readonly #selectPage: StatementSync
+  readonly #selectByReplicaId: StatementSync
   #closed = false
 
   constructor(db: DatabaseSync, randomBytes: RandomBytesFn) {
@@ -651,6 +762,14 @@ class SqliteWorkspaceStore implements WorkspaceStore {
        WHERE (opened_at, workspace_id) > (?, ?) AND (? IS NULL OR derived_state = ?)
        ORDER BY opened_at ASC, workspace_id ASC
        LIMIT ?`,
+    )
+    // findForkAdvisory(§4.10)의 비교 대상 조회 — 다른 주체의 작업공간과 겹쳤다는 사실을
+    // 노출하면 그 자체가 열거 경로이므로(§4.10 MUST) 같은 subject로 SQL에서 미리 좁힌다.
+    // replica_id 일치·자기 자신 제외는 findForkOverlap도 다시 거른다(순수 함수 단독 호출도
+    // 같은 제외 규칙을 지켜야 하므로) — 여기서 미리 좁히는 것은 방어의 이중화일 뿐이다.
+    this.#selectByReplicaId = db.prepare(
+      `SELECT workspace_id, opened_at, last_heartbeat_at, logs, supersedes, replica_id, terminal_state, ended_at
+       FROM workspaces WHERE subject = ? AND replica_id = ? AND workspace_id <> ?`,
     )
   }
 
@@ -836,6 +955,31 @@ class SqliteWorkspaceStore implements WorkspaceStore {
       ...(last === undefined ? {} : { cursor: encodeCursor(last.openedAt, last.workspaceId) }),
       hasMore,
     }
+  }
+
+  async findForkAdvisory(
+    subject: string,
+    workspaceId: string,
+    options: FindForkAdvisoryOptions,
+  ): Promise<ForkOverlap | undefined> {
+    const row = this.#selectByWorkspaceId.get(workspaceId)
+    if (row === undefined || columnAsString(row['subject']) !== subject) {
+      // `getWorkspace`·`#loadOwned`와 같은 이유(열거 오라클 방지) — 여기서
+      // `workspace_not_found`를 던지지 않는다(파일 상단 doc, `WorkspaceStore.findForkAdvisory`).
+      return undefined
+    }
+    const self = rowToRecord(workspaceId, row, { ...options, supersededBy: undefined })
+    if (self.replicaId === undefined) {
+      // SQL을 돌 것도 없다 — findForkOverlap도 같은 이유로 즉시 undefined다.
+      return undefined
+    }
+
+    const otherRows = this.#selectByReplicaId.all(subject, self.replicaId, workspaceId)
+    const others = otherRows.map((otherRow) =>
+      rowToRecord(columnAsString(otherRow['workspace_id']), otherRow, { ...options, supersededBy: undefined }),
+    )
+
+    return findForkOverlap(self, others, options)
   }
 
   /**
