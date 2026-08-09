@@ -76,8 +76,7 @@ export const ErrorCodes = {
   invalid_cursor: 'invalid_cursor',
   /** 400 — 멱등성이 요구되는 라우트에 `Idempotency-Key`가 없다 */
   missing_idempotency_key: 'missing_idempotency_key',
-  /** 400 — `replicaId`가 있는데 0003 §4.9 정규식에 맞지 않는다 (§4.2 실패표. 마스터 표
-   * `0003 §1.3`에는 이 행이 빠져 있다 — mori-nest #102 PR 본문에 이 불일치를 남긴다) */
+  /** 400 — `replicaId`가 있는데 0003 §4.9 정규식에 맞지 않는다 (0003 §1.3, §4.2) */
   invalid_replica_id: 'invalid_replica_id',
   /** 403 — 요청한 로그 중 이 주체가 grant할 수 없는 것이 있다 */
   not_grantable: 'not_grantable',
