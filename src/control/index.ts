@@ -41,9 +41,9 @@
  * 것은 없다.
  *
  * 같은 이유로 작업공간 생애 추적의 스토어(`./workspace-store.js` · #97 조각 1/3, #98 조각
- * 2/3)도 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)·단건 조회(`getWorkspace`)·세
- * 전이(`heartbeat`·`closeWorkspace`·`revokeWorkspace`)까지고, 목록 조회(조각 3/3)는 아직
- * 없다. `gracePeriod`·조회 시각·전이 시각도 이 스토어의 메서드 인자이지 `parseControlConfig`의
+ * 2/3, #99 조각 3/3)도 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)·단건 조회(`getWorkspace`)·
+ * 세 전이(`heartbeat`·`closeWorkspace`·`revokeWorkspace`)·목록 조회(`listWorkspaces`)까지다.
+ * `gracePeriod`·조회 시각·전이 시각도 이 스토어의 메서드 인자이지 `parseControlConfig`의
  * 필드가 아니다 — 그 값을 정하는 라우트가 아직 없다.
  *
  * ## 한 앱 두 포트로도, 두 앱으로도
@@ -107,6 +107,8 @@ export {
   WorkspaceStoreError,
   type CloseOutcome,
   type GetWorkspaceOptions,
+  type ListWorkspacesOptions,
+  type ListWorkspacesPage,
   type OpenWorkspaceRequest,
   type WorkspaceRecord,
   type WorkspaceState,
