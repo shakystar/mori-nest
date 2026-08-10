@@ -20,13 +20,13 @@ import { createVerificationKeySet, verifyWorkspaceToken } from '../src/transport
 import { KEY_ID, issuer } from './workspace-token.js'
 
 /**
- * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`·`§4.3`·`§4.4`·`§4.5`,
- * mori-nest #84·#93·#103·#113·#114).
+ * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`·`§4.3`·`§4.4`·`§4.5`·`§4.6`,
+ * mori-nest #84·#93·#103·#113·#114·#115).
  *
  * **동작 하나당 하나 — #84가 일곱 건, #93이 그 위에 세 건(`§2.6` revoke), #103이 다섯 건
- * (`§4.2` 개시), #113이 네 건(`§4.3` 하트비트), #114가 세 건(`§4.4`·`§4.5` 종료·폐기)을
- * 더한다** (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·
- * 커서 형식)의 케이스는 여기서 다시 세우지 않는다 — `#83`·`#93`·`#102`가
+ * (`§4.2` 개시), #113이 네 건(`§4.3` 하트비트), #114가 세 건(`§4.4`·`§4.5` 종료·폐기),
+ * #115가 네 건(`§4.6` 목록·단건 조회)을 더한다** (각 이슈 본문의 완료 조건). 게이트 판정
+ * (자격·메서드·본문 형태·커서 형식)의 케이스는 여기서 다시 세우지 않는다 — `#83`·`#93`·`#102`가
  * `test/control-request.test.ts`에 이미 세웠고, 이 파일이 보는 것은 **판정 결과가 스토어
  * 호출로 이어진 뒤의 관찰 가능한 응답**이다. 토큰 와이어 형식의 재검증도 하지 않는다
  * (`test/control-token.test.ts`가 덮는다) — 아래 ⑪이 검증자를 부르는 것은 형식을 다시
@@ -122,7 +122,7 @@ const CONFIG: ControlConfig = {
 /** `issuer`의 공개키 하나만 주입된 집합 — 전송 평면이 받는 절반(`§3.3`)이다. */
 const VERIFICATION_KEYS = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
 
-describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3·§4.4·§4.5)', () => {
+describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3·§4.4·§4.5·§4.6)', () => {
   let dir: string
   let store: ControlStore
   let idempotency: IdempotencyStore
@@ -231,8 +231,8 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     })
   }
 
-  function read(path: string, token: string): Promise<Reply> {
-    return send(path, { headers: { Authorization: `Bearer ${token}` } })
+  function read(path: string, token: string, at: string = origin): Promise<Reply> {
+    return send(path, { headers: { Authorization: `Bearer ${token}` } }, at)
   }
 
   /** `Idempotency-Key`를 보내지 않는다 — `§2.6`이 이 라우트에 그 헤더를 요구하지 않는다. */
@@ -766,4 +766,130 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     expect(revokeReply.status).toBe(404)
     expect(bodyOf(revokeReply)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
   })
+
+  it('㉓ GET /v1/workspaces → 200, openedAt 오름차순, hasMore:false, logs가 개시 시 스코프 그대로 (§4.6)', async () => {
+    const openedIds: string[] = []
+    const scopes: string[][] = []
+    for (const key of ['list-key-1', 'list-key-2', 'list-key-3']) {
+      const logs = [await mintedLogId(tokenA, `${key}-log`)]
+      const opened = bodyOf(await openWorkspace(tokenA, key, JSON.stringify({ logs }))) as OpenReply
+      openedIds.push(opened.workspaceId)
+      scopes.push(logs)
+    }
+
+    const reply = await read('/v1/workspaces', tokenA)
+
+    expect(reply.status).toBe(200)
+    const body = bodyOf(reply) as { workspaces: Record<string, unknown>[]; cursor?: string; hasMore: boolean }
+    expect(body.workspaces.map((workspace) => workspace['workspaceId'])).toEqual(openedIds)
+    expect(body.hasMore).toBe(false)
+    // `cursor`는 스토어가 발급한 불투명 값이다 — `workspaceId`가 아니다 (§4.6).
+    expect(body.cursor).toEqual(expect.any(String))
+    // §4.6이 답한 스코프는 개시 시 요청 그대로다 — 갱신으로 좁아진 현재 스코프가 아니다.
+    expect(body.workspaces.map((workspace) => workspace['logs'])).toEqual(scopes)
+    // §3.8 MUST NOT — 조회 응답에 토큰이 실리지 않는다.
+    for (const workspace of body.workspaces) {
+      expect(workspace['token']).toBeUndefined()
+    }
+  })
+
+  it('㉔ limit로 잘린 페이지의 cursor를 after에 넣으면 나머지가 나오고 hasMore가 맞다 (§4.6)', async () => {
+    const openedIds: string[] = []
+    for (const key of ['page-key-1', 'page-key-2', 'page-key-3']) {
+      const logs = [await mintedLogId(tokenA, `${key}-log`)]
+      const opened = bodyOf(await openWorkspace(tokenA, key, JSON.stringify({ logs }))) as OpenReply
+      openedIds.push(opened.workspaceId)
+    }
+
+    const firstPage = bodyOf(await read('/v1/workspaces?limit=2', tokenA)) as {
+      workspaces: { workspaceId: string }[]
+      cursor?: string
+      hasMore: boolean
+    }
+    expect(firstPage.workspaces).toHaveLength(2)
+    expect(firstPage.hasMore).toBe(true)
+    // `cursor`는 스토어가 발급한 불투명 값이다 — `workspaceId`가 아니다 (§4.6).
+    expect(firstPage.cursor).toEqual(expect.any(String))
+
+    const secondPage = bodyOf(await read(`/v1/workspaces?after=${String(firstPage.cursor)}`, tokenA)) as {
+      workspaces: { workspaceId: string }[]
+      hasMore: boolean
+    }
+    expect(secondPage.workspaces).toHaveLength(1)
+    expect(secondPage.hasMore).toBe(false)
+
+    // 필터 → 정렬 → limit이 스토어에서 이미 끝났다는 것 — 두 페이지를 이으면 개시 순서 그대로다.
+    const seen = [...firstPage.workspaces, ...secondPage.workspaces].map((workspace) => workspace.workspaceId)
+    expect(seen).toEqual(openedIds)
+  })
+
+  it('㉕ state=<다섯 밖>이면 400 invalid_state_filter, 깨진 after면 400 invalid_cursor (§4.6)', async () => {
+    const invalidState = await read('/v1/workspaces?state=bogus', tokenA)
+    expect(invalidState.status).toBe(400)
+    expect(bodyOf(invalidState)).toEqual({ error: { code: 'invalid_state_filter', message: expect.any(String) } })
+
+    const invalidCursor = await read('/v1/workspaces?after=not-a-cursor', tokenA)
+    expect(invalidCursor.status).toBe(400)
+    expect(bodyOf(invalidCursor)).toEqual({ error: { code: 'invalid_cursor', message: expect.any(String) } })
+
+    // 반복 쿼리도 "해석 불가"로 같은 code에 합류한다 (state·after) — limit만 malformed_request.
+    const repeatedState = await read('/v1/workspaces?state=open&state=closed', tokenA)
+    expect(repeatedState.status).toBe(400)
+    expect(bodyOf(repeatedState)).toEqual({ error: { code: 'invalid_state_filter', message: expect.any(String) } })
+
+    const repeatedAfter = await read('/v1/workspaces?after=a&after=b', tokenA)
+    expect(repeatedAfter.status).toBe(400)
+    expect(bodyOf(repeatedAfter)).toEqual({ error: { code: 'invalid_cursor', message: expect.any(String) } })
+
+    const repeatedLimit = await read('/v1/workspaces?limit=1&limit=2', tokenA)
+    expect(repeatedLimit.status).toBe(400)
+    expect(bodyOf(repeatedLimit)).toEqual({ error: { code: 'malformed_request', message: expect.any(String) } })
+  })
+
+  it(
+    '㉖ 단건 조회 — 자기 것은 200, 남의 것은 404, gracePeriod 경과분은 abandoned고 endedAt이 두 조회에서 같다 (§4.6)',
+    async () => {
+      const logs = [await mintedLogId(tokenA, 'get-log-1')]
+      const opened = bodyOf(await openWorkspace(tokenA, 'get-key-1', JSON.stringify({ logs }))) as OpenReply
+
+      const own = await read(`/v1/workspaces/${opened.workspaceId}`, tokenA)
+      expect(own.status).toBe(200)
+      const ownBody = bodyOf(own) as Record<string, unknown>
+      expect(ownBody['workspaceId']).toBe(opened.workspaceId)
+      expect(ownBody['state']).toBe('active')
+      expect(ownBody['logs']).toEqual(logs)
+      expect(ownBody['token']).toBeUndefined()
+
+      // 남의 작업공간과 없는 작업공간의 404가 바이트 단위로 같다 (열거 오라클 방지).
+      const othersLogs = [await mintedLogId(tokenB, 'get-others-log')]
+      const others = bodyOf(
+        await openWorkspace(tokenB, 'get-key-others', JSON.stringify({ logs: othersLogs })),
+      ) as OpenReply
+      const hidden = await read(`/v1/workspaces/${others.workspaceId}`, tokenA)
+      const missing = await read('/v1/workspaces/does-not-exist', tokenA)
+      expect(hidden.status).toBe(404)
+      expect(missing.status).toBe(404)
+      expect(hidden.text).toBe(missing.text)
+      expect(bodyOf(hidden)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
+
+      // gracePeriod 경과로 abandoned — endedAt이 lastHeartbeatAt + gracePeriod이고, 조회 시각이
+      // 아니므로 같은 기록을 두 번 조회해도 같은 값이 나온다 (§4.6 MUST).
+      const impatient = await startServer({ heartbeatIntervalSeconds: 1, tokenTtlSeconds: 3, gracePeriodSeconds: 4 })
+      const abandonLogs = [await mintedLogId(tokenA, 'get-abandon-log')]
+      const abandonOpened = bodyOf(
+        await openWorkspace(tokenA, 'get-abandon-key', JSON.stringify({ logs: abandonLogs }), impatient),
+      ) as OpenReply
+
+      await delay(4200)
+      const firstAbandoned = await read(`/v1/workspaces/${abandonOpened.workspaceId}`, tokenA, impatient)
+      expect(firstAbandoned.status).toBe(200)
+      const firstBody = bodyOf(firstAbandoned) as { state: string; endedAt: string }
+      expect(firstBody.state).toBe('abandoned')
+
+      const secondAbandoned = await read(`/v1/workspaces/${abandonOpened.workspaceId}`, tokenA, impatient)
+      expect(secondAbandoned.status).toBe(200)
+      expect(bodyOf(secondAbandoned)).toEqual(firstBody)
+    },
+    20_000,
+  )
 })

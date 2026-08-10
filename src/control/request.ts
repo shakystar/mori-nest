@@ -1,7 +1,7 @@
 /**
- * 제어 평면의 요청 판정 — 런처 자격 게이트 + 로그 라우트 4종 + 작업공간 개시 판별
- * (`0003 §1.1`·`§1.2`·`§1.3`·`§1.4`·`§2.1`·`§2.2`·`§2.4`·`§2.6`·`§4.2`·`§4.9`, mori-nest #68
- * 라우트 조각 1/2 · #83 · #93 · #102).
+ * 제어 평면의 요청 판정 — 런처 자격 게이트 + 로그 라우트 4종 + 작업공간 라우트 6종 판별
+ * (`0003 §1.1`·`§1.2`·`§1.3`·`§1.4`·`§2.1`·`§2.2`·`§2.4`·`§2.6`·`§4.2`~`§4.6`·`§4.9`, mori-nest
+ * #68 라우트 조각 1/2 · #83 · #93 · #102 · #112 · #115).
  *
  * `src/transport/request.ts`와 같은 모양이다: **판정 함수 하나.** HTTP 응답을 쓰지 않고,
  * 판정 결과(해석된 요청, 또는 `§1.3`의 에러 봉투 + 상태코드)를 **반환**할 뿐이다. 다른 점
@@ -9,18 +9,18 @@
  * 평면에는 [내구성 단일 장애점] 제약이 없다"), 이 함수는 async이고 {@link LauncherCredentialStore}를
  * 주입받는다.
  *
- * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 경로 중 일곱이다 — `POST /v1/logs`(`§2.1`),
+ * 이 파일이 판별하는 라우트는 `§0` 표의 여덟 경로 **전부**다 — `POST /v1/logs`(`§2.1`),
  * `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`), `POST /v1/logs/{logId}/revoke`(`§2.6`),
- * `POST /v1/workspaces`(`§4.2`, 컬렉션 경로만 — 하위 경로는 비범위, mori-nest #102 이슈 본문),
- * `POST /v1/workspaces/{workspaceId}/heartbeat`·`/close`·`/revoke`(`§4.3`~`§4.5`, mori-nest
- * #112). 나머지 하나(작업공간 목록 조회, `§4.6`)만 이 조각의 비범위다.
+ * `POST /v1/workspaces`(`§4.2`), `POST /v1/workspaces/{workspaceId}/heartbeat`·`/close`·
+ * `/revoke`(`§4.3`~`§4.5`, mori-nest #112), `GET /v1/workspaces`·
+ * `GET /v1/workspaces/{workspaceId}`(`§4.6`, mori-nest #115).
  *
  * 이 파일에는 HTTP 서버도 스토어 호출(`isGranted`·`createLog`·`revoke`·`openWorkspace`·
- * `issueWorkspaceToken`·`heartbeat`·`closeWorkspace`·`revokeWorkspace`)도 없다 — 그것은 라우트
- * 배선(`./server.js`, mori-nest #83 이슈 본문 "후속")의 몫이다. `src/transport/`를 import하지
- * 않는 것도 같은 경계 규율이다 (`src/control/index.ts` 상단 doc) — 아래 헬퍼들이
- * `src/transport/request.ts`의 것과 모양이 겹치는 것은 우연이 아니라 같은 문제를 각 평면이
- * 독립적으로 풀기 때문이다.
+ * `issueWorkspaceToken`·`heartbeat`·`closeWorkspace`·`revokeWorkspace`·`listWorkspaces`·
+ * `getWorkspace`)도 없다 — 그것은 라우트 배선(`./server.js`, mori-nest #83 이슈 본문 "후속")의
+ * 몫이다. `src/transport/`를 import하지 않는 것도 같은 경계 규율이다 (`src/control/index.ts`
+ * 상단 doc) — 아래 헬퍼들이 `src/transport/request.ts`의 것과 모양이 겹치는 것은 우연이 아니라
+ * 같은 문제를 각 평면이 독립적으로 풀기 때문이다.
  */
 
 import { parseBody } from '../body.js'
@@ -57,9 +57,9 @@ const REVOKE_SUFFIX = 'revoke'
 /** `§2.6`의 `RevokeLogRequest` 본문에서 게이트가 아는 최상위 필드. */
 const REVOKE_BODY_FIELDS = ['reason']
 
-/** `/v1/workspaces` 경로의 세그먼트(`§4.2`). 컬렉션 경로와 하위 경로(하트비트·종료·폐기,
- * `§4.3`~`§4.5`, mori-nest #112) 판별 둘 다 이 접두사를 쓴다 — 목록 조회(`§4.6`)만 이 조각의
- * 비범위다(mori-nest #102 이슈 본문). */
+/** `/v1/workspaces` 경로의 세그먼트(`§4.2`). 컬렉션 경로(개시·목록 조회, `§4.2`·`§4.6`)·단건
+ * 경로(조회, `§4.6`)·하위 경로(하트비트·종료·폐기, `§4.3`~`§4.5`, mori-nest #112) 판별 셋 다
+ * 이 접두사를 쓴다. */
 const WORKSPACE_PATH_PREFIX = ['', 'v1', 'workspaces'] as const
 
 /** `§4.2`의 `OpenWorkspaceRequest` 본문에서 게이트가 아는 최상위 필드. */
@@ -85,6 +85,11 @@ const CLOSE_OUTCOMES = new Set(['flushed', 'discarded'])
 /** `§4.5`의 `RevokeWorkspaceRequest` 본문에서 게이트가 아는 최상위 필드. */
 const REVOKE_WORKSPACE_BODY_FIELDS = ['reason']
 
+/** `GET /v1/workspaces`(`§4.6`)의 쿼리 파라미터 이름 전부. `§1.3`의 "정의되지 않은 최상위
+ * 필드" 규율을 쿼리에 적용한다(이슈 mori-nest #115 본문) — 이 셋 밖의 이름이 있으면
+ * `400 malformed_request`다. */
+const LIST_WORKSPACES_QUERY_FIELDS = new Set(['state', 'after', 'limit'])
+
 /** Node 표준 HTTP 서버가 넘겨주는 요청 객체와 모양만 맞는 요청 입력. `src/transport/request.ts`의
  * `RawRequest`와 같은 모양이지만 독립적으로 정의한다 — import하면 그 자체로 평면 경계가 깨진다. */
 export type RawRequest = {
@@ -105,6 +110,8 @@ export type ControlRoute =
   | 'heartbeatWorkspace'
   | 'closeWorkspace'
   | 'revokeWorkspace'
+  | 'listWorkspaces'
+  | 'getWorkspace'
 
 /**
  * 게이트를 통과한 요청. `subject`는 항상 런처 자격증명 조회로만 해석된다(`§1.2` MUST NOT —
@@ -164,6 +171,18 @@ export type ControlRequest =
     }
   | {
       readonly route: 'revokeWorkspace'
+      readonly subject: string
+      readonly workspaceId: string
+    }
+  | {
+      readonly route: 'listWorkspaces'
+      readonly subject: string
+      readonly state?: string
+      readonly after?: string
+      readonly limit?: number
+    }
+  | {
+      readonly route: 'getWorkspace'
       readonly subject: string
       readonly workspaceId: string
     }
@@ -283,6 +302,67 @@ function listLogsRequest(subject: string, after: string | undefined, limit: numb
     route: 'listLogs',
     subject,
     ...(after === undefined ? {} : { after }),
+    ...(limit === undefined ? {} : { limit }),
+  }
+}
+
+/**
+ * `GET /v1/workspaces`의 쿼리 (`§4.6`) — `listLogs`의 `after`·`limit`과 다른 점 셋(이슈
+ * mori-nest #115 본문):
+ *
+ * 1. **정의되지 않은 파라미터가 있으면 `400 malformed_request`다** ({@link LIST_WORKSPACES_QUERY_FIELDS}
+ *    — `§1.3`의 최상위 필드 규율을 쿼리에 적용한다).
+ * 2. **`limit`이 십진 정수 문자열이 아니면 거부한다** (`400 malformed_request`) — {@link parseLimit}
+ *    처럼 조용히 접지 않는다. 이 조각의 판단이다.
+ * 3. **`state`·`after`는 값을 판정하지 않는다** — 형식이 무엇이든 문자열로 그대로 싣는다.
+ *    유효성은 스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다(`./workspace-store.js`)
+ *    — 판정을 두 곳에 두면 갈린다.
+ *
+ * 반복 쿼리(같은 이름이 둘 이상)는 값을 하나로 정할 수 없다는 점이 {@link atMostOne}의
+ * 판정과 같지만, code는 파라미터별로 갈린다: `state`는 `400 invalid_state_filter`, `after`는
+ * `400 invalid_cursor` — 둘 다 `§1.3` 표에 이미 있는 code라 그 표를 따른다. `limit`만
+ * `400 malformed_request`다 — `§1.3`에 `limit` 전용 code가 없다.
+ */
+function checkListWorkspacesQuery(
+  query: string,
+):
+  | { readonly ok: true; readonly state?: string; readonly after?: string; readonly limit?: number }
+  | { readonly ok: false; readonly error: ErrorResponse } {
+  const unknownFields = [...new Set(new URLSearchParams(query).keys())].filter(
+    (key) => !LIST_WORKSPACES_QUERY_FIELDS.has(key),
+  )
+  if (unknownFields.length > 0) {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'unrecognized query parameter') }
+  }
+
+  const state = queryValue(query, 'state')
+  if (!state.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.invalid_state_filter, 'state query parameter repeated') }
+  }
+  const after = queryValue(query, 'after')
+  if (!after.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.invalid_cursor, 'after query parameter repeated') }
+  }
+  const limitRaw = queryValue(query, 'limit')
+  if (!limitRaw.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'limit query parameter repeated') }
+  }
+
+  let limit: number | undefined
+  if (limitRaw.value !== null) {
+    if (!LIMIT_PATTERN.test(limitRaw.value)) {
+      return {
+        ok: false,
+        error: errorResponse(ErrorCodes.malformed_request, 'limit must be a positive decimal integer'),
+      }
+    }
+    limit = Number(limitRaw.value)
+  }
+
+  return {
+    ok: true,
+    ...(state.value === null ? {} : { state: state.value }),
+    ...(after.value === null ? {} : { after: after.value }),
     ...(limit === undefined ? {} : { limit }),
   }
 }
@@ -470,8 +550,8 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  * 알려주는 것이 스펙을 읽은 사람이 이미 아는 것뿐이게 한다)을 따른다:
  *
  * 1. **라우트 해석** — 경로가 `/v1/logs`·`/v1/logs/{logId}`·`/v1/logs/{logId}/revoke`·
- *    `/v1/workspaces`·`/v1/workspaces/{workspaceId}/heartbeat`·`.../close`·`.../revoke`
- *    중 하나인가. 아니면 `400 malformed_request`.
+ *    `/v1/workspaces`·`/v1/workspaces/{workspaceId}`·`/v1/workspaces/{workspaceId}/heartbeat`·
+ *    `.../close`·`.../revoke` 중 하나인가. 아니면 `400 malformed_request`.
  * 2. **메서드** — `checkMethod`. 아니면 `405` + `Allow`.
  * 3. **라우트별 문법**:
  *    - `listLogs`: `after` 형식(`§2.4`) — 해석 불가면 `400 invalid_cursor`. `limit`은
@@ -492,8 +572,17 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *      밖이면 `400 malformed_request`). `Idempotency-Key`를 요구하지 않는다.
  *    - `revokeWorkspace`: 본문 형태(`§4.5` — `reason`이 있는데 문자열이 아니면
  *      `400 malformed_request`, `revokeLog`와 같은 문법). `Idempotency-Key`를 요구하지 않는다.
- *    - **셋 다 `workspaceId` 형식을 검사하지 않는다** — 없는 id·다른 주체의 id는 스토어가
- *      `404 workspace_not_found`로 답한다(`§4.6` MUST — 열거 오라클 방지, 이슈 #112 본문).
+ *    - `listWorkspaces`: 쿼리 문법(`§4.6`, {@link checkListWorkspacesQuery} doc) —
+ *      정의되지 않은 파라미터는 `400 malformed_request`. 반복 파라미터는 이름별로 code가
+ *      갈린다: `state` 반복은 `400 invalid_state_filter`, `after` 반복은 `400 invalid_cursor`,
+ *      `limit` 반복(또는 십진 정수가 아닌 `limit`)은 `400 malformed_request`(`listLogs`의
+ *      `limit`과 달리 조용히 접지 않는다, 이 조각의 판단). `state`·`after`의 **값**은 판정하지
+ *      않는다 — 유효성은 스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다.
+ *    - `getWorkspace`: 없음 — 경로의 `workspaceId`를 그대로 싣는다. 존재 판정은 이 게이트의
+ *      일이 아니다(다음 조각).
+ *    - **`heartbeatWorkspace`·`closeWorkspace`·`revokeWorkspace`·`getWorkspace` 넷 다
+ *      `workspaceId` 형식을 검사하지 않는다** — 없는 id·다른 주체의 id는 스토어가
+ *      `404 workspace_not_found`로 답한다(`§4.6` MUST — 열거 오라클 방지, 이슈 #112·#115 본문).
  * 4. **자격** — `Authorization: Bearer <런처 자격증명>` → `credentials.verify`. 아니면 `401`.
  *    작업공간 토큰이 이 자리에서 걸린다: 그 값은 이 스토어에 조회되는 해시와 절대
  *    일치하지 않으므로 `verify`가 그대로 `401`을 낸다(`§1.1`) — 이 파일에 작업공간 토큰을
@@ -503,10 +592,11 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *
  * - **스토어를 보지 않는다** (자격증명 조회는 예외 — `§1.1`이 그 형태를 요구한다).
  *   `isGranted`·`createLog`·`listLogsForSubject`·`revoke`·`heartbeat`·`closeWorkspace`·
- *   `revokeWorkspace`는 라우트 배선의 것이다.
+ *   `revokeWorkspace`·`listWorkspaces`·`getWorkspace`는 라우트 배선의 것이다.
  * - **`limit` 상한을 적용하지 않는다.** 형식이 유효한 값을 그대로 싣는다 — 서버 상한이
  *   생기면 그 판정도 다음 조각의 것이다(이 조각의 비범위, `§3.1`급 `maxLimit` 개념이
- *   `0003`에는 아직 없다).
+ *   `0003`에는 아직 없다). `listWorkspaces`도 같다 — `limit` 값의 **형식**은 거부하지만
+ *   **크기**의 천장은 라우트 배선(`./server.js`)이 정한다.
  * - **본문의 필드 타입을 검증하지 않는다** — `CreateLogRequest`·`HeartbeatWorkspaceRequest`는
  *   필드가 없으므로 볼 타입이 없다.
  *
@@ -523,9 +613,9 @@ export async function verifyControlRequest(
   const { path, query } = splitTarget(request.url)
 
   // ── 1: 라우트 해석. `/v1/logs`(셋) · `/v1/logs/{logId}`(넷) · `/v1/logs/{logId}/revoke`(다섯) ·
-  // `/v1/workspaces`(셋, 컬렉션 경로) · `/v1/workspaces/{workspaceId}/heartbeat`·`/close`·
-  // `/revoke`(다섯, mori-nest #112)뿐이다. 그 밖의 세그먼트 수·이름은 아래 어느 것과도 매치되지
-  // 않고 `malformed_request`로 떨어진다.
+  // `/v1/workspaces`(셋, 컬렉션 경로) · `/v1/workspaces/{workspaceId}`(넷, mori-nest #115) ·
+  // `/v1/workspaces/{workspaceId}/heartbeat`·`/close`·`/revoke`(다섯, mori-nest #112)뿐이다.
+  // 그 밖의 세그먼트 수·이름은 아래 어느 것과도 매치되지 않고 `malformed_request`로 떨어진다.
   const segments = path.split('/')
   const prefixMatches = PATH_PREFIX.every((expected, index) => segments[index] === expected)
   const isCollection = prefixMatches && segments.length === PATH_PREFIX.length
@@ -537,7 +627,12 @@ export async function verifyControlRequest(
       : ''
   const isRevoke = revokeLogIdSegment !== ''
   const workspacePrefixMatches = WORKSPACE_PATH_PREFIX.every((expected, index) => segments[index] === expected)
-  const isOpenWorkspace = workspacePrefixMatches && segments.length === WORKSPACE_PATH_PREFIX.length
+  const isWorkspaceCollection = workspacePrefixMatches && segments.length === WORKSPACE_PATH_PREFIX.length
+  const singleWorkspaceIdSegment =
+    workspacePrefixMatches && segments.length === WORKSPACE_PATH_PREFIX.length + 1
+      ? (segments[WORKSPACE_PATH_PREFIX.length] ?? '')
+      : ''
+  const isGetWorkspace = singleWorkspaceIdSegment !== ''
   const isWorkspaceSubRoute = workspacePrefixMatches && segments.length === WORKSPACE_PATH_PREFIX.length + 2
   const workspaceIdSegment = isWorkspaceSubRoute ? (segments[WORKSPACE_PATH_PREFIX.length] ?? '') : ''
   const workspaceAction = isWorkspaceSubRoute ? (segments[WORKSPACE_PATH_PREFIX.length + 1] ?? '') : ''
@@ -549,7 +644,8 @@ export async function verifyControlRequest(
     !isCollection &&
     !hasLogId &&
     !isRevoke &&
-    !isOpenWorkspace &&
+    !isWorkspaceCollection &&
+    !isGetWorkspace &&
     !isHeartbeatWorkspace &&
     !isCloseWorkspace &&
     !isRevokeWorkspace
@@ -557,15 +653,14 @@ export async function verifyControlRequest(
     return reject(400, errorResponse(ErrorCodes.malformed_request, 'request target is not a control route'))
   }
 
-  // ── 2: 메서드.
+  // ── 2: 메서드. 컬렉션 경로 둘(`/v1/logs`·`/v1/workspaces`)은 `POST`(생성·개시)와
+  // `GET`(목록 조회) 모두를 허용한다 — 갈리는 것은 아래 ── 3의 메서드 분기다.
   const allowedMethods =
     isRevoke || isHeartbeatWorkspace || isCloseWorkspace || isRevokeWorkspace
       ? ['POST']
-      : hasLogId
+      : hasLogId || isGetWorkspace
         ? ['GET']
-        : isOpenWorkspace
-          ? ['POST']
-          : ['POST', 'GET']
+        : ['POST', 'GET']
   const allowHeader: Readonly<Record<string, string>> = { Allow: allowedMethods.join(', ') }
   const methodCheck = checkMethod(request.method, allowedMethods)
   if (!methodCheck.ok) {
@@ -626,7 +721,43 @@ export async function verifyControlRequest(
     }
   }
 
-  if (isOpenWorkspace) {
+  if (isGetWorkspace) {
+    // `getWorkspace`에는 이 게이트가 판정할 문법이 없다 — 경로의 `workspaceId`를 그대로
+    // 싣는다. 존재 판정(없는 작업공간과 다른 주체의 작업공간을 구분하지 않는다, `§4.6` MUST —
+    // 열거 오라클 방지)은 이 게이트의 일이 아니다(다음 조각).
+    const authResult = await authenticate(request, credentials)
+    if (!authResult.ok) {
+      return authResult
+    }
+    return {
+      ok: true,
+      request: { route: 'getWorkspace', subject: authResult.subject, workspaceId: singleWorkspaceIdSegment },
+    }
+  }
+
+  if (isWorkspaceCollection && request.method === 'GET') {
+    const queryCheck = checkListWorkspacesQuery(query)
+    if (!queryCheck.ok) {
+      return reject(400, queryCheck.error)
+    }
+
+    const authResult = await authenticate(request, credentials)
+    if (!authResult.ok) {
+      return authResult
+    }
+    return {
+      ok: true,
+      request: {
+        route: 'listWorkspaces',
+        subject: authResult.subject,
+        ...(queryCheck.state === undefined ? {} : { state: queryCheck.state }),
+        ...(queryCheck.after === undefined ? {} : { after: queryCheck.after }),
+        ...(queryCheck.limit === undefined ? {} : { limit: queryCheck.limit }),
+      },
+    }
+  }
+
+  if (isWorkspaceCollection) {
     const bodyCheck = checkOpenWorkspaceBody(body)
     if (!bodyCheck.ok) {
       return reject(400, bodyCheck.error)
