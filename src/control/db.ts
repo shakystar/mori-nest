@@ -12,7 +12,7 @@
  * `journal_mode = WAL`을 걸고, SQLite는 WAL에서 다중 DB 원자 커밋을 보장하지 않는다.
  *
  * 규율이 없어서 생긴 문제가 아니다. **같은 DB 안에서는 이미 제대로 하고 있다** —
- * `src/control/store.ts`의 `createLog`는 `logs`와 `log_subjects`를 한 트랜잭션으로 묶는다
+ * `src/control/store.ts`의 `insertMintedLog`는 `logs`와 `log_subjects`를 한 트랜잭션으로 묶는다
  * (이관 전에는 자기 `BEGIN IMMEDIATE`로, 지금은 아래 {@link ControlDatabase.withTransaction}으로).
  * 무너지는 자리는 **파일 경계뿐**이다. 그래서 이 모듈이 하는 일은 새 규율을 들이는
  * 것이 아니라 **경계를 없애는 것**이다: 제어 평면 DB는 하나이고, 그 연결을 만드는 자리는
