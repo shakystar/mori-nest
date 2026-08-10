@@ -52,11 +52,11 @@ const { createControlServer } = await import('../src/control/server.ts')
 const { openControlStore } = await import('../src/control/store.ts')
 const { openWorkspaceStore } = await import('../src/control/workspace-store.ts')
 
-// 멱등 계층과 자격증명은 제어 평면 DB 하나를 공유한다 (mori-nest #130). 로그·작업공간
-// 스토어는 조각 2/4·3/4가 이관할 때까지 자기 파일로 남는다 — 그래서 이 자식이 여는 파일이
-// 아직 셋이다. 부모(`test/control-server.test.ts`)와 같은 이름을 써야 같은 DB를 본다.
+// 멱등 계층·자격증명·로그는 제어 평면 DB 하나를 공유한다 (mori-nest #130 · #131). 작업공간
+// 스토어는 조각 3/4가 이관할 때까지 자기 파일로 남는다 — 그래서 이 자식이 여는 파일이 아직
+// 둘이다. 부모(`test/control-server.test.ts`)와 같은 이름을 써야 같은 DB를 본다.
 const database = await openControlDatabase(`${dir}/control-plane.db`)
-const store = await openControlStore(`${dir}/control.db`)
+const store = await openControlStore(database)
 const idempotency = await openIdempotencyStore(database)
 const credentials = await openLauncherCredentialStore(database)
 const workspaces = await openWorkspaceStore(`${dir}/workspace.db`)
@@ -113,6 +113,6 @@ writeSync(1, `${JSON.stringify(replies)}\n`)
 
 server.closeAllConnections()
 server.close()
+// `store`는 `database`의 연결 위에 선 리포지토리라 닫을 것이 없다 (mori-nest #131).
 await database.close()
-await store.close()
 await workspaces.close()

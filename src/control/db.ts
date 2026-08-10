@@ -12,8 +12,9 @@
  * `journal_mode = WAL`을 걸고, SQLite는 WAL에서 다중 DB 원자 커밋을 보장하지 않는다.
  *
  * 규율이 없어서 생긴 문제가 아니다. **같은 DB 안에서는 이미 제대로 하고 있다** —
- * `src/control/store.ts`의 `createLog`는 `logs`와 `log_subjects`를 `BEGIN IMMEDIATE` 하나로
- * 묶는다. 무너지는 자리는 **파일 경계뿐**이다. 그래서 이 모듈이 하는 일은 새 규율을 들이는
+ * `src/control/store.ts`의 `createLog`는 `logs`와 `log_subjects`를 한 트랜잭션으로 묶는다
+ * (이관 전에는 자기 `BEGIN IMMEDIATE`로, 지금은 아래 {@link ControlDatabase.withTransaction}으로).
+ * 무너지는 자리는 **파일 경계뿐**이다. 그래서 이 모듈이 하는 일은 새 규율을 들이는
  * 것이 아니라 **경계를 없애는 것**이다: 제어 평면 DB는 하나이고, 그 연결을 만드는 자리는
  * {@link openControlDatabase} 하나다.
  *
@@ -31,8 +32,9 @@
  * **별도 배선 없이 같은 트랜잭션에 든다.** 파일 경계를 넘던 원자성은 그렇게 성립한다
  * (`test/control-db.test.ts`의 크로스-리포지토리 롤백 시험이 이 성질 하나를 잰다).
  *
- * `src/control/store.ts` · `src/control/workspace-store.ts`는 **조각 2/4 · 3/4**에서 이관한다.
- * 그동안 그 둘은 지금처럼 자기 경로로 연다 — 의도된 과도기다.
+ * `src/control/store.ts`는 **조각 2/4**(mori-nest #131)에서 이 연결로 왔다.
+ * `src/control/workspace-store.ts`는 **조각 3/4**에서 이관한다 — 그동안 그 하나는 지금처럼
+ * 자기 경로로 연다(의도된 과도기다).
  *
  * ## 중첩 트랜잭션: **금지한다** (사람 결정 3절 «설계 시 반드시 답할 것»)
  *
