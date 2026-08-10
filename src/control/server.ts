@@ -54,18 +54,25 @@
  *
  * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 · #113 · #114 · #115 이슈 본문)
  *
- * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 폐기 사유(`reason`)의 저장, `§4.10` 포크
- * 감지·재발급 지시 (하트비트 **응답**에 실리는 것이 맞지만 판정 규칙이 따로 있는 별도 작업이다
- * — 이 파일은 그 필드를 만들지 않는다).
+ * 유량 제한(`429`)·본문 크기 한도(`413`)·SSE, 폐기 사유(`reason`)의 저장.
  * 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
  * 뜻이다** — 전송 평면의 `maxRequestBytes`(`0002 §1.3` L103)에 해당하는 자리가 이 평면에는
  * 아직 배선되지 않았다(`0003 §1.3` 표에 `413 request_too_large`가 있으므로 자리는 열려 있고,
  * 값을 정하는 것은 이 조각이 아니다). 그 라우트를 여는 다음 조각이 이 함수에 상한을 준다.
  *
- * 진단 훅(`src/transport/server.ts`의 `onDiagnostic`)도 비범위라, 아래 `catch`들이 삼킨
- * 예외는 상태코드 말고는 아무 흔적을 남기지 않는다 — 전송 평면이 #38·#51에서 닫은 자리가
+ * `§4.10` 포크 감지·재발급 지시(하트비트 **응답**의 `forkAdvisory`)는 mori-nest #117(판정,
+ * 스토어 단위)이 이미 세웠고, {@link handleHeartbeatWorkspace}가 `heartbeat` 성공 뒤에
+ * `WorkspaceStore.findForkAdvisory`를 불러 배선한다(mori-nest #118).
+ *
+ * 진단 훅(`src/transport/server.ts`의 `onDiagnostic`)은 여전히 비범위라, 아래 `catch`들이
+ * 삼킨 예외는 상태코드 말고는 아무 흔적을 남기지 않는다 — 전송 평면이 #38·#51에서 닫은 자리가
  * 이 평면에는 아직 열려 있다. 예외 `message`를 봉투에 싣지 않는 규율(`§1.3`)은 그것과
- * 무관하게 지킨다: 아래에서 쓰는 메시지는 전부 고정 문자열이다.
+ * 무관하게 지킨다: 아래에서 쓰는 메시지는 전부 고정 문자열이다. **딱 하나 예외**가
+ * {@link handleHeartbeatWorkspace}의 `forkAdvisory` 판정 실패다 — 그 실패는 상태코드에조차
+ * 흔적을 남기지 않으므로(`200`을 그대로 쓴다, `§4.10` MUST NOT) 훅 없이도 `console.error` 한
+ * 줄로 운영자에게 흔적을 남긴다(이슈 #118 완료 조건). 이 자리가 이 파일에서 유일하게
+ * `console.*`을 부르는 이유이자, 진단 훅이 이 평면에 아직 없다는 위 사실이 바뀌기 전까지
+ * 유지되는 임시 자리다.
  *
  * ## Node 타입이 이 디렉터리에 들어오지 않는다
  *
@@ -91,7 +98,7 @@ import type { ControlConfig } from './index.js'
 import { verifyControlRequest, type ControlRequest, type RawRequest } from './request.js'
 import { ControlStoreError, DEFAULT_PAGE_LIMIT, type ControlStore } from './store.js'
 import { issueWorkspaceToken, mintTokenId } from './token.js'
-import { WorkspaceStoreError, type WorkspaceStore } from './workspace-store.js'
+import { WorkspaceStoreError, type ForkOverlap, type WorkspaceStore } from './workspace-store.js'
 
 /**
  * `GET /v1/logs`의 `limit` 천장 ({@link handleListLogs} doc). 스토어가 `limit` 없이 쓰는
@@ -768,7 +775,16 @@ async function handleOpenWorkspace(
 
 /**
  * `POST /v1/workspaces/{workspaceId}/heartbeat` (`§4.3`) — 조회 → 스코프 재판정 → 전이 →
- * 토큰 갱신 → `200`.
+ * 토큰 갱신 → 포크 advisory(`§4.10`) → `200`.
+ *
+ * ## 포크 advisory는 전이 뒤, 응답 쓰기 직전이다 (`§4.10`, mori-nest #118)
+ *
+ * `heartbeat`가 성공한 **뒤에만** `WorkspaceStore.findForkAdvisory`를 부른다 — 그 전에 부르면
+ * 유기를 확정하는 호출(`workspace_not_active`로 이미 끝난)에도 판정을 시도하게 된다. 결과가
+ * 있으면 응답에 `forkAdvisory`를 얹지만 **그 존재가 상태코드도, 다른 필드도 바꾸지 않는다**
+ * (MUST) — advisory가 요청의 성패를 바꾸면 그 순간 advisory가 아니라 강제다. 같은 이유로
+ * 판정이 던져도 `catch`가 `200`을 그대로 쓴다 (MUST NOT, 아래 `catch` 참고). 자세한 이유·버린
+ * 후보는 `0003-control-plane-spec.md` §4.10 "재발급 지시가 실리는 자리"가 표로 적어 뒀다.
  *
  * ## 재판정은 좁힌다 — 개시의 all-or-nothing이 여기 오지 않는다 (`§3.4` MUST)
  *
@@ -875,6 +891,21 @@ async function handleHeartbeatWorkspace(
     return
   }
 
+  // 포크 advisory (`§4.10`, mori-nest #117·#118) — `heartbeat` 성공 **뒤**에만 부른다: 그 전엔
+  // 유기가 확정되는 호출(§4.1)일 수 있고 그러면 `workspace_not_active`로 이미 끝나 판정할
+  // 대상이 없다. **던져도 하트비트는 그대로 `200`이다** (MUST NOT — advisory가 갱신 경로를
+  // 끊으면 그 순간 advisory가 아니라 강제가 된다). `findForkOverlap`을 직접 부르지 않고 반드시
+  // `findForkAdvisory`를 통해 부른다 — self·others를 한 `options`로 파생시키지 않고 다른
+  // 시각으로 조회한 레코드를 섞으면 `unexpected_row_shape`가 실사용 중 튈 수 있다.
+  let forkAdvisory: ForkOverlap | undefined
+  try {
+    forkAdvisory = await options.workspaces.findForkAdvisory(subject, workspaceId, { gracePeriodMs, now: new Date() })
+  } catch (error) {
+    // 조용히 삼키지 않는다 — 운영자가 볼 수 있는 흔적을 한 줄 남긴다(이슈 #118 완료 조건).
+    // 클라이언트로는 아무것도 새지 않는다: 아래 응답에는 `forkAdvisory` 키가 그냥 빠진다.
+    console.error('forkAdvisory 판정 실패 — advisory 없이 하트비트를 200으로 마친다', error)
+  }
+
   writeJson(response, 200, {
     workspaceId,
     // 위 `getWorkspace`가 본 값이 아니라 **전이가 확정한 값**이다 (`§4.1` — 원본은 `heartbeat`).
@@ -886,6 +917,9 @@ async function handleHeartbeatWorkspace(
     scope,
     expiresAt: issued.expiresAt,
     heartbeatIntervalSeconds: options.config.heartbeatIntervalSeconds,
+    // `exactOptionalPropertyTypes` — 겹침이 없으면 키 자체가 없다(`undefined`로 메우지 않는다,
+    // `WorkspaceRecord`의 `replicaId` 미신고와 같은 규율, `§4.10`).
+    ...(forkAdvisory === undefined ? {} : { forkAdvisory }),
   })
 }
 
