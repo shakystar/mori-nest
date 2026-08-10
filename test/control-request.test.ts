@@ -130,6 +130,29 @@ describe('verifyControlRequest — GET /v1/logs', () => {
     expect(result.status).toBe(405)
     expect(result.error.error.code).toBe('method_not_allowed')
   })
+
+  it('⑲ 정의되지 않은 파라미터·형식 오류 limit·반복 limit → 400 malformed_request, after 반복은 여전히 400 invalid_cursor (§1.3, §2.4, GET /v1/workspaces와 통일, mori-nest #123)', async () => {
+    const store = await openLauncherCredentialStore(':memory:')
+    const { token } = await store.issue('subject-g')
+    const get = async (url: string) =>
+      verifyControlRequest({ method: 'GET', url, headers: { authorization: `Bearer ${token}` } }, '', store)
+
+    const unrecognized = await get('/v1/logs?foo=bar')
+    expect(unrecognized.ok).toBe(false)
+    if (!unrecognized.ok) expect(unrecognized.error.error.code).toBe('malformed_request')
+
+    const malformedLimit = await get('/v1/logs?limit=abc')
+    expect(malformedLimit.ok).toBe(false)
+    if (!malformedLimit.ok) expect(malformedLimit.error.error.code).toBe('malformed_request')
+
+    const repeatedLimit = await get('/v1/logs?limit=1&limit=2')
+    expect(repeatedLimit.ok).toBe(false)
+    if (!repeatedLimit.ok) expect(repeatedLimit.error.error.code).toBe('malformed_request')
+
+    const repeatedAfter = await get('/v1/logs?after=a&after=b')
+    expect(repeatedAfter.ok).toBe(false)
+    if (!repeatedAfter.ok) expect(repeatedAfter.error.error.code).toBe('invalid_cursor')
+  })
 })
 
 describe('verifyControlRequest — POST /v1/logs/{logId}/revoke', () => {
