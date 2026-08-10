@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { openLauncherCredentialStore, type LauncherCredentialStore } from '../src/control/credential.js'
+import { openControlDatabase, type ControlDatabase } from '../src/control/db.js'
 import { openIdempotencyStore, type IdempotencyStore } from '../src/control/idempotency.js'
 import type { ControlConfig } from '../src/control/index.js'
 import { createControlServer, type ControlDiagnostic } from '../src/control/server.js'
@@ -144,6 +145,8 @@ const VERIFICATION_KEYS = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
 
 describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3·§4.4·§4.5·§4.6)', () => {
   let dir: string
+  /** 멱등 계층과 자격증명이 공유하는 제어 평면 DB (mori-nest #130). 닫는 것도 이쪽이다. */
+  let database: ControlDatabase
   let store: ControlStore
   let idempotency: IdempotencyStore
   let credentials: LauncherCredentialStore
@@ -273,9 +276,10 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'mori-nest-control-server-'))
-    store = await openControlStore(join(dir, 'control.db'))
-    idempotency = await openIdempotencyStore(join(dir, 'idempotency.db'))
-    credentials = await openLauncherCredentialStore(join(dir, 'credential.db'))
+    database = await openControlDatabase(join(dir, 'control-plane.db'))
+    store = await openControlStore(database)
+    idempotency = await openIdempotencyStore(database)
+    credentials = await openLauncherCredentialStore(database)
     workspaces = await openWorkspaceStore(join(dir, 'workspace.db'))
     tokenA = (await credentials.issue('subject-a')).token
     tokenB = (await credentials.issue('subject-b')).token
@@ -300,9 +304,8 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
       })
     }
     extraServers.length = 0
-    await idempotency.close()
-    await store.close()
-    await credentials.close()
+    // `store`는 `database`의 연결 위에 선 리포지토리라 닫을 것이 없다 (mori-nest #131).
+    await database.close()
     await workspaces.close()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -414,15 +417,16 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   it(
     '⑦ 원자성 회귀 — 같은 주체·키의 POST 두 건이 동시에 와도 로그는 정확히 하나다 (§1.4 MUST)',
     async () => {
-      // 자식 각자가 **자기 프로세스에서 서버를 띄운다** — 두 서버가 같은 DB 파일 셋을 보므로
+      // 자식 각자가 **자기 프로세스에서 서버를 띄운다** — 두 서버가 같은 DB 파일들을 보므로
       // 경합이 라우트 배선을 통째로 지나 프로세스 경계를 건넌다 (`test/idempotency-race-child.mjs`가
       // 세운 선례 그대로: 스핀으로 시각을 맞추고 결과 한 줄을 JSON으로 낸다). 한 프로세스
       // 안의 두 요청으로는 이 자리가 시험되지 않는 이유는 자식 파일 머리말에 적혀 있다.
       const raceDir = join(dir, 'race')
       mkdirSync(raceDir)
-      const raceCredentials = await openLauncherCredentialStore(join(raceDir, 'credential.db'))
+      const raceDatabase = await openControlDatabase(join(raceDir, 'control-plane.db'))
+      const raceCredentials = await openLauncherCredentialStore(raceDatabase)
       const raceToken = (await raceCredentials.issue('subject-race')).token
-      await raceCredentials.close()
+      await raceDatabase.close()
 
       const startAt = Date.now() + 1500
       const rounds = 5
@@ -445,13 +449,16 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
         expect(new Set(minted).size).toBe(1)
       }
 
-      const raceStore = await openControlStore(join(raceDir, 'control.db'))
+      // 자식들이 쓴 제어 평면 DB를 그대로 다시 연다 — 로그도 이제 그 DB에 산다
+      // (mori-nest #131). 닫는 것은 연결의 소유자이므로 리포지토리가 아니라 이 DB를 닫는다.
+      const verifyDatabase = await openControlDatabase(join(raceDir, 'control-plane.db'))
       try {
+        const raceStore = await openControlStore(verifyDatabase)
         // 키 다섯 개 × 요청 두 건 = 열 건이 들어갔는데 로그는 키당 하나, 즉 다섯이다.
         const page = await raceStore.listLogsForSubject('subject-race')
         expect(page.logs).toHaveLength(rounds)
       } finally {
-        await raceStore.close()
+        await verifyDatabase.close()
       }
     },
     30_000,

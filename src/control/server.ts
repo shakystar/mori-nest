@@ -91,7 +91,8 @@ import { createServer, type Server } from 'node:http'
 
 import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
 import type { LauncherCredentialStore } from './credential.js'
-import { IdempotencyStoreError, type IdempotencyStore } from './idempotency.js'
+import { ControlDatabaseError } from './db.js'
+import type { IdempotencyStore } from './idempotency.js'
 // **타입 전용 import다** — 런타임 그래프에는 이 간선이 없다(`verbatimModuleSyntax`가 지운다).
 // 설정 스키마의 집이 `./index.js` 하나라는 것이 이 평면의 규율이라(그 파일 머리말), 그 모양을
 // 여기에 다시 적는 대신 이름으로 가리킨다.
@@ -302,7 +303,9 @@ function isClosedResource(error: unknown): boolean {
  *
  * 세 갈래다:
  * - **`503 not_durable`** — 내구화를 보장할 수 없다. 디스크 I/O·읽기전용·디스크 참
- *   ({@link NOT_DURABLE_CODES}), 그리고 멱등 저장소가 내구성 PRAGMA를 걸지 못한 경우.
+ *   ({@link NOT_DURABLE_CODES}), 그리고 제어 평면 DB가 내구성 PRAGMA를 걸지 못한 경우
+ *   (그 사유를 내는 자리가 멱등 저장소에서 `./db.ts`로 옮겨갔다 — mori-nest #130. 문자열도
+ *   상태코드도 그대로다).
  * - **`503 unavailable`** — 셧다운 중이거나 저장소에 닿을 수 없다 ({@link UNAVAILABLE_CODES},
  *   닫힌 핸들).
  * - **`500 internal`** — 그 외 전부. 제약 위반·행 모양 이상·mint 고갈처럼 **서버 쪽 결함**이라
@@ -312,7 +315,7 @@ function isClosedResource(error: unknown): boolean {
  * 자격증명 값이 실릴 자리가 없다.
  */
 function storeFailure(error: unknown): Failure {
-  if (error instanceof IdempotencyStoreError && error.reason === 'durability_pragmas_not_applied') {
+  if (error instanceof ControlDatabaseError && error.reason === 'durability_pragmas_not_applied') {
     return {
       status: 503,
       error: errorResponse(ErrorCodes.not_durable, 'the request could not be durably recorded'),
