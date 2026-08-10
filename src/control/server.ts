@@ -91,16 +91,16 @@ import { createServer, type Server } from 'node:http'
 
 import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
 import type { LauncherCredentialStore } from './credential.js'
-import { ControlDatabaseError } from './db.js'
+import { ControlDatabaseError, type ControlDatabase } from './db.js'
 import type { IdempotencyStore } from './idempotency.js'
 // **타입 전용 import다** — 런타임 그래프에는 이 간선이 없다(`verbatimModuleSyntax`가 지운다).
 // 설정 스키마의 집이 `./index.js` 하나라는 것이 이 평면의 규율이라(그 파일 머리말), 그 모양을
 // 여기에 다시 적는 대신 이름으로 가리킨다.
 import type { ControlConfig } from './index.js'
 import { verifyControlRequest, type ControlRequest, type RawRequest } from './request.js'
-import { ControlStoreError, DEFAULT_PAGE_LIMIT, type ControlStore } from './store.js'
+import { ControlStoreError, DEFAULT_PAGE_LIMIT, mintLogId, type ControlStore } from './store.js'
 import { issueWorkspaceToken, mintTokenId } from './token.js'
-import { WorkspaceStoreError, type ForkOverlap, type WorkspaceStore } from './workspace-store.js'
+import { mintWorkspaceId, WorkspaceStoreError, type ForkOverlap, type WorkspaceStore } from './workspace-store.js'
 
 /**
  * `GET /v1/logs`의 `limit` 천장 ({@link handleListLogs} doc). 스토어가 `limit` 없이 쓰는
@@ -114,6 +114,15 @@ const MAX_PAGE_LIMIT = DEFAULT_PAGE_LIMIT
  * `WORKSPACE_REVOKE_SUFFIX`가 `./request.js`의 `REVOKE_SUFFIX`와 같은 이유로 분리된 것과 같다.
  */
 const MAX_WORKSPACE_PAGE_LIMIT = DEFAULT_PAGE_LIMIT
+
+/**
+ * mint 재시도 상한 — `handleCreateLog`·`handleOpenWorkspace`가 쓴다 (mori-nest #133, UoW
+ * 조각 4/4: mint 재시도가 이제 라우트 배선의 몫이다, `ControlStore.insertMintedLog`·
+ * `WorkspaceStore.insertMintedWorkspace` doc 참고). 값은 `ControlStore`·`WorkspaceStore`
+ * 내부의 같은 이름 상수와 맞춘다 — 근거도 같다: 128비트 난수의 충돌 확률은 무시할 수 있고,
+ * 이 상한에 실제로 닿는 것은 난수원이 고장 났을 때뿐이다.
+ */
+const MAX_MINT_ATTEMPTS = 5
 
 /**
  * 요청 객체 — Node 표준 HTTP 서버가 넘겨주는 것과 **모양만** 맞는 독립 타입 (파일 상단 doc).
@@ -153,6 +162,13 @@ export type ControlDiagnostic = {
 }
 
 export type ControlServerOptions = {
+  /**
+   * 넷이 공유하는 제어 평면 연결 (`./db.js`, mori-nest #130). `handleCreateLog`·
+   * `handleOpenWorkspace`가 로그·작업공간 mint를 멱등 완료와 한 트랜잭션으로 묶을 때
+   * {@link ControlDatabase.withTransaction}을 직접 여는 자리가 이것이다(mori-nest #133,
+   * UoW 조각 4/4).
+   */
+  readonly database: ControlDatabase
   /** `logId` mint와 (주체, 로그) 관계 (`./store.js`, #72). */
   readonly store: ControlStore
   /** `Idempotency-Key` 예약·재생·충돌 판정 (`./idempotency.js`, #73). */
@@ -307,9 +323,27 @@ function isClosedResource(error: unknown): boolean {
  *   (그 사유를 내는 자리가 멱등 저장소에서 `./db.ts`로 옮겨갔다 — mori-nest #130. 문자열도
  *   상태코드도 그대로다).
  * - **`503 unavailable`** — 셧다운 중이거나 저장소에 닿을 수 없다 ({@link UNAVAILABLE_CODES},
- *   닫힌 핸들).
+ *   닫힌 핸들, 그리고 `ControlDatabaseError('database_closed')` — 아래 참고).
  * - **`500 internal`** — 그 외 전부. 제약 위반·행 모양 이상·mint 고갈처럼 **서버 쪽 결함**이라
- *   재시도가 답이 아닌 것들이 여기로 모인다.
+ *   재시도가 답이 아닌 것들이 여기로 모인다. `ControlDatabaseError('nested_transaction')`도
+ *   의도적으로 여기 남는다 — 아래 참고.
+ *
+ * ## `database_closed`는 `503`, `nested_transaction`은 `500` — mori-nest #133이 답한
+ * mori-nest #130 코멘트의 설계 숙제 2번
+ *
+ * `database_closed`는 **셧다운 경로**의 사유다(`./db.ts`) — `isClosedResource`가 이미 같은
+ * 뜻의 원시 `ERR_INVALID_STATE`를 `503 unavailable`로 옮기는 것과 같은 자리에 합류시킨다:
+ * 서버 결함이 아니라 "지금은 처리 못 하니 다시 오라"이고, 재시도(다른 인스턴스로든 재기동
+ * 후든)가 실제로 답이 될 수 있다.
+ *
+ * `nested_transaction`은 다르다. `./db.ts` 상단 doc "조각 4/4가 고른 답"이 세운 전제 —
+ * **모든 트랜잭션 콜백은 동기다** — 가 리포 전역에서 성립하는 한, 이 사유는 동시 요청이
+ * 만들 수 없다(콜백 하나의 `BEGIN`~`COMMIT`이 한 자바스크립트 실행틱을 벗어나지 않으므로
+ * 서로 다른 요청의 `withTransaction` 호출이 실제로 겹칠 자리가 없다). 그래서 이 사유가
+ * 나온다면 그것은 코드 어딘가(대개 콜백에 `await`를 흘려 넣은 새 코드)가 그 전제를 깬
+ * **결함**이라는 뜻이고, 결함은 재시도해도 같은 이유로 다시 던진다 — `503`으로 옮기면
+ * 클라이언트에게 "다시 오면 될 수도 있다"는 거짓 신호를 준다. 그래서 여기서 따로 분류하지
+ * 않고 기본 갈래(`500 internal`)에 남긴다.
  *
  * 예외의 `message`를 봉투에 싣지 않는다 (`§1.3`) — 아래 메시지는 전부 고정 문자열이고,
  * 자격증명 값이 실릴 자리가 없다.
@@ -319,6 +353,13 @@ function storeFailure(error: unknown): Failure {
     return {
       status: 503,
       error: errorResponse(ErrorCodes.not_durable, 'the request could not be durably recorded'),
+      headers: RETRY_AFTER,
+    }
+  }
+  if (error instanceof ControlDatabaseError && error.reason === 'database_closed') {
+    return {
+      status: 503,
+      error: errorResponse(ErrorCodes.unavailable, 'the backing store is not reachable'),
       headers: RETRY_AFTER,
     }
   }
@@ -347,7 +388,8 @@ function storeFailure(error: unknown): Failure {
 }
 
 /**
- * `POST /v1/logs` (`§2.1`·`§1.4`) — `reserve` → `createLog` → `complete`.
+ * `POST /v1/logs` (`§2.1`·`§1.4`) — `reserve` → (mint + 삽입 + `complete`, 한 트랜잭션) (mori-nest
+ * #133, UoW 조각 4/4).
  *
  * `reserve`의 네 판정이 이 라우트에서 갈리는 곳:
  *
@@ -367,12 +409,29 @@ function storeFailure(error: unknown): Failure {
  * 첫 요청이 끝나기를 기다렸다 응답하는 것은 이 파일에 없는 대기 정책(타임아웃·유량)을 여기서
  * 새로 정하는 것이다.
  *
- * **`complete`가 실패하면 `201`을 쓰지 않는다.** 그 시점에 로그는 이미 만들어져 있지만,
- * 저장된 응답이 없으므로 «재시도는 첫 결과 그대로»(`§1.4` MUST)를 지킬 근거가 사라진다 —
- * `201`을 쓰고 나면 같은 키의 재시도가 무엇을 돌려줘야 하는지 서버가 모른다. 실패를 그대로
- * 알리는 쪽이 fail-closed다: 그 예약은 완료되지 않은 채 남아 재시도가 `'in_progress'`로
- * 걸리므로 **로그가 둘 생기는 일은 어느 쪽으로도 없고**, 만들어진 로그는 `GET /v1/logs`로
- * 여전히 보인다.
+ * ## `reserve`는 트랜잭션 **밖**에 남는다 — mint·삽입·`complete`만 한 트랜잭션이다
+ *
+ * `0003 §68` 사람 결정이 답을 요구한 첫 물음이다. `reserve`는 그 자체로 이미 원자적이다
+ * (`(subject, key)` `PRIMARY KEY` 제약 하나가 "동시에 최대 하나"를 지는 것이지 트랜잭션이 아니다
+ * — `./idempotency.js` 상단 doc). 이 이슈가 닫으려는 실패 창은 **자원이 만들어진 뒤 완료
+ * 기록이 실패하는 창**이지 `reserve` 자체의 원자성이 아니므로, `reserve`를 뒤 트랜잭션에
+ * 합류시켜도 그 창이 더 좁아지지 않는다 — 오히려 `reserve`(비동기 인터페이스, 내부는 동기)를
+ * 트랜잭션 콜백 안에서 `await`하면 콜백이 thenable이 되어 `./db.ts`가 막으려는 바로 그 문제가
+ * 생긴다. 그래서 `reserve`는 독립된 (사실상 오토커밋) 문장으로 먼저 실행하고, `'reserved'`를
+ * 받은 뒤에만 두 번째 트랜잭션을 연다.
+ *
+ * ## 원자 구간 — mint 재시도까지 포함해 **한 트랜잭션**
+ *
+ * `'reserved'` 판정 뒤: `mintLogId`(트랜잭션 밖, mint는 던질 수 있다) → `ControlDatabase.
+ * withTransaction`(동기 콜백) 안에서 `ControlStore.insertMintedLog`(`logs`+`log_subjects` 삽입)
+ * → `IdempotencyStore.completeSync`(같은 트랜잭션, `await` 없이) 순서다. 콜백이 던지면 삽입도
+ * 완료 기록도 함께 롤백된다 — **`complete`가 실패하는 순간 방금 만든 로그도 사라진다**(이전
+ * 조각들과 달리, 이 조각부터는 "로그는 남고 완료만 실패"가 아예 발생하지 않는다). `logId`
+ * 충돌(`log_id_collision`)만 예외로 다음 시도에서 새 트랜잭션을 연다 — 충돌한 시도는
+ * 아무것도 커밋하지 않았으므로 재시도가 깨끗한 상태에서 시작한다.
+ *
+ * 두 문장 다 동기 메서드다(`Promise`를 돌려주지 않는다) — 콜백에 `await`를 쓸 문법적 자리가
+ * 없으므로 `./db.ts` 상단 doc "조각 4/4가 고른 답"이 요구하는 성질이 타입으로 강제된다.
  */
 async function handleCreateLog(
   options: ControlServerOptions,
@@ -411,21 +470,35 @@ async function handleCreateLog(
     return
   }
 
-  // `'reserved'` — 자원을 만들어도 되는 유일한 판정이다.
-  let created
+  // `'reserved'` — 자원을 만들어도 되는 유일한 판정이다. mint + 삽입 + 완료를 한 트랜잭션으로
+  // 묶는다(위 doc) — 충돌한 시도만 재시도한다.
+  let record: { readonly status: number; readonly body: string } | undefined
   try {
-    created = await options.store.createLog(subject)
+    for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt += 1) {
+      const logId = mintLogId()
+      const candidate = { status: 201, body: JSON.stringify({ logId }) }
+      try {
+        await options.database.withTransaction(() => {
+          options.store.insertMintedLog(logId, subject)
+          options.idempotency.completeSync(subject, idempotencyKey, candidate)
+        })
+      } catch (error) {
+        if (error instanceof ControlStoreError && error.reason === 'log_id_collision') {
+          continue
+        }
+        throw error
+      }
+      record = candidate
+      break
+    }
   } catch (error) {
     writeFailure(response, storeFailure(error))
     return
   }
-
-  // `§2.4`: 응답 `LogRecord`에는 `logId` 외의 필드가 없다.
-  const record = { status: 201, body: JSON.stringify({ logId: created.logId }) }
-  try {
-    await options.idempotency.complete(subject, idempotencyKey, record)
-  } catch (error) {
-    writeFailure(response, storeFailure(error))
+  if (record === undefined) {
+    // mint 재시도가 store.ts의 MAX_MINT_ATTEMPTS와 같은 상한을 넘었다 — 난수원이 고장났다고
+    // 본다(`ControlStore.createLog`와 같은 판단).
+    writeFailure(response, storeFailure(new ControlStoreError('mint_exhausted')))
     return
   }
 
@@ -709,7 +782,8 @@ async function replayOpenWorkspace(
 }
 
 /**
- * `POST /v1/workspaces` (`§4.2`) — 멱등 예약(`§1.4`) → grant 판정(`§3.6`) → 개시 → 발급 → `201`.
+ * `POST /v1/workspaces` (`§4.2`) — 멱등 예약(`§1.4`) → grant 판정(`§3.6`) → (mint + 삽입 +
+ * `complete`, 한 트랜잭션) → 발급 → `201` (mori-nest #133, UoW 조각 4/4).
  *
  * 이 순서가 계약이다. `handleCreateLog`가 세운 «계층이 핸들러를 감싸지 않고 핸들러가 계층을
  * 부른다»를 그대로 따르고, 갈리는 것은 저장분과 재시도 경로 둘이다(위 두 doc).
@@ -727,6 +801,24 @@ async function replayOpenWorkspace(
  * (이슈 #103 작업 범위 2의 순서). 그래서 `403`으로 끝난 예약은 완료되지 않은 채 남고, 같은
  * 키·같은 본문의 재시도는 `'in_progress'`로 걸린다 — 스코프를 고쳐 다시 오는 요청은 본문이
  * 달라졌으므로 `409 idempotency_key_reused`이고, **어느 쪽도 작업공간을 만들지 않는다.**
+ *
+ * ## `reserve`·`isGranted`는 원자 트랜잭션 **밖**에 남는다 — mori-nest #133이 답한 이슈 본문의
+ * 설계 결정 (판단 기준: 콜백에 `await`·I/O를 끌고 들어가지 않는다; mint·발급처럼 트랜잭션
+ * 밖에서 하는 것이 이미 규율인 것은 밖에 둔다)
+ *
+ * - **`reserve`**: `handleCreateLog`와 같은 이유다(그 doc "reserve는 트랜잭션 밖에 남는다") —
+ *   자기 원자성은 `PRIMARY KEY` 제약이 이미 지고, 이 이슈가 닫는 창은 그 뒤(자원 생성~완료)다.
+ * - **`isGranted`**: `Promise.all`로 로그마다 조회하는 **비동기** 판정이다 — 동기 콜백 전제를
+ *   깨지 않고는 트랜잭션 안에 넣을 수 없다. 또한 이 판정은 읽기 전용 게이트이고 만든 자원이
+ *   없다 — 이 이슈가 닫는 실패 창(자원은 있는데 완료가 없는 상태)의 당사자가 아니다.
+ * - **발급(`issueToken`)**: 기존 규율대로 트랜잭션 **밖**에 둔다(`workspace-store.ts`의
+ *   `mintWorkspaceId` 선례와 같은 자리 — mint·서명류는 트랜잭션 밖). 다만 **순서를 바꾼다**:
+ *   이전엔 개시(자기 트랜잭션) → 발급 → `complete`였는데, 이제는 (mint+삽입+`complete`가 한
+ *   트랜잭션) → 발급이다. 저장되는 바이트(`OpenWorkspaceReservation`)에 애초에 토큰이 없으므로
+ *   (`§3.8`) 순서를 바꿔도 저장분은 달라지지 않는다 — 오히려 예전엔 발급이 실패하면 이미
+ *   커밋된 작업공간이 남긴 채 예약이 `'in_progress'`로 24시간 묶였는데, 이제는 발급 실패 시
+ *   재시도가 `'replay'`로 걸려 `replayOpenWorkspace`가 새 토큰 발급을 즉시 다시 시도한다 —
+ *   이 이슈가 명시적으로 요구한 범위는 아니지만 같은 종류의 창을 하나 더 닫는 부수 효과다.
  */
 async function handleOpenWorkspace(
   options: ControlServerOptions,
@@ -786,39 +878,51 @@ async function handleOpenWorkspace(
     return
   }
 
-  let opened
+  // mint + 삽입 + 완료를 한 트랜잭션으로 묶는다(위 doc) — 충돌한 시도만 재시도한다.
+  let stored: OpenWorkspaceReservation | undefined
   try {
-    opened = await options.workspaces.openWorkspace(subject, {
-      logs,
-      ...(request.supersedes === undefined ? {} : { supersedes: request.supersedes }),
-      ...(request.replicaId === undefined ? {} : { replicaId: request.replicaId }),
-    })
+    for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt += 1) {
+      const workspaceId = mintWorkspaceId()
+      // `scope`는 요청한 `logs` 그대로다 — 서버가 넓히지도 조용히 좁히지도 않는다 (`§3.6` MUST).
+      const candidate: OpenWorkspaceReservation = { workspaceId, scope: logs }
+      try {
+        await options.database.withTransaction(() => {
+          options.workspaces.insertMintedWorkspace(workspaceId, subject, {
+            logs,
+            ...(request.supersedes === undefined ? {} : { supersedes: request.supersedes }),
+            ...(request.replicaId === undefined ? {} : { replicaId: request.replicaId }),
+          })
+          options.idempotency.completeSync(subject, idempotencyKey, { status: 201, body: JSON.stringify(candidate) })
+        })
+      } catch (error) {
+        if (error instanceof WorkspaceStoreError && error.reason === 'workspace_id_collision') {
+          continue
+        }
+        throw error
+      }
+      stored = candidate
+      break
+    }
   } catch (error) {
     if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_found') {
-      // `supersedes`가 없는 id이거나 다른 주체의 것이다 (`§4.2` MUST). 스토어가 이미 그
-      // 판정에서 개시를 롤백했으므로 작업공간은 만들어지지 않았다.
+      // `supersedes`가 없는 id이거나 다른 주체의 것이다 (`§4.2` MUST). 트랜잭션이 롤백했으므로
+      // 작업공간도 완료 기록도 만들어지지 않았다.
       writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
       return
     }
     writeFailure(response, storeFailure(error))
     return
   }
-
-  // `scope`는 요청한 `logs` 그대로다 — 서버가 넓히지도 조용히 좁히지도 않는다 (`§3.6` MUST).
-  const stored: OpenWorkspaceReservation = { workspaceId: opened.workspaceId, scope: logs }
+  if (stored === undefined) {
+    // mint 재시도가 workspace-store.ts의 MAX_MINT_ATTEMPTS와 같은 상한을 넘었다 — 난수원이
+    // 고장났다고 본다(`WorkspaceStore.openWorkspace`와 같은 판단).
+    writeFailure(response, storeFailure(new WorkspaceStoreError('mint_exhausted')))
+    return
+  }
 
   let issued: IssuedToken
   try {
     issued = issueToken(options.config, stored.workspaceId, stored.scope)
-  } catch (error) {
-    writeFailure(response, storeFailure(error))
-    return
-  }
-
-  try {
-    // `handleCreateLog`와 같은 이유로 응답보다 **먼저** 완료를 기록한다. 저장되는 바이트에
-    // 토큰이 없다는 것이 `§3.8`이 걸리는 자리다.
-    await options.idempotency.complete(subject, idempotencyKey, { status: 201, body: JSON.stringify(stored) })
   } catch (error) {
     writeFailure(response, storeFailure(error))
     return

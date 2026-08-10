@@ -118,6 +118,7 @@ type TerminalReply = { workspaceId: string; state: string; endedAt: string }
 function withFailingForkAdvisory(real: WorkspaceStore): WorkspaceStore {
   return {
     openWorkspace: real.openWorkspace.bind(real),
+    insertMintedWorkspace: real.insertMintedWorkspace.bind(real),
     getWorkspace: real.getWorkspace.bind(real),
     heartbeat: real.heartbeat.bind(real),
     closeWorkspace: real.closeWorkspace.bind(real),
@@ -166,6 +167,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   /** 설정만 갈아 끼운 서버 하나를 더 띄운다 — 스토어(= DB 파일)는 그대로 공유한다. */
   async function startServer(overrides: Partial<ControlConfig>): Promise<string> {
     const extra = createControlServer({
+      database,
       store,
       idempotency,
       credentials,
@@ -286,7 +288,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     tokenA = (await credentials.issue('subject-a')).token
     tokenB = (await credentials.issue('subject-b')).token
 
-    server = createControlServer({ store, idempotency, credentials, workspaces, config: CONFIG })
+    server = createControlServer({ database, store, idempotency, credentials, workspaces, config: CONFIG })
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', resolve)
     })
@@ -951,6 +953,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   it('㉘ findForkAdvisory가 던져도 하트비트는 200이고 forkAdvisory 키만 빠진다 (§4.10 MUST NOT)', async () => {
     const diagnostics: ControlDiagnostic[] = []
     const failing = createControlServer({
+      database,
       store,
       idempotency,
       credentials,
@@ -983,6 +986,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
 
   it('㉙ onDiagnostic 훅 자신이 던져도 하트비트는 200이다 (전송 평면 diagnosticSink 규율)', async () => {
     const throwing = createControlServer({
+      database,
       store,
       idempotency,
       credentials,

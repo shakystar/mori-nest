@@ -182,9 +182,10 @@ function unauthenticated(): LauncherCredentialVerification {
 }
 
 /** `node:sqlite` 위의 {@link LauncherCredentialStore} 구현 — 연결을 소유하지 않는
- * 리포지토리다(파일 상단 doc). 메서드 본문에 `await`가 트랜잭션을 가로지르지 않는다 —
- * `src/control/store.ts` 파일 상단 doc과 같은 규율(트랜잭션 구간에 `await`를 넣으면
- * 이벤트 루프가 다른 호출에 제어를 넘겨 트랜잭션이 겹칠 수 있다). */
+ * 리포지토리다(파일 상단 doc). «트랜잭션 콜백에 `await`를 넣지 않는다» 불변식을 이 파일은
+ * 진술하지 않는다 — 진술하는 자리는 `./db.ts` 상단 doc(«한 연결이라 트랜잭션은 직렬이다»)
+ * 하나다(mori-nest #133, PR mori-nest#138 교차 리뷰가 남긴 정리 — 근거로 `store.ts`가 아니라
+ * `db.ts`를 든다). */
 class SqliteLauncherCredentialStore implements LauncherCredentialStore {
   readonly #database: ControlDatabase
   readonly #randomBytes: RandomBytesFn
