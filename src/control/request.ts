@@ -318,8 +318,10 @@ function listLogsRequest(subject: string, after: string | undefined, limit: numb
  *    유효성은 스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다(`./workspace-store.js`)
  *    — 판정을 두 곳에 두면 갈린다.
  *
- * 반복 쿼리(같은 이름이 둘 이상)는 셋 다 해석 불가로 보고 `400 malformed_request`다 — 값을
- * 하나로 정할 수 없다는 점이 {@link atMostOne}의 판정과 같다.
+ * 반복 쿼리(같은 이름이 둘 이상)는 값을 하나로 정할 수 없다는 점이 {@link atMostOne}의
+ * 판정과 같지만, code는 파라미터별로 갈린다: `state`는 `400 invalid_state_filter`, `after`는
+ * `400 invalid_cursor` — 둘 다 `§1.3` 표에 이미 있는 code라 그 표를 따른다. `limit`만
+ * `400 malformed_request`다 — `§1.3`에 `limit` 전용 code가 없다.
  */
 function checkListWorkspacesQuery(
   query: string,
@@ -334,10 +336,16 @@ function checkListWorkspacesQuery(
   }
 
   const state = queryValue(query, 'state')
+  if (!state.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.invalid_state_filter, 'state query parameter repeated') }
+  }
   const after = queryValue(query, 'after')
+  if (!after.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.invalid_cursor, 'after query parameter repeated') }
+  }
   const limitRaw = queryValue(query, 'limit')
-  if (!state.ok || !after.ok || !limitRaw.ok) {
-    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'query parameter repeated') }
+  if (!limitRaw.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'limit query parameter repeated') }
   }
 
   let limit: number | undefined
@@ -565,10 +573,11 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *    - `revokeWorkspace`: 본문 형태(`§4.5` — `reason`이 있는데 문자열이 아니면
  *      `400 malformed_request`, `revokeLog`와 같은 문법). `Idempotency-Key`를 요구하지 않는다.
  *    - `listWorkspaces`: 쿼리 문법(`§4.6`, {@link checkListWorkspacesQuery} doc) —
- *      정의되지 않은 파라미터나 반복 파라미터는 `400 malformed_request`, 십진 정수가 아닌
- *      `limit`도 같은 코드로 거부한다(`listLogs`의 `limit`과 달리 조용히 접지 않는다, 이 조각의
- *      판단). `state`·`after`의 **값**은 판정하지 않는다 — 유효성은 스토어가
- *      `invalid_state_filter`·`invalid_cursor`로 답한다.
+ *      정의되지 않은 파라미터는 `400 malformed_request`. 반복 파라미터는 이름별로 code가
+ *      갈린다: `state` 반복은 `400 invalid_state_filter`, `after` 반복은 `400 invalid_cursor`,
+ *      `limit` 반복(또는 십진 정수가 아닌 `limit`)은 `400 malformed_request`(`listLogs`의
+ *      `limit`과 달리 조용히 접지 않는다, 이 조각의 판단). `state`·`after`의 **값**은 판정하지
+ *      않는다 — 유효성은 스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다.
  *    - `getWorkspace`: 없음 — 경로의 `workspaceId`를 그대로 싣는다. 존재 판정은 이 게이트의
  *      일이 아니다(다음 조각).
  *    - **`heartbeatWorkspace`·`closeWorkspace`·`revokeWorkspace`·`getWorkspace` 넷 다

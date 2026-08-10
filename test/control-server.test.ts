@@ -831,6 +831,19 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     const invalidCursor = await read('/v1/workspaces?after=not-a-cursor', tokenA)
     expect(invalidCursor.status).toBe(400)
     expect(bodyOf(invalidCursor)).toEqual({ error: { code: 'invalid_cursor', message: expect.any(String) } })
+
+    // 반복 쿼리도 "해석 불가"로 같은 code에 합류한다 (state·after) — limit만 malformed_request.
+    const repeatedState = await read('/v1/workspaces?state=open&state=closed', tokenA)
+    expect(repeatedState.status).toBe(400)
+    expect(bodyOf(repeatedState)).toEqual({ error: { code: 'invalid_state_filter', message: expect.any(String) } })
+
+    const repeatedAfter = await read('/v1/workspaces?after=a&after=b', tokenA)
+    expect(repeatedAfter.status).toBe(400)
+    expect(bodyOf(repeatedAfter)).toEqual({ error: { code: 'invalid_cursor', message: expect.any(String) } })
+
+    const repeatedLimit = await read('/v1/workspaces?limit=1&limit=2', tokenA)
+    expect(repeatedLimit.status).toBe(400)
+    expect(bodyOf(repeatedLimit)).toEqual({ error: { code: 'malformed_request', message: expect.any(String) } })
   })
 
   it(
