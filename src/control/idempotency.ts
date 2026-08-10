@@ -9,6 +9,14 @@
  * - {@link IdempotencyStore} — 원자적 예약·재생·충돌 판정과 24시간 보관을 지는 저장소.
  *   구현은 `src/transport/store.ts`와 같은 `node:sqlite`다 (런타임 의존성 0 유지).
  *
+ * ## 연결을 소유하지 않는다 (mori-nest #130 — UoW 조각 1/4)
+ *
+ * 이 파일에 `new DatabaseSync`가 없다. 연결은 `./db.ts`의 {@link ControlDatabase}가 소유하고
+ * 이 스토어는 그 위에 문장을 준비하는 **리포지토리**다 — 그래서 `close()`도 없다(닫는 것은
+ * 연결의 소유자다). 그 대가로 얻는 것: 자격증명 쓰기와 멱등 쓰기가 `withTransaction` 하나
+ * 안에서 **함께 커밋된다.** 파일이 갈려 있던 동안에는 표현할 수조차 없던 성질이다
+ * (`./db.ts` 상단 doc).
+ *
  * ## 원자성을 세우는 자리
  *
  * `§1.4`의 MUST — *"키 기록과 자원 생성은 원자적이다"* — 를 이 파일이 통째로 못 지킨다: 자원을
@@ -32,7 +40,9 @@
  */
 
 import { createHash } from 'node:crypto'
-import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
+import { type DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
+
+import type { ControlDatabase } from './db.js'
 
 /** `0003 §1.4`: `Idempotency-Key := ^[A-Za-z0-9_.:-]{1,128}$`. */
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/
@@ -61,7 +71,6 @@ export function parseIdempotencyKey(headerValue: string | null | undefined): Ide
 const RETENTION_MS = 24 * 60 * 60 * 1000
 
 const SQLITE_CONSTRAINT_PRIMARYKEY = 1555
-const BUSY_TIMEOUT_MS = 5000
 
 /**
  * 저장된 응답. `body`는 이미 직렬화된 JSON 문자열이다 — 이 계층은 응답의 **모양**을 모른다
@@ -84,9 +93,13 @@ export type IdempotencyReservation =
   | { readonly kind: 'replay'; readonly record: IdempotencyRecord }
 
 export type IdempotencyStoreFailure =
-  /** 열린 DB의 `journal_mode`/`synchronous`가 요구값이 아니다 (`store.ts`와 같은 검사). */
-  | 'durability_pragmas_not_applied'
-  /** DB가 돌려준 행의 모양이 스키마와 다르다. */
+  /**
+   * DB가 돌려준 행의 모양이 스키마와 다르다.
+   *
+   * 내구성 PRAGMA 실패(`durability_pragmas_not_applied`)는 더 이상 이 표면에 없다 — 연결을
+   * 여는 자리가 `./db.ts`로 옮겨갔으므로 그 사유도 그쪽 `ControlDatabaseError`가 낸다
+   * (문자열은 그대로다, mori-nest #130).
+   */
   | 'unexpected_row_shape'
   /** `subject`가 빈 문자열이다 — 네임스페이스가 없는 예약을 만들지 않는다 (`§1.4` MUST). */
   | 'missing_subject'
@@ -129,9 +142,6 @@ export type IdempotencyStore = {
    *   `reserve` 없이 부른 것이라 부르는 쪽의 결함이다.
    */
   complete(subject: string, key: string, record: IdempotencyRecord): Promise<void>
-
-  /** 연결을 닫는다. 두 번 불러도 안전하다. */
-  close(): Promise<void>
 }
 
 /**
@@ -166,19 +176,6 @@ function isPrimaryKeyViolation(error: unknown): boolean {
     error !== null &&
     (error as { errcode?: unknown }).errcode === SQLITE_CONSTRAINT_PRIMARYKEY
   )
-}
-
-/** `journal_mode=WAL`·`synchronous=FULL`을 걸고 되읽어 확인한다 (`store.ts`와 같은 검사). */
-function applyDurabilityPragmas(db: DatabaseSync): void {
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
-  db.exec('PRAGMA journal_mode = WAL')
-  db.exec('PRAGMA synchronous = FULL')
-
-  const journalMode = db.prepare('PRAGMA journal_mode').get()?.['journal_mode']
-  const synchronous = db.prepare('PRAGMA synchronous').get()?.['synchronous']
-  if (journalMode !== 'wal' || synchronous !== 2) {
-    throw new IdempotencyStoreError('durability_pragmas_not_applied')
-  }
 }
 
 type StoredRow = {
@@ -217,17 +214,15 @@ function toStoredRow(row: Record<string, SQLOutputValue>): StoredRow {
   }
 }
 
-/** `node:sqlite` 위의 {@link IdempotencyStore} 구현. */
+/** `node:sqlite` 위의 {@link IdempotencyStore} 구현 — 연결을 소유하지 않는 리포지토리다
+ * (파일 상단 doc). */
 class SqliteIdempotencyStore implements IdempotencyStore {
-  readonly #db: DatabaseSync
   readonly #insert: StatementSync
   readonly #select: StatementSync
   readonly #claimExpired: StatementSync
   readonly #complete: StatementSync
-  #closed = false
 
   constructor(db: DatabaseSync) {
-    this.#db = db
     this.#insert = db.prepare(
       'INSERT INTO idempotency_keys (subject, key, request_hash, status, response_body, created_at) VALUES (?, ?, ?, NULL, NULL, ?)',
     )
@@ -315,14 +310,6 @@ class SqliteIdempotencyStore implements IdempotencyStore {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return
-    }
-    this.#closed = true
-    this.#db.close()
-  }
-
   #selectRow(subject: string, key: string): StoredRow {
     const row = this.#select.get(subject, key)
     if (row === undefined) {
@@ -334,19 +321,13 @@ class SqliteIdempotencyStore implements IdempotencyStore {
 }
 
 /**
- * 저장소를 연다. `path`의 DB가 없으면 만든다.
+ * 리포지토리를 연다 — 제어 평면 DB에 이 계층의 테이블이 없으면 만든다.
  *
- * @param path DB 파일 경로. `:memory:`는 쓸 수 없다 (`store.ts`와 같은 이유 — WAL을 걸 수
- *   없어 {@link applyDurabilityPragmas}가 거부한다).
+ * @param database 연결의 소유자 (`./db.ts`). **경로를 받지 않는다** — DB를 여는 자리는
+ *   `openControlDatabase` 하나다 (mori-nest #130).
  */
-export async function openIdempotencyStore(path: string): Promise<IdempotencyStore> {
-  const db = new DatabaseSync(path)
-  try {
-    applyDurabilityPragmas(db)
-    db.exec(SCHEMA)
-  } catch (error) {
-    db.close()
-    throw error
-  }
-  return new SqliteIdempotencyStore(db)
+export async function openIdempotencyStore(database: ControlDatabase): Promise<IdempotencyStore> {
+  const connection = database.connection
+  connection.exec(SCHEMA)
+  return new SqliteIdempotencyStore(connection)
 }

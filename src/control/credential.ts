@@ -32,19 +32,30 @@
  * 판정이 조회이므로, 행을 지우면 다음 조회부터 곧바로 실패한다. 작업공간 토큰이 `§3.5`에서
  * 감수한 `≤ tokenTtl` 잔여 창이 여기에는 없다. 회전은 "새 자격증명 발급 + 옛 자격증명
  * 폐기"를 한 트랜잭션으로 묶은 것뿐이다 — {@link LauncherCredentialStore.rotate}.
+ *
+ * ## 연결을 소유하지 않는다 — 그리고 **왜 이 계층이 단일 DB에 합류하는가**
+ *
+ * 이 파일에 `new DatabaseSync`가 없다. 연결은 `./db.ts`의 {@link ControlDatabase}가 소유하고
+ * 이 스토어는 그 위에 문장을 준비하는 **리포지토리**다 — `close()`도 갖지 않는다(닫는 것은
+ * 연결의 소유자다).
+ *
+ * 자격증명은 `0003 §1.4` 원자성 결함([mori-nest #130](https://github.com/shakystar/mori-nest/issues/130))의
+ * **당사자가 아니다** — 실패 창은 멱등 예약과 자원 생성 사이에 있지 자격증명에 있지 않다.
+ * 그런데도 첫 조각에서 함께 옮기는 것은 owner 판정이다(#130 본문 «credential 합류 여부»):
+ * 같은 평면·같은 생애의 저장소이고, 미루면 **같은 전환을 두 번** 하게 된다. 지금 옮기면
+ * 크로스-리포지토리 롤백이 실제로 성립하는지를 이 조각 안에서 증명할 상대가 생긴다는 이득도
+ * 있다 (`test/control-db.test.ts`).
  */
 
 import { createHash, randomBytes as nodeRandomBytes } from 'node:crypto'
-import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
+import { type SQLOutputValue, type StatementSync } from 'node:sqlite'
 
 import { ErrorCodes, errorResponse, type ErrorResponse } from '../errors.js'
+import type { ControlDatabase } from './db.js'
 import { readEntropy, type RandomBytesFn } from './store.js'
 
 /** `SQLITE_CONSTRAINT_CHECK`. `launcher_credentials.subject <> ''` 위반. */
 const SQLITE_CONSTRAINT_CHECK = 275
-
-/** 잠금 대기 상한. 근거는 `src/control/store.ts`의 같은 값과 같다. */
-const BUSY_TIMEOUT_MS = 5000
 
 /** `§1.1` MUST 하한 그대로 — `mintLogId`(`src/control/store.ts`)와 같은 128비트. */
 const CREDENTIAL_ENTROPY_BYTES = 16
@@ -138,12 +149,14 @@ export type LauncherCredentialStore = {
    * 회전 — 같은 주체에게 새 자격증명을 발급하고 옛 것을 같은 트랜잭션에서 폐기한다. 한
    * 번의 호출이 §1.1의 "회전·폐기 경로를 처음부터 둔다"가 요구하는 회전이다.
    *
+   * **자기 트랜잭션을 연다.** 중첩이 금지되어 있으므로(`./db.ts` 상단 doc) 바깥
+   * `withTransaction` 안에서 부르면 `nested_transaction`을 받는다 — 회전을 더 큰 쓰기와
+   * 한 커밋으로 묶어야 하면 이 메서드 대신 {@link LauncherCredentialStore.issue}와
+   * {@link LauncherCredentialStore.revoke}를 그 트랜잭션 안에서 직접 조합한다.
+   *
    * @throws {LauncherCredentialError} `credentialId`가 존재하지 않으면 (`credential_not_found`).
    */
   rotate(credentialId: string): Promise<IssuedCredential>
-
-  /** 연결을 닫는다. 두 번 불러도 안전하다. */
-  close(): Promise<void>
 }
 
 function isCheckViolation(error: unknown): boolean {
@@ -168,29 +181,24 @@ function unauthenticated(): LauncherCredentialVerification {
   }
 }
 
-function applyPragmas(db: DatabaseSync): void {
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
-  db.exec('PRAGMA journal_mode = WAL')
-  db.exec('PRAGMA synchronous = FULL')
-}
-
-/** `node:sqlite` 위의 {@link LauncherCredentialStore} 구현. 메서드 본문에 `await`가 없다 —
+/** `node:sqlite` 위의 {@link LauncherCredentialStore} 구현 — 연결을 소유하지 않는
+ * 리포지토리다(파일 상단 doc). 메서드 본문에 `await`가 트랜잭션을 가로지르지 않는다 —
  * `src/control/store.ts` 파일 상단 doc과 같은 규율(트랜잭션 구간에 `await`를 넣으면
  * 이벤트 루프가 다른 호출에 제어를 넘겨 트랜잭션이 겹칠 수 있다). */
 class SqliteLauncherCredentialStore implements LauncherCredentialStore {
-  readonly #db: DatabaseSync
+  readonly #database: ControlDatabase
   readonly #randomBytes: RandomBytesFn
   readonly #insert: StatementSync
   readonly #selectSubject: StatementSync
   readonly #delete: StatementSync
-  #closed = false
 
-  constructor(db: DatabaseSync, randomBytes: RandomBytesFn) {
-    this.#db = db
+  constructor(database: ControlDatabase, randomBytes: RandomBytesFn) {
+    const connection = database.connection
+    this.#database = database
     this.#randomBytes = randomBytes
-    this.#insert = db.prepare('INSERT INTO launcher_credentials (credential_hash, subject) VALUES (?, ?)')
-    this.#selectSubject = db.prepare('SELECT subject FROM launcher_credentials WHERE credential_hash = ?')
-    this.#delete = db.prepare('DELETE FROM launcher_credentials WHERE credential_hash = ?')
+    this.#insert = connection.prepare('INSERT INTO launcher_credentials (credential_hash, subject) VALUES (?, ?)')
+    this.#selectSubject = connection.prepare('SELECT subject FROM launcher_credentials WHERE credential_hash = ?')
+    this.#delete = connection.prepare('DELETE FROM launcher_credentials WHERE credential_hash = ?')
   }
 
   async issue(subject: string): Promise<IssuedCredential> {
@@ -226,39 +234,19 @@ class SqliteLauncherCredentialStore implements LauncherCredentialStore {
     // 커넥션에 남는다.
     const token = mintCredentialToken(this.#randomBytes)
     const newCredentialId = hashCredential(token)
-    this.#db.exec('BEGIN IMMEDIATE')
-    try {
+    // 콜백이 동기이므로 `BEGIN`과 `COMMIT` 사이에 `await`가 끼지 않는다 (`./db.ts`의
+    // «트랜잭션은 직렬이다»). 커밋이 돌아온 시점에 새 자격증명이 있고 옛 것은 없다 —
+    // 회전이 한 번의 호출로 표현된다(§1.1). 삽입이 실패하면 옛 자격증명은 롤백으로 그대로
+    // 남는다: 회전 시도 실패가 기존 접근을 조용히 잃게 만들지 않는다.
+    await this.#database.withTransaction(() => {
       const row = this.#selectSubject.get(credentialId)
       if (row === undefined) {
         throw new LauncherCredentialError('credential_not_found')
       }
       this.#insert.run(newCredentialId, columnAsSubject(row['subject']))
       this.#delete.run(credentialId)
-      // 커밋이 돌아온 시점에 새 자격증명이 있고 옛 것은 없다 — 회전이 한 번의 호출로
-      // 표현된다(§1.1). 삽입이 실패하면 옛 자격증명은 롤백으로 그대로 남는다: 회전
-      // 시도 실패가 기존 접근을 조용히 잃게 만들지 않는다.
-      this.#db.exec('COMMIT')
-    } catch (error) {
-      this.#rollbackQuietly()
-      throw error
-    }
+    })
     return { credentialId: newCredentialId, token }
-  }
-
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return
-    }
-    this.#closed = true
-    this.#db.close()
-  }
-
-  #rollbackQuietly(): void {
-    try {
-      this.#db.exec('ROLLBACK')
-    } catch {
-      // 트랜잭션이 이미 열려 있지 않다 (제약 위반이 트랜잭션을 자동으로 접은 경우).
-    }
   }
 }
 
@@ -268,22 +256,15 @@ export type LauncherCredentialStoreOptions = {
 }
 
 /**
- * 스토어를 연다. `path`의 DB가 없으면 만들고, 있으면 그대로 연다.
+ * 리포지토리를 연다 — 제어 평면 DB에 이 계층의 테이블이 없으면 만든다.
  *
- * @param path DB 파일 경로. `:memory:`도 받는다 — `src/control/store.ts`의 로그 스토어와
- *   같은 이유로(라우트가 아직 없다) WAL 강제 확인까지는 하지 않는다.
+ * @param database 연결의 소유자 (`./db.ts`). **경로를 받지 않는다** — DB를 여는 자리는
+ *   `openControlDatabase` 하나다 (mori-nest #130).
  */
 export async function openLauncherCredentialStore(
-  path: string,
+  database: ControlDatabase,
   options: LauncherCredentialStoreOptions = {},
 ): Promise<LauncherCredentialStore> {
-  const db = new DatabaseSync(path)
-  try {
-    applyPragmas(db)
-    db.exec(SCHEMA)
-  } catch (error) {
-    db.close()
-    throw error
-  }
-  return new SqliteLauncherCredentialStore(db, options.randomBytes ?? nodeRandomBytes)
+  database.connection.exec(SCHEMA)
+  return new SqliteLauncherCredentialStore(database, options.randomBytes ?? nodeRandomBytes)
 }

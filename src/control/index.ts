@@ -48,6 +48,20 @@
  * {@link resolveGracePeriodMs} 하나뿐이다. 개시·전이 셋·조회 둘, 그 값을 쓰는 라우트 여섯
  * 전부가 이 헬퍼를 부른다 — 호출마다 `× 1000`을 다시 적으면 그 값이 갈릴 여지가 생긴다.
  *
+ * ## 연결 소유권은 스토어가 아니라 트랜잭션 관리자에 있다 (mori-nest #130 — UoW 조각 1/4)
+ *
+ * 제어 평면의 DB는 **하나**이고, 그 연결을 만드는 자리는 `./db.js`의
+ * {@link openControlDatabase} 하나다. 스토어는 연결을 소유하지 않는다 — 경로가 아니라
+ * {@link ControlDatabase}를 받아 그 위에 문장을 준비하는 **리포지토리**이고, 그래서 `close()`도
+ * 갖지 않는다(닫는 것은 연결의 소유자다). 이 방향을 되돌리면 — 스토어가 다시 자기 파일을 열면 —
+ * `0003 §1.4`의 *"키 기록과 자원 생성은 원자적이다"*를 **표현할 수단 자체가 사라진다**: 파일이
+ * 갈리면 공통 트랜잭션 경계가 없고, 넷 다 WAL이라 `ATTACH`로 묶는 우회도 SQLite가 원자 커밋을
+ * 보장하지 않는다. 근거와 중첩 트랜잭션 정책(«금지»)은 `./db.ts` 상단 doc에 있다.
+ *
+ * 오늘 이 연결로 옮겨온 것은 `./idempotency.js`와 `./credential.js` 둘이다. `./store.js`와
+ * `./workspace-store.js`는 아직 자기 경로로 연다 — **조각 2/4 · 3/4**에서 이관하는 의도된
+ * 과도기다. 라우트를 한 트랜잭션으로 묶어 실패 창을 실제로 닫는 것은 **조각 4/4**다.
+ *
  * ## 한 앱 두 포트로도, 두 앱으로도
  *
  * 전송 엔트리와 같은 이유로 이 모듈도 **프로세스를 모른다** — env를 읽지 않고,
@@ -60,6 +74,13 @@
 import { KeyObject } from 'node:crypto'
 
 import { KEY_ID_PATTERN } from './token.js'
+
+export {
+  openControlDatabase,
+  ControlDatabaseError,
+  type ControlDatabase,
+  type ControlDatabaseFailure,
+} from './db.js'
 
 export {
   parseIdempotencyKey,
