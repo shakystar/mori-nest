@@ -73,7 +73,9 @@ mori는 개발자만이 아니라 **사람들이 협업에 쓰는 하네스**다
 ## 빌드·테스트
 
 Node 22 · TypeScript · pnpm · vitest. **런타임 의존성(`dependencies`)은 0개다** —
-전송 평면을 `node:http` 수준으로 유지한다는 `0002 §4.1-3`의 방향이다.
+전송 평면을 `node:http` 수준으로 유지한다는 `0002 §4.1-3`의 방향이다. **유효 기간**: 상업
+배포 시점의 PostgreSQL 이관([2026-08-10 결정](https://github.com/shakystar/mori-nest/issues/68#issuecomment-5236925659))에서
+이 규칙은 폐기될 수 있다 — 자세한 근거·이식성 하드 룰은 `CLAUDE.md`. 오늘은 유효하다.
 
 ```bash
 pnpm install
