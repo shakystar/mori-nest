@@ -11,15 +11,42 @@
  * ## 저장 형태
  *
  * `node:sqlite` 위에 스키마 둘(`logs`·`log_subjects`)을 둔다. 런타임 의존성은 여전히
- * 0이다(`0002 §4.1-3`). 전송 평면의 이벤트 스토어와는 **별도 DB 파일**이다 — 제어 평면은
- * 전송 평면을 import하지 않는다(`src/control/index.ts` 상단 doc).
+ * 0이다(`0002 §4.1-3`). 이 둘은 **제어 평면 DB 하나**에 산다 — 전송 평면의 이벤트 스토어와는
+ * 여전히 별개이고(제어 평면은 전송 평면을 import하지 않는다, `src/control/index.ts` 상단 doc),
+ * 같은 제어 평면의 멱등·자격증명·작업공간 테이블과는 **같은 DB**다.
  *
- * ## 원자성 — `BEGIN IMMEDIATE` 하나가 mint와 관계 행을 함께 묶는다
+ * ## 원자성 — 성질은 그대로, **트랜잭션을 여는 자리만 바뀐다** (mori-nest #131, UoW 조각 2/4)
  *
  * `§2.1` MUST: *"성공한 요청은 (요청 주체, mint된 로그) 관계 행을 만든다."* 로그만 있고
- * 쌍이 없는 상태는 어떤 주체도 grant받지 못하는 고아 로그이므로, {@link createLog}는 `logs`
- * INSERT와 `log_subjects` INSERT를 한 트랜잭션에 묶는다 — 관계 행 추가가 실패하면 방금 넣은
- * 로그 행도 롤백으로 함께 사라진다.
+ * 쌍이 없는 상태는 어떤 주체도 grant받지 못하는 고아 로그이므로, {@link ControlStore.createLog}는
+ * `logs` INSERT와 `log_subjects` INSERT를 한 트랜잭션에 묶는다 — 관계 행 추가가 실패하면 방금
+ * 넣은 로그 행도 롤백으로 함께 사라진다. **이 규율은 이관 전과 한 글자도 다르지 않다.**
+ *
+ * 바뀐 것은 *누가 그 트랜잭션을 여는가*다. 이 파일은 더 이상 `BEGIN IMMEDIATE`를 자기 손으로
+ * 실행하지 않는다 — 경계를 여는 것은 `./db.ts`의 {@link ControlDatabase.withTransaction}
+ * 하나이고(mori-nest #130), 이 스토어는 그 안에서 문장을 돌리는 **리포지토리**다. 이 파일이
+ * `BEGIN`/`COMMIT`/`ROLLBACK`을 직접 쓰면 그 경계는 `withTransaction`의 중첩 판정이 보지 못하는
+ * 경계가 되고, 그 순간 «이 두 쓰기는 함께 커밋된다»를 제어 평면 전체에서 말할 수 없게 된다.
+ *
+ * 그 대가는 `./db.ts` 상단 doc의 «중첩 금지»가 여기에도 그대로 걸린다는 것이다: 자기
+ * 트랜잭션을 여는 {@link ControlStore.createLog}는 바깥 `withTransaction` 안에서 부를 수 없다
+ * (`nested_transaction`). 로그 mint를 더 큰 쓰기와 한 커밋으로 묶어야 하는 자리(**조각 4/4**의
+ * 라우트 배선)는 이 메서드가 아니라 그것이 쓰는 기본 연산을 그 트랜잭션 안에서 조합한다 —
+ * `credential.ts`의 `rotate()`가 남긴 선례와 같다.
+ *
+ * ## SQLite 고유 API는 이 파일 밖으로 새지 않는다 (이식성)
+ *
+ * `DatabaseSync`·`StatementSync`·확장 결과코드(`SQLITE_CONSTRAINT_*`)처럼 SQLite에만 있는 것은
+ * 전부 이 파일 **안**에 있고, 표면(`ControlStore`·{@link ControlStoreError})으로는 나가지
+ * 않는다 — 나가는 것은 이 스토어가 정한 고정 사유 문자열({@link ControlStoreFailure})뿐이다.
+ * 그래서 다른 엔진으로 옮길 때 고쳐야 할 자리가 이 파일 하나로 좁혀진다. 두 가지가 특히 그렇다:
+ *
+ * - **행 id를 밖으로 돌려주지 않는다.** `lastInsertRowid`(SQLite 고유)를 쓰는 자리가 이 스토어에
+ *   없다 — `logId`는 DB가 아니라 {@link mintLogId}가 만들고, `logs`도 `log_subjects`도 rowid를
+ *   식별자로 삼지 않는다. 이관 시 `RETURNING`으로 바꿔야 할 자리가 애초에 생기지 않는다.
+ * - **커서는 `logId` 그 자체다.** {@link ControlStore.listLogsForSubject}의 `after`는 인코딩된
+ *   불투명 값이 아니라 `0002 §1.1` 알파벳의 `logId`이고, 비교는 SQL의 사전순(`>`)이다 — 엔진이
+ *   바뀌어도 와이어 계약이 따라 바뀌지 않는다.
  *
  * ## mint 재시도와 dedup — 선판정 없이 제약이 판정한다
  *
@@ -30,7 +57,9 @@
  */
 
 import { randomBytes as nodeRandomBytes } from 'node:crypto'
-import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
+import { type SQLOutputValue, type StatementSync } from 'node:sqlite'
+
+import type { ControlDatabase } from './db.js'
 
 /** `SQLITE_CONSTRAINT_PRIMARYKEY`. `logs.log_id` 충돌 — mint가 이미 있는 id를 뽑았다. */
 const SQLITE_CONSTRAINT_PRIMARYKEY = 1555
@@ -40,9 +69,6 @@ const SQLITE_CONSTRAINT_CHECK = 275
 
 /** `SQLITE_CONSTRAINT_FOREIGNKEY`. 존재하지 않는 `log_id`에 관계를 걸려는 시도. */
 const SQLITE_CONSTRAINT_FOREIGNKEY = 787
-
-/** 잠금 대기 상한. 근거는 `src/transport/store.ts`의 같은 값과 같다. */
-const BUSY_TIMEOUT_MS = 5000
 
 /**
  * mint 재시도 상한. 128비트 난수의 충돌 확률은 무시할 수 있으므로, 이 상한에 실제로
@@ -106,35 +132,31 @@ const REVOCATION_COLUMN = { name: 'revoked_at', declaration: 'revoked_at TEXT' }
  * 그대로 재사용한다). 새로 만든 DB에서는 {@link SCHEMA}의 `CREATE TABLE`이 이미 컬럼을
  * 세웠으므로 아무것도 하지 않는다.
  *
- * `BEGIN IMMEDIATE`로 감싸는 이유도 그 파일과 같다 — 같은 구 DB 파일을 두 프로세스가
- * 동시에 여는 창에서 `ALTER TABLE`이 중복 실행되는 것을 막는다. `PRAGMA user_version`류의
- * 스키마 버전 추적은 이 스토어에 아직 없어서 들이지 않는다 — `openControlStore`를 부를
- * 때마다 컬럼 존재 여부를 직접 확인하는 이 함수 하나로 충분하다(호출 빈도가 연결을 열 때
- * 뿐이라 비용도 무시할 수 있다).
+ * 트랜잭션으로 감싸는 이유도 그 파일과 같다 — 같은 구 DB 파일을 두 프로세스가 동시에 여는
+ * 창에서 `ALTER TABLE`이 중복 실행되는 것을 막는다. 다만 그 경계를 여는 것은 이제 이 함수가
+ * 아니라 {@link ControlDatabase.withTransaction}이다(파일 상단 doc «원자성»). 트랜잭션을
+ * 놓는 일(예외 경로의 `ROLLBACK`)도 거기가 하므로 여기에는 그 배선이 없다.
+ *
+ * `PRAGMA user_version`류의 스키마 버전 추적은 이 스토어에 아직 없어서 들이지 않는다 —
+ * {@link openControlStore}를 부를 때마다 컬럼 존재 여부를 직접 확인하는 이 함수 하나로
+ * 충분하다(호출 빈도가 스토어를 열 때뿐이라 비용도 무시할 수 있다).
  */
-function addMissingRevocationColumn(db: DatabaseSync): void {
-  db.exec('BEGIN IMMEDIATE')
-  try {
+async function addMissingRevocationColumn(database: ControlDatabase): Promise<void> {
+  const connection = database.connection
+  // 콜백이 동기다 — `BEGIN`과 `COMMIT` 사이에 `await`가 끼지 않는다 (`./db.ts`의
+  // «트랜잭션은 직렬이다»).
+  await database.withTransaction(() => {
     const existing = new Set(
-      db
+      connection
         .prepare('PRAGMA table_info(logs)')
         .all()
         .map((row) => row['name']),
     )
     if (!existing.has(REVOCATION_COLUMN.name)) {
       // 상수 문자열이고 클라이언트 입력이 아니다 (`ALTER TABLE`은 식별자를 바인딩할 수 없다).
-      db.exec(`ALTER TABLE logs ADD COLUMN ${REVOCATION_COLUMN.declaration}`)
+      connection.exec(`ALTER TABLE logs ADD COLUMN ${REVOCATION_COLUMN.declaration}`)
     }
-    db.exec('COMMIT')
-  } catch (error) {
-    // 예외 경로에서 트랜잭션을 반드시 놓는다 — 붙잡은 채로 올라가면 이 연결은 쓸 수 없다.
-    try {
-      db.exec('ROLLBACK')
-    } catch {
-      // 트랜잭션이 이미 열려 있지 않다.
-    }
-    throw error
-  }
+  })
 }
 
 /** {@link mintLogId}가 받는 난수원의 모양. 테스트가 고정할 수 있도록 주입 지점을 둔다. */
@@ -237,10 +259,19 @@ export type ListLogsForSubjectPage = {
 /**
  * 제어 평면 스토어. 원래 넷(#72)에 `revoke`가 더해져 다섯이다(#92, `§2.6`) — 라우트가
  * 아직 없으므로 HTTP 표현(에러 봉투·상태코드)은 이 표면에 없다.
+ *
+ * **연결을 소유하지 않는 리포지토리다**(파일 상단 doc, mori-nest #131) — 그래서 `close()`가
+ * 없다. 닫는 것은 연결의 소유자, 즉 {@link ControlDatabase.close} 하나다.
  */
 export type ControlStore = {
   /**
    * 새 로그를 mint하고, (요청 주체, 그 로그) 관계 행을 같은 트랜잭션에 만든다 (`§2.1` MUST).
+   *
+   * **자기 트랜잭션을 연다.** 중첩이 금지되어 있으므로(`./db.ts` 상단 doc) 바깥
+   * `withTransaction` 안에서 부르면 `nested_transaction`을 받는다 — 로그 mint를 멱등 키 기록과
+   * 한 커밋으로 묶는 것(`0003 §1.4`)은 **조각 4/4**의 일이고, 그 배선은 이 메서드를 그대로
+   * 부르는 대신 mint와 관계 행 삽입을 바깥 트랜잭션 안에서 조합하는 표면을 먼저 열어야 한다
+   * (`credential.ts`의 `rotate()`가 남긴 것과 같은 선택지다).
    *
    * @throws {ControlStoreError} `subject`가 빈 문자열이면 (`blank_subject`, 그 시도의 로그도
    *   함께 롤백된다) mint가 {@link MAX_MINT_ATTEMPTS}번 전부 기존 id와 충돌하면
@@ -287,8 +318,8 @@ export type ControlStore = {
    * 아래 멱등이 성립한다: 같은 (`subject`, `logId`)에 대한 반복 호출은 **첫 폐기 시각**을
    * 그대로 돌려준다 (갱신하지 않는다).
    *
-   * 전이는 이 호출이 반환하기 전에 내구화된다 — `openControlStore`가 여는 연결에
-   * `synchronous = FULL`이 걸려 있다({@link applyPragmas}). 갱신 자체는 `UPDATE ...
+   * 전이는 이 호출이 반환하기 전에 내구화된다 — `openControlDatabase`(`./db.ts`)가 여는 연결에
+   * `synchronous = FULL`이 걸려 있고 걸렸는지 되읽어 확인한다. 갱신 자체는 `UPDATE ...
    * RETURNING` 한 문장이라(`COALESCE(revoked_at, ?)` — 이미 값이 있으면 덮지 않는다),
    * 같은 (`subject`, `logId`)를 겨눈 동시 호출 여럿이 있어도(같은 프로세스든 다른
    * 프로세스든) 그 문장 자체의 원자성이 "첫 값이 이긴다"를 보장한다 — 별도 트랜잭션으로
@@ -301,9 +332,6 @@ export type ControlStore = {
    *   적이 없으면 (`log_not_found`) — 존재하지 않는 로그와 구분하지 않는다.
    */
   revoke(subject: string, logId: string): Promise<{ readonly revokedAt: string }>
-
-  /** 연결을 닫는다. 두 번 불러도 안전하다. */
-  close(): Promise<void>
 }
 
 function isPrimaryKeyViolation(error: unknown): boolean {
@@ -356,22 +384,22 @@ function resolveLimit(limit: number | undefined): number {
   return limit
 }
 
-function applyPragmas(db: DatabaseSync): void {
-  // `busy_timeout`이 맨 먼저다 — `journal_mode` 전환 자체가 짧게 잠금을 요구한다
-  // (`src/transport/store.ts`의 같은 순서와 같은 이유).
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
-  // `REFERENCES`(외래키)는 이 PRAGMA 없이는 강제되지 않는다 — 켜지 않으면 `grant`가
-  // 존재하지 않는 로그에도 조용히 관계 행을 만든다.
-  db.exec('PRAGMA foreign_keys = ON')
-  db.exec('PRAGMA journal_mode = WAL')
-  db.exec('PRAGMA synchronous = FULL')
-}
+/**
+ * mint 충돌을 {@link ControlDatabase.withTransaction} 콜백 **밖으로** 실어 나르는 표식.
+ *
+ * 콜백이 던지면 트랜잭션이 롤백되고 그 예외가 그대로 올라온다 — 재mint 판정은 그 위에서
+ * 한다. 그때 원래의 `SQLITE_CONSTRAINT_PRIMARYKEY`를 그대로 보고 판정하면 «`logs` 삽입이
+ * 충돌했다»와 «`log_subjects` 삽입이 충돌했다»가 한 값으로 뭉개진다. 어느 문장이 던졌는지는
+ * 그 문장 자리에서만 알 수 있으므로, 그 자리에서 이 표식으로 바꿔 올린다. 이 파일 밖으로
+ * 나가지 않는다.
+ */
+class MintCollision extends Error {}
 
-/** `node:sqlite` 위의 {@link ControlStore} 구현. 메서드 본문에 `await`가 없다 — 트랜잭션
- * 구간에 `await`를 넣으면 이벤트 루프가 다른 호출에 제어를 넘겨 트랜잭션이 겹칠 수 있다
- * (`src/transport/store.ts` 파일 상단 doc과 같은 규율). */
+/** `node:sqlite` 위의 {@link ControlStore} 구현 — 연결을 소유하지 않는 리포지토리다(파일 상단
+ * doc). 트랜잭션 구간을 `await`가 가로지르지 않는다 — 넣으면 이벤트 루프가 다른 호출에 제어를
+ * 넘겨 그 호출의 쓰기가 이 트랜잭션에 든다 (`./db.ts`의 «트랜잭션은 직렬이다»). */
 class SqliteControlStore implements ControlStore {
-  readonly #db: DatabaseSync
+  readonly #database: ControlDatabase
   readonly #randomBytes: RandomBytesFn
   readonly #insertLog: StatementSync
   readonly #insertSubject: StatementSync
@@ -379,70 +407,68 @@ class SqliteControlStore implements ControlStore {
   readonly #selectGrant: StatementSync
   readonly #selectPage: StatementSync
   readonly #revokeLog: StatementSync
-  #closed = false
 
-  constructor(db: DatabaseSync, randomBytes: RandomBytesFn) {
-    this.#db = db
+  constructor(database: ControlDatabase, randomBytes: RandomBytesFn) {
+    const connection = database.connection
+    this.#database = database
     this.#randomBytes = randomBytes
-    this.#insertLog = db.prepare('INSERT INTO logs (log_id) VALUES (?)')
-    this.#insertSubject = db.prepare('INSERT INTO log_subjects (log_id, subject) VALUES (?, ?)')
+    this.#insertLog = connection.prepare('INSERT INTO logs (log_id) VALUES (?)')
+    this.#insertSubject = connection.prepare('INSERT INTO log_subjects (log_id, subject) VALUES (?, ?)')
     // 관계 행의 존재만 본다 — 폐기 여부는 이 질의의 입력이 아니다. `revoke`의 「폐기 이전의
     // 자격만 본다」(§2.6 MUST)가 이 질의를 쓴다.
-    this.#selectMembership = db.prepare('SELECT 1 AS ok FROM log_subjects WHERE subject = ? AND log_id = ?')
+    this.#selectMembership = connection.prepare('SELECT 1 AS ok FROM log_subjects WHERE subject = ? AND log_id = ?')
     // 공개 grant 판정(§3.6) — 관계 행이 있어도 로그가 폐기됐으면 통과하지 못한다 (§2.4·§3.6
     // MUST: 폐기는 이 판정의 입력이다). `isGranted`가 이 질의를 쓴다.
-    this.#selectGrant = db.prepare(
+    this.#selectGrant = connection.prepare(
       'SELECT 1 AS ok FROM log_subjects ls JOIN logs l ON l.log_id = ls.log_id ' +
         'WHERE ls.subject = ? AND ls.log_id = ? AND l.revoked_at IS NULL',
     )
     // WHERE에서 폐기된 로그를 먼저 거른다 — ORDER BY·LIMIT보다 앞이어야 hasMore가 폐기분을
     // 제외한 값이 된다 (§2.4 MUST: 판정 → 정렬 → limit).
-    this.#selectPage = db.prepare(
+    this.#selectPage = connection.prepare(
       'SELECT ls.log_id AS log_id FROM log_subjects ls JOIN logs l ON l.log_id = ls.log_id ' +
         'WHERE ls.subject = ? AND ls.log_id > ? AND l.revoked_at IS NULL ORDER BY ls.log_id ASC LIMIT ?',
     )
     // 이미 값이 있으면 덮지 않는다 — 재폐기가 최초 폐기 시각을 그대로 돌려주는 멱등이
     // 여기서 성립한다(§2.6 MUST). `RETURNING`으로 갱신과 읽기를 한 문장에 묶어, 동시
     // 호출이 있어도 그 문장의 원자성이 "첫 값이 이긴다"를 보장한다(별도 트랜잭션 불필요).
-    this.#revokeLog = db.prepare(
+    this.#revokeLog = connection.prepare(
       'UPDATE logs SET revoked_at = COALESCE(revoked_at, ?) WHERE log_id = ? RETURNING revoked_at',
     )
   }
 
   async createLog(subject: string): Promise<{ readonly logId: string }> {
     for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt++) {
+      // mint를 트랜잭션 **밖**에서 한다 — `mintLogId`는 던질 수 있고(`readEntropy`가 짧은
+      // 난수원을 거부), 시도마다 새 id가 필요하다.
       const logId = mintLogId(this.#randomBytes)
 
-      // `BEGIN IMMEDIATE`인 것은 이 트랜잭션이 반드시 쓰기 때문이다(`src/transport/store.ts`의
-      // 같은 선택과 같은 이유).
-      this.#db.exec('BEGIN IMMEDIATE')
       try {
-        this.#insertLog.run(logId)
+        // 콜백이 동기이므로 `BEGIN`과 `COMMIT` 사이에 `await`가 끼지 않는다. 커밋이 돌아온
+        // 시점에 로그와 관계 행이 함께 있다 — §2.1 MUST가 요구하는 그대로다. 콜백이 던지면
+        // 방금 넣은 로그 행도 롤백으로 함께 사라진다: 로그만 있고 쌍이 없는 고아 로그를
+        // 만들지 않는다 (파일 상단 doc «원자성»).
+        await this.#database.withTransaction(() => {
+          try {
+            this.#insertLog.run(logId)
+          } catch (error) {
+            // §2.1 MUST NOT: 이미 존재하는 id가 나오면 그 로그를 돌려주지 않는다 — 아래에서
+            // 다시 mint한다.
+            throw isPrimaryKeyViolation(error) ? new MintCollision() : error
+          }
+          this.#insertSubject.run(logId, subject)
+        })
       } catch (error) {
-        this.#rollbackQuietly()
-        if (isPrimaryKeyViolation(error)) {
-          // §2.1 MUST NOT: 이미 존재하는 id가 나오면 그 로그를 돌려주지 않는다 — 다시
-          // mint한다. 이 트랜잭션은 아직 아무것도 커밋하지 않았으므로 다음 시도는 깨끗한
-          // 상태에서 시작한다.
+        if (error instanceof MintCollision) {
+          // 이 트랜잭션은 아무것도 커밋하지 않았으므로 다음 시도는 깨끗한 상태에서 시작한다.
           continue
         }
-        throw error
-      }
-
-      try {
-        this.#insertSubject.run(logId, subject)
-        // 커밋이 돌아온 시점에 로그와 관계 행이 함께 있다 — §2.1 MUST가 요구하는 그대로다.
-        this.#db.exec('COMMIT')
-        return { logId }
-      } catch (error) {
-        // 관계 행 추가가 실패하면 방금 넣은 로그 행도 롤백으로 함께 사라진다 — 로그만 있고
-        // 쌍이 없는 고아 로그를 만들지 않는다 (파일 상단 doc "원자성").
-        this.#rollbackQuietly()
         if (isCheckViolation(error)) {
           throw new ControlStoreError('blank_subject')
         }
         throw error
       }
+      return { logId }
     }
     throw new ControlStoreError('mint_exhausted')
   }
@@ -496,22 +522,6 @@ class SqliteControlStore implements ControlStore {
     const row = this.#revokeLog.get(new Date().toISOString(), logId)
     return { revokedAt: columnAsRevokedAt(row?.['revoked_at']) }
   }
-
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return
-    }
-    this.#closed = true
-    this.#db.close()
-  }
-
-  #rollbackQuietly(): void {
-    try {
-      this.#db.exec('ROLLBACK')
-    } catch {
-      // 트랜잭션이 이미 열려 있지 않다 (제약 위반이 트랜잭션을 자동으로 접은 경우).
-    }
-  }
 }
 
 export type ControlStoreOptions = {
@@ -520,21 +530,19 @@ export type ControlStoreOptions = {
 }
 
 /**
- * 스토어를 연다. `path`의 DB가 없으면 만들고, 있으면 그대로 연다.
+ * 리포지토리를 연다 — 제어 평면 DB에 이 계층의 테이블이 없으면 만들고, 구 스키마면 보정한다
+ * ({@link addMissingRevocationColumn}).
  *
- * @param path DB 파일 경로. `:memory:`도 받는다 — 전송 스토어의 이벤트 로그와 달리 이
- *   스토어에는 `0002 §2.2`급 내구성 MUST가 걸려 있지 않으므로(제어 평면 라우트가 아직
- *   없다), WAL 강제 확인까지는 하지 않는다.
+ * @param database 연결의 소유자 (`./db.ts`). **경로를 받지 않는다** — DB를 여는 자리는
+ *   `openControlDatabase` 하나이고, PRAGMA(`foreign_keys`·WAL·`synchronous = FULL`)도 거기가
+ *   건다 (mori-nest #130·#131). 실패해도 여기서 연결을 닫지 않는다: 이 연결은 이 리포지토리의
+ *   것이 아니다.
  */
-export async function openControlStore(path: string, options: ControlStoreOptions = {}): Promise<ControlStore> {
-  const db = new DatabaseSync(path)
-  try {
-    applyPragmas(db)
-    db.exec(SCHEMA)
-    addMissingRevocationColumn(db)
-  } catch (error) {
-    db.close()
-    throw error
-  }
-  return new SqliteControlStore(db, options.randomBytes ?? nodeRandomBytes)
+export async function openControlStore(
+  database: ControlDatabase,
+  options: ControlStoreOptions = {},
+): Promise<ControlStore> {
+  database.connection.exec(SCHEMA)
+  await addMissingRevocationColumn(database)
+  return new SqliteControlStore(database, options.randomBytes ?? nodeRandomBytes)
 }
