@@ -86,9 +86,27 @@ const CLOSE_OUTCOMES = new Set(['flushed', 'discarded'])
 const REVOKE_WORKSPACE_BODY_FIELDS = ['reason']
 
 /** `GET /v1/workspaces`(`§4.6`)의 쿼리 파라미터 이름 전부. `§1.3`의 "정의되지 않은 최상위
- * 필드" 규율을 쿼리에 적용한다(이슈 mori-nest #115 본문) — 이 셋 밖의 이름이 있으면
- * `400 malformed_request`다. */
+ * 필드" 규율을 쿼리에 적용한다(`0003 §1.3` 쿼리 판정 규율, mori-nest #115·#123) — 이 셋
+ * 밖의 이름이 있으면 `400 malformed_request`다. */
 const LIST_WORKSPACES_QUERY_FIELDS = new Set(['state', 'after', 'limit'])
+
+/** `GET /v1/logs`(`§2.4`)의 쿼리 파라미터 이름 전부. {@link LIST_WORKSPACES_QUERY_FIELDS}와
+ * 같은 규율, 허용 이름 집합만 다르다(`0003 §1.3`, mori-nest #123). */
+const LIST_LOGS_QUERY_FIELDS = new Set(['after', 'limit'])
+
+/** 쿼리에 `allowedFields` 밖의 이름이 있으면 `400 malformed_request`다(`0003 §1.3` 쿼리
+ * 판정 규율 1번, mori-nest #123). `listLogs`·`listWorkspaces` 둘 다 이 함수 하나로 판정한다
+ * — 허용 이름 집합만 라우트마다 다르다. */
+function checkUnrecognizedQueryFields(
+  query: string,
+  allowedFields: ReadonlySet<string>,
+): { readonly ok: true } | { readonly ok: false; readonly error: ErrorResponse } {
+  const unknownFields = [...new Set(new URLSearchParams(query).keys())].filter((key) => !allowedFields.has(key))
+  if (unknownFields.length > 0) {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'unrecognized query parameter') }
+  }
+  return { ok: true }
+}
 
 /** Node 표준 HTTP 서버가 넘겨주는 요청 객체와 모양만 맞는 요청 입력. `src/transport/request.ts`의
  * `RawRequest`와 같은 모양이지만 독립적으로 정의한다 — import하면 그 자체로 평면 경계가 깨진다. */
@@ -280,18 +298,25 @@ function parseAfter(query: string): { readonly ok: true; readonly value?: string
 }
 
 /**
- * `limit` 쿼리 (`§2.4`). **거부하지 않는다** — `0003 §1.3`의 표에 이 판정을 위한 code가
- * 없다(이슈 본문의 owner 판단). 형식이 깨졌거나(비숫자·음수·소수·`0`) 반복 쿼리면 값이
- * 없는 것으로 접는다 — 부르는 쪽(다음 조각의 `listLogsForSubject` 호출)이 `undefined`를
- * 받으면 `DEFAULT_PAGE_LIMIT`을 적용하므로(`src/control/store.ts`의 `resolveLimit`), 여기서
- * 새 에러 code를 만들어 스펙이 아직 정하지 않은 자리를 앞질러 정하지 않는다.
+ * `limit` 쿼리 형식 판정 — 반복이거나 십진 정수 문자열이 아니면 `400 malformed_request`다
+ * (`0003 §1.3` 쿼리 판정 규율, mori-nest #123). 값이 없는 것으로 접지 않는다 — `§1.3`에
+ * `limit` 전용 code가 없어 이 code로 합류할 뿐, 형식이 깨진 요청은 거부한다.
+ * `listLogs`·`listWorkspaces` 둘 다 같은 판정이므로 한 함수로 공유한다.
  */
-function parseLimit(query: string): number | undefined {
+function checkLimitQuery(
+  query: string,
+): { readonly ok: true; readonly value?: number } | { readonly ok: false; readonly error: ErrorResponse } {
   const raw = queryValue(query, 'limit')
-  if (!raw.ok || raw.value === null || !LIMIT_PATTERN.test(raw.value)) {
-    return undefined
+  if (!raw.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'limit query parameter repeated') }
   }
-  return Number(raw.value)
+  if (raw.value === null) {
+    return { ok: true }
+  }
+  if (!LIMIT_PATTERN.test(raw.value)) {
+    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'limit must be a positive decimal integer') }
+  }
+  return { ok: true, value: Number(raw.value) }
 }
 
 /** `listLogs`의 판정 결과를 짓는다. `exactOptionalPropertyTypes`(tsconfig) 아래서는
@@ -307,16 +332,14 @@ function listLogsRequest(subject: string, after: string | undefined, limit: numb
 }
 
 /**
- * `GET /v1/workspaces`의 쿼리 (`§4.6`) — `listLogs`의 `after`·`limit`과 다른 점 셋(이슈
- * mori-nest #115 본문):
+ * `GET /v1/workspaces`의 쿼리 (`§4.6`) — 정의되지 않은 파라미터 검사({@link checkUnrecognizedQueryFields})와
+ * `limit` 판정({@link checkLimitQuery})은 `listLogs`({@link checkListLogsQuery})와 같은 함수를
+ * 공유한다(mori-nest #123). 남는 차이는 하나:
  *
- * 1. **정의되지 않은 파라미터가 있으면 `400 malformed_request`다** ({@link LIST_WORKSPACES_QUERY_FIELDS}
- *    — `§1.3`의 최상위 필드 규율을 쿼리에 적용한다).
- * 2. **`limit`이 십진 정수 문자열이 아니면 거부한다** (`400 malformed_request`) — {@link parseLimit}
- *    처럼 조용히 접지 않는다. 이 조각의 판단이다.
- * 3. **`state`·`after`는 값을 판정하지 않는다** — 형식이 무엇이든 문자열로 그대로 싣는다.
- *    유효성은 스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다(`./workspace-store.js`)
- *    — 판정을 두 곳에 두면 갈린다.
+ * - **`state`·`after`는 값을 판정하지 않는다** — 형식이 무엇이든 문자열로 그대로 싣는다.
+ *   `listLogs`의 `after`와 달리 `LOG_ID_PATTERN` 형식을 보지 않는다 — 반복만 거부한다.
+ *   유효성은 스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다(`./workspace-store.js`)
+ *   — 판정을 두 곳에 두면 갈린다.
  *
  * 반복 쿼리(같은 이름이 둘 이상)는 값을 하나로 정할 수 없다는 점이 {@link atMostOne}의
  * 판정과 같지만, code는 파라미터별로 갈린다: `state`는 `400 invalid_state_filter`, `after`는
@@ -328,11 +351,9 @@ function checkListWorkspacesQuery(
 ):
   | { readonly ok: true; readonly state?: string; readonly after?: string; readonly limit?: number }
   | { readonly ok: false; readonly error: ErrorResponse } {
-  const unknownFields = [...new Set(new URLSearchParams(query).keys())].filter(
-    (key) => !LIST_WORKSPACES_QUERY_FIELDS.has(key),
-  )
-  if (unknownFields.length > 0) {
-    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'unrecognized query parameter') }
+  const fieldsCheck = checkUnrecognizedQueryFields(query, LIST_WORKSPACES_QUERY_FIELDS)
+  if (!fieldsCheck.ok) {
+    return fieldsCheck
   }
 
   const state = queryValue(query, 'state')
@@ -343,27 +364,52 @@ function checkListWorkspacesQuery(
   if (!after.ok) {
     return { ok: false, error: errorResponse(ErrorCodes.invalid_cursor, 'after query parameter repeated') }
   }
-  const limitRaw = queryValue(query, 'limit')
-  if (!limitRaw.ok) {
-    return { ok: false, error: errorResponse(ErrorCodes.malformed_request, 'limit query parameter repeated') }
-  }
-
-  let limit: number | undefined
-  if (limitRaw.value !== null) {
-    if (!LIMIT_PATTERN.test(limitRaw.value)) {
-      return {
-        ok: false,
-        error: errorResponse(ErrorCodes.malformed_request, 'limit must be a positive decimal integer'),
-      }
-    }
-    limit = Number(limitRaw.value)
+  const limitCheck = checkLimitQuery(query)
+  if (!limitCheck.ok) {
+    return limitCheck
   }
 
   return {
     ok: true,
     ...(state.value === null ? {} : { state: state.value }),
     ...(after.value === null ? {} : { after: after.value }),
-    ...(limit === undefined ? {} : { limit }),
+    ...(limitCheck.value === undefined ? {} : { limit: limitCheck.value }),
+  }
+}
+
+/**
+ * `GET /v1/logs`의 쿼리 (`§2.4`) — `0003 §1.3` 쿼리 판정 규율을 이 라우트에 적용한다
+ * (mori-nest #123, `checkListWorkspacesQuery`가 세운 모양을 그대로 재사용한다):
+ *
+ * 1. **정의되지 않은 파라미터가 있으면 `400 malformed_request`다** ({@link LIST_LOGS_QUERY_FIELDS},
+ *    {@link checkUnrecognizedQueryFields}로 `listWorkspaces`와 같은 함수에서 판정한다).
+ * 2. **`after`는 기존 그대로다** — 해석 불가(형식 위반·반복)면 `400 invalid_cursor`
+ *    ({@link parseAfter} doc, 회귀 없음).
+ * 3. **`limit`이 반복이거나 십진 정수 문자열이 아니면 거부한다** (`400 malformed_request`,
+ *    {@link checkLimitQuery}) — 예전처럼 `DEFAULT_PAGE_LIMIT`으로 접지 않는다.
+ */
+function checkListLogsQuery(
+  query: string,
+): { readonly ok: true; readonly after?: string; readonly limit?: number } | { readonly ok: false; readonly error: ErrorResponse } {
+  const fieldsCheck = checkUnrecognizedQueryFields(query, LIST_LOGS_QUERY_FIELDS)
+  if (!fieldsCheck.ok) {
+    return fieldsCheck
+  }
+
+  const after = parseAfter(query)
+  if (!after.ok) {
+    return { ok: false, error: errorResponse(ErrorCodes.invalid_cursor, 'after cannot be interpreted as a cursor') }
+  }
+
+  const limitCheck = checkLimitQuery(query)
+  if (!limitCheck.ok) {
+    return limitCheck
+  }
+
+  return {
+    ok: true,
+    ...(after.value === undefined ? {} : { after: after.value }),
+    ...(limitCheck.value === undefined ? {} : { limit: limitCheck.value }),
   }
 }
 
@@ -554,8 +600,11 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *    `.../close`·`.../revoke` 중 하나인가. 아니면 `400 malformed_request`.
  * 2. **메서드** — `checkMethod`. 아니면 `405` + `Allow`.
  * 3. **라우트별 문법**:
- *    - `listLogs`: `after` 형식(`§2.4`) — 해석 불가면 `400 invalid_cursor`. `limit`은
- *      거부하지 않는다({@link parseLimit} doc).
+ *    - `listLogs`: 쿼리 문법(`§2.4`, {@link checkListLogsQuery} doc, mori-nest #123) —
+ *      정의되지 않은 파라미터는 `400 malformed_request`(`listWorkspaces`와 같은 함수로
+ *      판정한다). `after` 형식은 그대로다 — 해석 불가면 `400 invalid_cursor`. `limit`은
+ *      반복이거나 십진 정수 문자열이 아니면 `400 malformed_request`다({@link checkLimitQuery}
+ *      doc) — 예전처럼 조용히 접지 않는다.
  *    - `createLog`: 본문 형태(`§2.1`·`§2.2`) 그다음 `Idempotency-Key` 형식(`§1.4`).
  *    - `getLog`: 없음 — 경로의 `logId`를 그대로 싣는다. grant 판정은 이 게이트의 일이
  *      아니다(다음 조각).
@@ -573,11 +622,11 @@ function unauthenticated(): Extract<ControlRequestResult, { readonly ok: false }
  *    - `revokeWorkspace`: 본문 형태(`§4.5` — `reason`이 있는데 문자열이 아니면
  *      `400 malformed_request`, `revokeLog`와 같은 문법). `Idempotency-Key`를 요구하지 않는다.
  *    - `listWorkspaces`: 쿼리 문법(`§4.6`, {@link checkListWorkspacesQuery} doc) —
- *      정의되지 않은 파라미터는 `400 malformed_request`. 반복 파라미터는 이름별로 code가
- *      갈린다: `state` 반복은 `400 invalid_state_filter`, `after` 반복은 `400 invalid_cursor`,
- *      `limit` 반복(또는 십진 정수가 아닌 `limit`)은 `400 malformed_request`(`listLogs`의
- *      `limit`과 달리 조용히 접지 않는다, 이 조각의 판단). `state`·`after`의 **값**은 판정하지
- *      않는다 — 유효성은 스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다.
+ *      정의되지 않은 파라미터는 `400 malformed_request`(`listLogs`와 같은 함수로 판정한다).
+ *      반복 파라미터는 이름별로 code가 갈린다: `state` 반복은 `400 invalid_state_filter`,
+ *      `after` 반복은 `400 invalid_cursor`, `limit` 반복(또는 십진 정수가 아닌 `limit`)은
+ *      `400 malformed_request`. `state`·`after`의 **값**은 판정하지 않는다 — 유효성은
+ *      스토어가 `invalid_state_filter`·`invalid_cursor`로 답한다.
  *    - `getWorkspace`: 없음 — 경로의 `workspaceId`를 그대로 싣는다. 존재 판정은 이 게이트의
  *      일이 아니다(다음 조각).
  *    - **`heartbeatWorkspace`·`closeWorkspace`·`revokeWorkspace`·`getWorkspace` 넷 다
@@ -818,17 +867,16 @@ export async function verifyControlRequest(
   }
 
   if (request.method === 'GET') {
-    const after = parseAfter(query)
-    if (!after.ok) {
-      return reject(400, errorResponse(ErrorCodes.invalid_cursor, 'after cannot be interpreted as a cursor'))
+    const queryCheck = checkListLogsQuery(query)
+    if (!queryCheck.ok) {
+      return reject(400, queryCheck.error)
     }
-    const limit = parseLimit(query)
 
     const authResult = await authenticate(request, credentials)
     if (!authResult.ok) {
       return authResult
     }
-    return { ok: true, request: listLogsRequest(authResult.subject, after.value, limit) }
+    return { ok: true, request: listLogsRequest(authResult.subject, queryCheck.after, queryCheck.limit) }
   }
 
   // request.method === 'POST' (checkMethod가 이미 POST|GET으로 좁혔다).
