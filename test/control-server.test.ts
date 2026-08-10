@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { openLauncherCredentialStore, type LauncherCredentialStore } from '../src/control/credential.js'
+import { openControlDatabase, type ControlDatabase } from '../src/control/db.js'
 import { openIdempotencyStore, type IdempotencyStore } from '../src/control/idempotency.js'
 import type { ControlConfig } from '../src/control/index.js'
 import { createControlServer, type ControlDiagnostic } from '../src/control/server.js'
@@ -144,6 +145,8 @@ const VERIFICATION_KEYS = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
 
 describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3·§4.4·§4.5·§4.6)', () => {
   let dir: string
+  /** 멱등 계층과 자격증명이 공유하는 제어 평면 DB (mori-nest #130). 닫는 것도 이쪽이다. */
+  let database: ControlDatabase
   let store: ControlStore
   let idempotency: IdempotencyStore
   let credentials: LauncherCredentialStore
@@ -274,8 +277,9 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'mori-nest-control-server-'))
     store = await openControlStore(join(dir, 'control.db'))
-    idempotency = await openIdempotencyStore(join(dir, 'idempotency.db'))
-    credentials = await openLauncherCredentialStore(join(dir, 'credential.db'))
+    database = await openControlDatabase(join(dir, 'control-plane.db'))
+    idempotency = await openIdempotencyStore(database)
+    credentials = await openLauncherCredentialStore(database)
     workspaces = await openWorkspaceStore(join(dir, 'workspace.db'))
     tokenA = (await credentials.issue('subject-a')).token
     tokenB = (await credentials.issue('subject-b')).token
@@ -300,9 +304,8 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
       })
     }
     extraServers.length = 0
-    await idempotency.close()
+    await database.close()
     await store.close()
-    await credentials.close()
     await workspaces.close()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -420,9 +423,10 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
       // 안의 두 요청으로는 이 자리가 시험되지 않는 이유는 자식 파일 머리말에 적혀 있다.
       const raceDir = join(dir, 'race')
       mkdirSync(raceDir)
-      const raceCredentials = await openLauncherCredentialStore(join(raceDir, 'credential.db'))
+      const raceDatabase = await openControlDatabase(join(raceDir, 'control-plane.db'))
+      const raceCredentials = await openLauncherCredentialStore(raceDatabase)
       const raceToken = (await raceCredentials.issue('subject-race')).token
-      await raceCredentials.close()
+      await raceDatabase.close()
 
       const startAt = Date.now() + 1500
       const rounds = 5

@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest'
 
 import { openLauncherCredentialStore } from '../src/control/credential.js'
 import { verifyControlRequest, type RawRequest } from '../src/control/request.js'
+import { openTestControlDatabase } from './control-db.js'
 import { baseClaims, mint } from './workspace-token.js'
 
 function post(token: string, headers: Readonly<Record<string, string>> = {}): RawRequest {
@@ -23,7 +24,7 @@ function post(token: string, headers: Readonly<Record<string, string>> = {}): Ra
 
 describe('verifyControlRequest — POST /v1/logs', () => {
   it('① 유효 자격증명 + 빈 본문 + 유효 키 → 성공 판정, 주체가 발급 시 준 주체와 같다', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-a')
 
     const result = await verifyControlRequest(post(token), '{}', store)
@@ -38,7 +39,7 @@ describe('verifyControlRequest — POST /v1/logs', () => {
   })
 
   it('② 작업공간 토큰 문자열을 Bearer로 제시하면 판정 함수 경유로도 401이다 (§1.1)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     await store.issue('subject-b')
     const workspaceToken = mint(baseClaims())
 
@@ -51,7 +52,7 @@ describe('verifyControlRequest — POST /v1/logs', () => {
   })
 
   it('③ 폐기된 자격증명 → 401', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { credentialId, token } = await store.issue('subject-c')
     await store.revoke(credentialId)
 
@@ -63,7 +64,7 @@ describe('verifyControlRequest — POST /v1/logs', () => {
   })
 
   it('④ {"logId":"x","zzz":1} → 400 client_minted_id — malformed_request보다 우선한다 (§2.2)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-d')
 
     const result = await verifyControlRequest(post(token), JSON.stringify({ logId: 'x', zzz: 1 }), store)
@@ -75,7 +76,7 @@ describe('verifyControlRequest — POST /v1/logs', () => {
   })
 
   it('⑤ 정의되지 않은 최상위 필드만 있으면 → 400 malformed_request', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-e')
 
     const result = await verifyControlRequest(post(token), JSON.stringify({ zzz: 1 }), store)
@@ -87,7 +88,7 @@ describe('verifyControlRequest — POST /v1/logs', () => {
   })
 
   it('⑥ Idempotency-Key가 없으면 → 400 missing_idempotency_key', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-f')
 
     const result = await verifyControlRequest(
@@ -105,7 +106,7 @@ describe('verifyControlRequest — POST /v1/logs', () => {
 
 describe('verifyControlRequest — GET /v1/logs', () => {
   it('⑦ after를 해석할 수 없으면 → 400 invalid_cursor (§2.4)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-g')
 
     const result = await verifyControlRequest(
@@ -121,7 +122,7 @@ describe('verifyControlRequest — GET /v1/logs', () => {
   })
 
   it('⑧ DELETE /v1/logs → 405 method_not_allowed (§0)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
 
     const result = await verifyControlRequest({ method: 'DELETE', url: '/v1/logs', headers: {} }, '', store)
 
@@ -132,7 +133,7 @@ describe('verifyControlRequest — GET /v1/logs', () => {
   })
 
   it('⑲ 정의되지 않은 파라미터·형식 오류 limit·반복 limit → 400 malformed_request, after 반복은 여전히 400 invalid_cursor (§1.3, §2.4, GET /v1/workspaces와 통일, mori-nest #123)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-g')
     const get = async (url: string) =>
       verifyControlRequest({ method: 'GET', url, headers: { authorization: `Bearer ${token}` } }, '', store)
@@ -161,7 +162,7 @@ describe('verifyControlRequest — POST /v1/logs/{logId}/revoke', () => {
   }
 
   it('⑩ 유효 자격증명 + reason 문자열 → revokeLog 판정, reason이 실린다 (§2.6)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-i')
 
     const result = await verifyControlRequest(revokeReq(token, 'log-1'), JSON.stringify({ reason: 'stale' }), store)
@@ -176,7 +177,7 @@ describe('verifyControlRequest — POST /v1/logs/{logId}/revoke', () => {
   })
 
   it('⑪ reason이 문자열이 아니면 → 400 malformed_request (§2.6)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-j')
 
     const result = await verifyControlRequest(revokeReq(token, 'log-1'), JSON.stringify({ reason: 123 }), store)
@@ -198,7 +199,7 @@ describe('verifyControlRequest — POST /v1/workspaces', () => {
   }
 
   it('⑫ 유효 자격증명 + { logs: ["log-a"] } + Idempotency-Key → openWorkspace 판정, logs·idempotencyKey가 실리고 replicaId를 안 보냈으면 그 필드가 없다 (§4.2)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-k')
 
     const result = await verifyControlRequest(openReq(token), JSON.stringify({ logs: ['log-a'] }), store)
@@ -214,7 +215,7 @@ describe('verifyControlRequest — POST /v1/workspaces', () => {
   })
 
   it('⑬ logs가 빈 배열이면 → 400 empty_scope, logs 원소가 LOG_ID_PATTERN 위반이면 → 400 invalid_log_id (§4.2)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-l')
 
     const emptyResult = await verifyControlRequest(openReq(token), JSON.stringify({ logs: [] }), store)
@@ -231,7 +232,7 @@ describe('verifyControlRequest — POST /v1/workspaces', () => {
   })
 
   it('⑭ Idempotency-Key가 없으면 → 400 missing_idempotency_key (§4.2)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-m')
 
     const result = await verifyControlRequest(
@@ -247,7 +248,7 @@ describe('verifyControlRequest — POST /v1/workspaces', () => {
   })
 
   it('⑮ POST·GET 밖의 메서드 → 405, Allow: POST, GET (§4.2·§4.6 — 컬렉션 경로는 개시와 목록 조회를 겸한다)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
 
     const result = await verifyControlRequest({ method: 'DELETE', url: '/v1/workspaces', headers: {} }, '', store)
 
@@ -265,7 +266,7 @@ describe('verifyControlRequest — POST /v1/workspaces/{workspaceId}/heartbeat|c
   }
 
   it('⑯ 세 경로가 각각 자기 route로 판별되고 workspaceId가 뽑힌다 (§4.3~§4.5)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-n')
 
     const heartbeat = await verifyControlRequest(subReq(token, 'ws-1', 'heartbeat'), '{}', store)
@@ -295,7 +296,7 @@ describe('verifyControlRequest — POST /v1/workspaces/{workspaceId}/heartbeat|c
   })
 
   it('⑰ close의 outcome 부재·두 값 밖·타입 불일치가 각각 400 malformed_request다 (§4.4)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-o')
 
     for (const body of [JSON.stringify({}), JSON.stringify({ outcome: 'other' }), JSON.stringify({ outcome: 1 })]) {
@@ -308,7 +309,7 @@ describe('verifyControlRequest — POST /v1/workspaces/{workspaceId}/heartbeat|c
   })
 
   it('⑱ heartbeat 본문에 정의되지 않은 필드가 있으면 400, revoke의 reason은 문자열이면 통과하되 산출물에 실리지 않는다 (§4.3·§4.5)', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { token } = await store.issue('subject-p')
 
     const heartbeat = await verifyControlRequest(subReq(token, 'ws-1', 'heartbeat'), JSON.stringify({ zzz: 1 }), store)
@@ -328,7 +329,7 @@ describe('verifyControlRequest — POST /v1/workspaces/{workspaceId}/heartbeat|c
 
 describe('실패 판정 봉투', () => {
   it('⑨ 자격증명 값·해시가 실리지 않는다', async () => {
-    const store = await openLauncherCredentialStore(':memory:')
+    const store = await openLauncherCredentialStore(await openTestControlDatabase())
     const { credentialId, token } = await store.issue('subject-h')
     await store.revoke(credentialId)
 

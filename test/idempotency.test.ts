@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { openControlDatabase, type ControlDatabase } from '../src/control/db.js'
 import { openIdempotencyStore, parseIdempotencyKey, type IdempotencyStore } from '../src/control/idempotency.js'
 
 /**
@@ -64,16 +65,20 @@ function runRaceChild(
 describe('제어 평면 멱등성 계층 (0003 §1.4)', () => {
   let dir: string
   let dbPath: string
+  let database: ControlDatabase
   let store: IdempotencyStore
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'mori-nest-idempotency-'))
-    dbPath = join(dir, 'idempotency.db')
-    store = await openIdempotencyStore(dbPath)
+    // 파일 하나가 제어 평면 DB 전체다 (mori-nest #130) — 이 계층은 그 위의 리포지토리이고
+    // 연결을 소유하지 않으므로, 닫는 것도 스토어가 아니라 아래 `database`다.
+    dbPath = join(dir, 'control-plane.db')
+    database = await openControlDatabase(dbPath)
+    store = await openIdempotencyStore(database)
   })
 
   afterEach(async () => {
-    await store.close()
+    await database.close()
     rmSync(dir, { recursive: true, force: true })
   })
 
