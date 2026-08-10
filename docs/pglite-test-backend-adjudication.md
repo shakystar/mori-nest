@@ -1,5 +1,19 @@
 # PGlite(`@electric-sql/pglite`) 테스트 백엔드 검토 — 산정
 
+## 판정 — 기각 권고
+
+**기각 권고.** PGlite의 쿼리 API(`.query`·`.exec`·`.transaction`)가 예외 없이 비동기이고
+동기 폴백이 없어, #133이 세운 「트랜잭션 콜백은 동기다」 불변식(`src/control/db.ts:67-81`)을
+PGlite 위에서 구현할 수 없다 — 시험이 검사하는 성질이 생산 코드의 성질과 달라진다.
+근거 전문은 §Q5와 문서 말미 「판정」 절에 있다. 영구 기각이 아니다(재개 조건도 같은 절).
+
+| 자리 | 인용 | PGlite에서 어떻게 되는가 | 판정 |
+|---|---|---|---|
+| (a) `DatabaseSync`·`exec`·`prepare` | `src/control/db.ts:93`, `:164-170`, `:172-173` | `.query`/`.exec`만 있고 `prepare` 대응물이 없다 — 셋 다 `Promise` 반환 | 부딪힌다 (§Q1) |
+| (b) `BEGIN IMMEDIATE` 잠금 의미 | `db.ts:213`, `:136-139` | 구문 자체가 PostgreSQL에 없고, 단일 연결이라 `SQLITE_BUSY` 경합이 재현되지 않는다 | 부딪힌다 (§Q2) |
+| (c) `run()` 반환값 `changes` | `workspace-store.ts:1125-1129`, `idempotency.ts:296-297`, `:326-327` | `affectedRows`(옵셔널)가 같은 뜻 — 이름 치환 + `?? 0` 한 줄 | 부딪히지 않는다 (§Q3) |
+| (d) `SQLITE_*` 오류 코드 | `store.ts:67-74`, `:375-395`, `server.ts:219-223`, `:229-233`, `:240-244` | SQLSTATE 문자열이라 상수·타입·`0xff` 마스킹이 통째로 갈린다 | 부딪힌다 (§Q4) |
+
 **이것은 스펙이 아니다.** `docs/design/0000`–`0003`이 스펙이고, 이 문서는 *PGlite를 시험
 백엔드로 갈아 끼우면 무엇이 부딪히는가*를 재는 산정이다. 그래서 `docs/design/` 밖에 있고
 번호도 붙이지 않는다 — `replica-identity-and-join-adjudication.md`·
