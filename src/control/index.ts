@@ -133,7 +133,12 @@ export {
   type RawRequest,
 } from './request.js'
 
-export { createControlServer, type ControlServerOptions } from './server.js'
+export {
+  createControlServer,
+  type ControlDiagnostic,
+  type ControlDiagnosticSite,
+  type ControlServerOptions,
+} from './server.js'
 
 /** 이 평면의 설정 스키마가 정의한 최상위 필드 **전부**. */
 const CONTROL_CONFIG_FIELDS = [

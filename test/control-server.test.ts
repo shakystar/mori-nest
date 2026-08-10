@@ -8,12 +8,12 @@ import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { openLauncherCredentialStore, type LauncherCredentialStore } from '../src/control/credential.js'
 import { openIdempotencyStore, type IdempotencyStore } from '../src/control/idempotency.js'
 import type { ControlConfig } from '../src/control/index.js'
-import { createControlServer } from '../src/control/server.js'
+import { createControlServer, type ControlDiagnostic } from '../src/control/server.js'
 import { openControlStore, type ControlStore } from '../src/control/store.js'
 import { openWorkspaceStore, type WorkspaceStore } from '../src/control/workspace-store.js'
 import { createVerificationKeySet, verifyWorkspaceToken } from '../src/transport/token.js'
@@ -940,35 +940,65 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   })
 
   it('㉘ findForkAdvisory가 던져도 하트비트는 200이고 forkAdvisory 키만 빠진다 (§4.10 MUST NOT)', async () => {
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
-    try {
-      const failing = createControlServer({
-        store,
-        idempotency,
-        credentials,
-        workspaces: withFailingForkAdvisory(workspaces),
-        config: CONFIG,
-      })
-      await new Promise<void>((resolve) => {
-        failing.listen(0, '127.0.0.1', resolve)
-      })
-      extraServers.push(failing)
-      const at = `http://127.0.0.1:${String((failing.address() as AddressInfo).port)}`
+    const diagnostics: ControlDiagnostic[] = []
+    const failing = createControlServer({
+      store,
+      idempotency,
+      credentials,
+      workspaces: withFailingForkAdvisory(workspaces),
+      config: CONFIG,
+      onDiagnostic: (diagnostic) => {
+        diagnostics.push(diagnostic)
+      },
+    })
+    await new Promise<void>((resolve) => {
+      failing.listen(0, '127.0.0.1', resolve)
+    })
+    extraServers.push(failing)
+    const at = `http://127.0.0.1:${String((failing.address() as AddressInfo).port)}`
 
-      const logs = [await mintedLogId(tokenA, 'fork-fail-log')]
-      const opened = bodyOf(await openWorkspace(tokenA, 'fork-fail-key', JSON.stringify({ logs }), at)) as OpenReply
+    const logs = [await mintedLogId(tokenA, 'fork-fail-log')]
+    const opened = bodyOf(await openWorkspace(tokenA, 'fork-fail-key', JSON.stringify({ logs }), at)) as OpenReply
 
-      const reply = await heartbeat(opened.workspaceId, tokenA, at)
+    const reply = await heartbeat(opened.workspaceId, tokenA, at)
 
-      expect(reply.status).toBe(200)
-      const body = bodyOf(reply) as HeartbeatReply
-      expect('forkAdvisory' in body).toBe(false)
-      // 나머지 필드는 판정 실패와 무관하게 정상 갱신된다.
-      expect(body.state).toBe('active')
-      expect(body.scope).toEqual(logs)
-      expect(consoleError).toHaveBeenCalledTimes(1)
-    } finally {
-      consoleError.mockRestore()
-    }
+    expect(reply.status).toBe(200)
+    const body = bodyOf(reply) as HeartbeatReply
+    expect('forkAdvisory' in body).toBe(false)
+    // 나머지 필드는 판정 실패와 무관하게 정상 갱신된다.
+    expect(body.state).toBe('active')
+    expect(body.scope).toEqual(logs)
+    expect(diagnostics).toHaveLength(1)
+    expect(diagnostics[0]?.site).toBe('fork_advisory')
+  })
+
+  it('㉙ onDiagnostic 훅 자신이 던져도 하트비트는 200이다 (전송 평면 diagnosticSink 규율)', async () => {
+    const throwing = createControlServer({
+      store,
+      idempotency,
+      credentials,
+      workspaces: withFailingForkAdvisory(workspaces),
+      config: CONFIG,
+      onDiagnostic: () => {
+        throw new Error('onDiagnostic boom (시험용)')
+      },
+    })
+    await new Promise<void>((resolve) => {
+      throwing.listen(0, '127.0.0.1', resolve)
+    })
+    extraServers.push(throwing)
+    const at = `http://127.0.0.1:${String((throwing.address() as AddressInfo).port)}`
+
+    const logs = [await mintedLogId(tokenA, 'fork-hook-throw-log')]
+    const opened = bodyOf(
+      await openWorkspace(tokenA, 'fork-hook-throw-key', JSON.stringify({ logs }), at),
+    ) as OpenReply
+
+    const reply = await heartbeat(opened.workspaceId, tokenA, at)
+
+    expect(reply.status).toBe(200)
+    const body = bodyOf(reply) as HeartbeatReply
+    expect('forkAdvisory' in body).toBe(false)
+    expect(body.state).toBe('active')
   })
 })

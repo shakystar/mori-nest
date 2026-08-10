@@ -64,15 +64,16 @@
  * 스토어 단위)이 이미 세웠고, {@link handleHeartbeatWorkspace}가 `heartbeat` 성공 뒤에
  * `WorkspaceStore.findForkAdvisory`를 불러 배선한다(mori-nest #118).
  *
- * 진단 훅(`src/transport/server.ts`의 `onDiagnostic`)은 여전히 비범위라, 아래 `catch`들이
- * 삼킨 예외는 상태코드 말고는 아무 흔적을 남기지 않는다 — 전송 평면이 #38·#51에서 닫은 자리가
- * 이 평면에는 아직 열려 있다. 예외 `message`를 봉투에 싣지 않는 규율(`§1.3`)은 그것과
- * 무관하게 지킨다: 아래에서 쓰는 메시지는 전부 고정 문자열이다. **딱 하나 예외**가
- * {@link handleHeartbeatWorkspace}의 `forkAdvisory` 판정 실패다 — 그 실패는 상태코드에조차
- * 흔적을 남기지 않으므로(`200`을 그대로 쓴다, `§4.10` MUST NOT) 훅 없이도 `console.error` 한
- * 줄로 운영자에게 흔적을 남긴다(이슈 #118 완료 조건). 이 자리가 이 파일에서 유일하게
- * `console.*`을 부르는 이유이자, 진단 훅이 이 평면에 아직 없다는 위 사실이 바뀌기 전까지
- * 유지되는 임시 자리다.
+ * 진단 훅(`src/transport/server.ts`의 `onDiagnostic`과 같은 모양, `ControlServerOptions.onDiagnostic`)이
+ * 이 평면에도 있다(mori-nest #126, PR #125 후속) — 하지만 아직 배선된 자리는
+ * {@link handleHeartbeatWorkspace}의 `forkAdvisory` 판정 실패 하나뿐이다
+ * ({@link ControlDiagnosticSite}). 나머지 `catch`들이 삼킨 예외는 여전히 상태코드 말고는 아무
+ * 흔적을 남기지 않는다 — 그 자리들에 훅을 태우는 것은 이 조각이 아니라 그 자리가 실제로
+ * 필요해진 조각이 한다(전송 평면 doc의 증분 확장 규율, 「리포 전역 관례」 문단). 예외 `message`를
+ * 봉투에 싣지 않는 규율(`§1.3`)은 그것과 무관하게 지킨다: 아래에서 쓰는 메시지는 전부 고정
+ * 문자열이다. `forkAdvisory` 판정 실패가 첫 자리로 뽑힌 이유는 상태코드에조차 흔적을 남기지
+ * 않기 때문이다(`200`을 그대로 쓴다, `§4.10` MUST NOT) — 훅을 주입하지 않은 배포에서는 여전히
+ * 아무 흔적도 남지 않는다(no-op 기본값, {@link diagnosticSink}).
  *
  * ## Node 타입이 이 디렉터리에 들어오지 않는다
  *
@@ -131,6 +132,25 @@ type ResponseWriter = {
   readonly writableEnded: boolean
 }
 
+/**
+ * 진단 훅이 배선된 자리 (`src/transport/server.ts`의 {@link TransportDiagnosticSite}와 같은
+ * 역할). **이 조각은 `'fork_advisory'` 하나만 연다** — 나머지 `catch`는 파일 상단 doc이 적은
+ * 대로 아직 이 훅을 타지 않는다. 새 자리를 열 때는 전송 평면과 같은 규율을 따른다: 이 자리에
+ * 이름을 하나 더하고 그 자리에서 `emit`을 부른다.
+ */
+export type ControlDiagnosticSite = 'fork_advisory'
+
+/**
+ * 진단 훅이 받는 사건 하나. `src/transport/server.ts`의 {@link TransportDiagnostic}과 같은
+ * 모양이다 — 와이어에 나가는 값이 아니다.
+ */
+export type ControlDiagnostic = {
+  /** 결함을 고정 문자열로 덮은 자리. */
+  readonly site: ControlDiagnosticSite
+  /** 삼킨 예외 원문. `Error`라는 보장은 없다 — 던지는 쪽이 무엇이든 던질 수 있다. */
+  readonly error: unknown
+}
+
 export type ControlServerOptions = {
   /** `logId` mint와 (주체, 로그) 관계 (`./store.js`, #72). */
   readonly store: ControlStore
@@ -146,6 +166,37 @@ export type ControlServerOptions = {
    * 첫 요청까지 미뤄지면 `§3.4` 강제를 파싱 시점에 둔 이유가 사라진다.
    */
   readonly config: ControlConfig
+  /**
+   * 삼킨 예외 하나를 배포의 진단 평면으로 넘기는 훅 (`src/transport/server.ts`의
+   * `TransportServerOptions.onDiagnostic`과 같은 규율). 부재면 no-op이다 — **부재가 곧 지금까지의
+   * 동작**이고, 주입해도 응답 봉투는 한 글자도 바뀌지 않는다.
+   *
+   * 이 훅은 응답을 쓰기 전에, 동기로 불린다. **던져도 된다** — 이 파일이 그 예외를 받아 삼키고
+   * 응답 경로를 그대로 이어간다 ({@link diagnosticSink}). 진단 실패가 요청 실패로 번지지 않는다.
+   */
+  readonly onDiagnostic?: (diagnostic: ControlDiagnostic) => void
+}
+
+/** 삼킨 예외 하나를 진단 훅으로 넘긴다. 주입이 없으면 아무것도 하지 않는다. */
+type DiagnosticSink = (diagnostic: ControlDiagnostic) => void
+
+/**
+ * 주입된 훅을 {@link DiagnosticSink}로 감싼다. `src/transport/server.ts`의 동명 함수와 같은
+ * 이유 하나뿐이다: **훅이 던져도 요청 경로가 그것 때문에 무너지지 않아야 한다.**
+ */
+function diagnosticSink(hook: ((diagnostic: ControlDiagnostic) => void) | undefined): DiagnosticSink {
+  if (hook === undefined) {
+    return () => {
+      // no-op — 주입하지 않은 배포의 동작은 이 이슈 이전과 같다.
+    }
+  }
+  return (diagnostic) => {
+    try {
+      hook(diagnostic)
+    } catch {
+      // 진단 실패가 요청 실패로 번지지 않는다 (위 doc).
+    }
+  }
 }
 
 /**
@@ -819,6 +870,7 @@ async function handleHeartbeatWorkspace(
   options: ControlServerOptions,
   request: Extract<ControlRequest, { route: 'heartbeatWorkspace' }>,
   response: ResponseWriter,
+  emit: DiagnosticSink,
 ): Promise<void> {
   const { subject, workspaceId } = request
   const gracePeriodMs = resolveGracePeriodMs(options.config)
@@ -901,9 +953,11 @@ async function handleHeartbeatWorkspace(
   try {
     forkAdvisory = await options.workspaces.findForkAdvisory(subject, workspaceId, { gracePeriodMs, now: new Date() })
   } catch (error) {
-    // 조용히 삼키지 않는다 — 운영자가 볼 수 있는 흔적을 한 줄 남긴다(이슈 #118 완료 조건).
-    // 클라이언트로는 아무것도 새지 않는다: 아래 응답에는 `forkAdvisory` 키가 그냥 빠진다.
-    console.error('forkAdvisory 판정 실패 — advisory 없이 하트비트를 200으로 마친다', error)
+    // 조용히 삼키지 않는다 — 주입된 진단 훅으로 운영자가 볼 수 있는 흔적을 남긴다(이슈 #126,
+    // PR #125 후속). 클라이언트로는 아무것도 새지 않는다: 아래 응답에는 `forkAdvisory` 키가
+    // 그냥 빠진다. 훅을 주입하지 않은 배포에서는 이 실패가 여전히 아무 흔적도 남기지 않는다
+    // (no-op 기본값, {@link diagnosticSink}) — 그것이 의도된 트레이드오프다.
+    emit({ site: 'fork_advisory', error })
   }
 
   writeJson(response, 200, {
@@ -1105,6 +1159,7 @@ async function handleRequest(
   request: ServerRequest,
   response: ResponseWriter,
   options: ControlServerOptions,
+  emit: DiagnosticSink,
 ): Promise<void> {
   const body = request.method === 'POST' ? await readBody(request) : ''
 
@@ -1140,7 +1195,7 @@ async function handleRequest(
       await handleOpenWorkspace(options, gate.request, response)
       return
     case 'heartbeatWorkspace':
-      await handleHeartbeatWorkspace(options, gate.request, response)
+      await handleHeartbeatWorkspace(options, gate.request, response, emit)
       return
     case 'closeWorkspace':
       await handleCloseWorkspace(options, gate.request, response)
@@ -1177,8 +1232,9 @@ async function handleRequest(
  * 머리말과 같은 규율).
  */
 export function createControlServer(options: ControlServerOptions): Server {
+  const emit = diagnosticSink(options.onDiagnostic)
   return createServer((request, response) => {
-    handleRequest(request, response, options).catch(() => {
+    handleRequest(request, response, options, emit).catch(() => {
       // 여기 닿는 것은 라우트 핸들러 **밖**의 예외뿐이다 — 요청 스트림 오류처럼 게이트도
       // 스토어도 아닌 자리. 스토어·게이트의 실패는 위에서 이미 응답으로 끝났다. 이미 끝난
       // 응답에 다시 쓰지 않는다.
