@@ -223,16 +223,16 @@ describe('verifyControlRequest — POST /v1/workspaces', () => {
     expect(result.error.error.code).toBe('missing_idempotency_key')
   })
 
-  it('⑮ POST 아닌 메서드 → 405, Allow: POST (§4.2)', async () => {
+  it('⑮ POST·GET 밖의 메서드 → 405, Allow: POST, GET (§4.2·§4.6 — 컬렉션 경로는 개시와 목록 조회를 겸한다)', async () => {
     const store = await openLauncherCredentialStore(':memory:')
 
-    const result = await verifyControlRequest({ method: 'GET', url: '/v1/workspaces', headers: {} }, '', store)
+    const result = await verifyControlRequest({ method: 'DELETE', url: '/v1/workspaces', headers: {} }, '', store)
 
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.status).toBe(405)
     expect(result.error.error.code).toBe('method_not_allowed')
-    expect(result.headers['Allow']).toBe('POST')
+    expect(result.headers['Allow']).toBe('POST, GET')
   })
 })
 

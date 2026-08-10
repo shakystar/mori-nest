@@ -6,7 +6,10 @@
  * `POST /v1/logs/{logId}/revoke`(`§2.6`) · `POST /v1/workspaces`(`§4.2`) ·
  * `POST /v1/workspaces/{workspaceId}/heartbeat`(`§4.3`) ·
  * `POST /v1/workspaces/{workspaceId}/close`(`§4.4`) ·
- * `POST /v1/workspaces/{workspaceId}/revoke`(`§4.5`) 여덟을 배선한다.
+ * `POST /v1/workspaces/{workspaceId}/revoke`(`§4.5`) ·
+ * `GET /v1/workspaces`·`GET /v1/workspaces/{workspaceId}`(`§4.6`, mori-nest #115) 열을 배선한다 —
+ * `§0` 표의 여덟 행이 이제 전부 응답한다.
+ *
  * **판정은 이 파일에 없다** — 자격 게이트·라우트 판별·본문/쿼리 검사는 `./request.js`의
  * {@link verifyControlRequest}가 이미 끝냈고(mori-nest #83 · #93 · #102), 여기서는 그 산출물을
  * 스토어 호출로 잇는다. 페이지네이션도 마찬가지다: 판정 → 정렬 → `limit` 적용과 `hasMore` 판정은
@@ -49,11 +52,11 @@
  * 흘려보내고, 실패 매핑은 {@link handleHeartbeatWorkspace}가 세운 것과 같은 모양을 재사용한다
  * ({@link writeWorkspaceTransitionFailure}).
  *
- * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 · #113 · #114 이슈 본문)
+ * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 · #113 · #114 · #115 이슈 본문)
  *
- * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간 조회 라우트(`§4.6`)
- * 전부, 폐기 사유(`reason`)의 저장, `§4.10` 포크 감지·재발급 지시 (하트비트 **응답**에 실리는
- * 것이 맞지만 판정 규칙이 따로 있는 별도 작업이다 — 이 파일은 그 필드를 만들지 않는다).
+ * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 폐기 사유(`reason`)의 저장, `§4.10` 포크
+ * 감지·재발급 지시 (하트비트 **응답**에 실리는 것이 맞지만 판정 규칙이 따로 있는 별도 작업이다
+ * — 이 파일은 그 필드를 만들지 않는다).
  * 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
  * 뜻이다** — 전송 평면의 `maxRequestBytes`(`0002 §1.3` L103)에 해당하는 자리가 이 평면에는
  * 아직 배선되지 않았다(`0003 §1.3` 표에 `413 request_too_large`가 있으므로 자리는 열려 있고,
@@ -95,6 +98,13 @@ import { WorkspaceStoreError, type WorkspaceStore } from './workspace-store.js'
  * 페이지 크기를 그대로 재사용한다 — 이 자리에 새 숫자를 지어내지 않는다.
  */
 const MAX_PAGE_LIMIT = DEFAULT_PAGE_LIMIT
+
+/**
+ * `GET /v1/workspaces`의 `limit` 천장 ({@link handleListWorkspaces} doc). `MAX_PAGE_LIMIT`과
+ * 같은 값이지만 축이 다른 자원(로그 대 작업공간)의 천장이므로 별도 상수로 옮겨 적는다 —
+ * `WORKSPACE_REVOKE_SUFFIX`가 `./request.js`의 `REVOKE_SUFFIX`와 같은 이유로 분리된 것과 같다.
+ */
+const MAX_WORKSPACE_PAGE_LIMIT = DEFAULT_PAGE_LIMIT
 
 /**
  * 요청 객체 — Node 표준 HTTP 서버가 넘겨주는 것과 **모양만** 맞는 독립 타입 (파일 상단 doc).
@@ -882,7 +892,7 @@ async function handleHeartbeatWorkspace(
 /**
  * 종료·폐기 실패를 옮기는 공통 매핑 — `handleOpenWorkspace`·{@link handleHeartbeatWorkspace}가
  * 세운 것과 같은 모양이다: `workspace_not_found` → `404`, `workspace_not_active` → `409`,
- * 그 외는 {@link storeFailure}. `true`를 돌려주면 응답을 이미 썼다는 뜻이다.
+ * 그 외는 {@link storeFailure}.
  */
 function writeWorkspaceTransitionFailure(response: ResponseWriter, error: unknown): void {
   if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_found') {
@@ -953,6 +963,106 @@ async function handleRevokeWorkspace(
 }
 
 /**
+ * `GET /v1/workspaces` (`§4.6`) — `listWorkspaces`가 답한 페이지를 그대로 옮긴다.
+ *
+ * 주체 스코프 → `state` 필터 → 정렬 → `limit`은 **스토어가 이미 적용했다**
+ * (`./workspace-store.js`의 `#selectPage`: 필터 → 정렬 → `LIMIT`). {@link handleListLogs}가
+ * 세운 규율 그대로 여기서 다시 자르거나 거르지 않는다 — 자르면 `hasMore`가 거짓말이 된다.
+ *
+ * **`limit` 상한은 여기서 선다** ({@link MAX_WORKSPACE_PAGE_LIMIT}) — `./request.js`가
+ * `limit`의 **형식**만 보고 값을 그대로 실어 보내므로, 상한이 없으면 스토어가 받지 못하는
+ * 크기(`WorkspaceStoreError('invalid_page_limit')`)가 그대로 올라와 클라이언트가 문법적으로
+ * 멀쩡한 요청으로 `500`을 만들 수 있다. 깎는 것은 `§4.6`이 이미 허락한 동작이다(쿼리 표의
+ * `limit` 설명 — "서버가 더 작게 깎을 수 있다").
+ *
+ * `state`·`after`의 값 판정은 스토어가 한다(`./request.js`가 형식만 보고 넘긴 값) —
+ * `invalid_state_filter`·`invalid_cursor`를 각 code로 옮기고, `invalid_page_limit`은
+ * `0003 §1.3`에 그 code가 없으므로(게이트 doc과 같은 이유) `malformed_request`로 옮긴다.
+ */
+async function handleListWorkspaces(
+  options: ControlServerOptions,
+  request: Extract<ControlRequest, { route: 'listWorkspaces' }>,
+  response: ResponseWriter,
+): Promise<void> {
+  const query: { state?: string; after?: string; limit?: number; gracePeriodMs: number } = {
+    gracePeriodMs: resolveGracePeriodMs(options.config),
+  }
+  if (request.state !== undefined) {
+    query.state = request.state
+  }
+  if (request.after !== undefined) {
+    query.after = request.after
+  }
+  if (request.limit !== undefined) {
+    query.limit = Math.min(request.limit, MAX_WORKSPACE_PAGE_LIMIT)
+  }
+
+  let page
+  try {
+    page = await options.workspaces.listWorkspaces(request.subject, query)
+  } catch (error) {
+    if (error instanceof WorkspaceStoreError && error.reason === 'invalid_state_filter') {
+      writeJson(
+        response,
+        400,
+        errorResponse(ErrorCodes.invalid_state_filter, 'state is not one of the known workspace states'),
+      )
+      return
+    }
+    if (error instanceof WorkspaceStoreError && error.reason === 'invalid_cursor') {
+      writeJson(response, 400, errorResponse(ErrorCodes.invalid_cursor, 'after cannot be interpreted as a cursor'))
+      return
+    }
+    if (error instanceof WorkspaceStoreError && error.reason === 'invalid_page_limit') {
+      writeJson(response, 400, errorResponse(ErrorCodes.malformed_request, 'limit is not a valid page size'))
+      return
+    }
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  writeJson(response, 200, {
+    workspaces: page.workspaces,
+    ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+    hasMore: page.hasMore,
+  })
+}
+
+/**
+ * `GET /v1/workspaces/{workspaceId}` (`§4.6`) — `getWorkspace`가 답하면 `200`, `undefined`면
+ * `404 workspace_not_found`.
+ *
+ * **존재 여부를 묻지 않는다** ({@link handleGetLog}와 같은 규율). 없는 작업공간과 이 주체에게
+ * 보이지 않는 작업공간을 스토어가 구분하지 않으므로(`./workspace-store.js`의 `getWorkspace`
+ * doc), 이 핸들러에도 그 둘을 가르는 분기가 없다 — 응답이 바이트 단위로 같다는 보장이
+ * 여기서 나온다.
+ *
+ * 응답에는 `WorkspaceRecord`를 그대로 낸다 — 토큰이 실릴 자리가 그 타입에 없으므로 구조적으로
+ * `§3.8` MUST NOT을 지킨다.
+ */
+async function handleGetWorkspace(
+  options: ControlServerOptions,
+  request: Extract<ControlRequest, { route: 'getWorkspace' }>,
+  response: ResponseWriter,
+): Promise<void> {
+  let workspace
+  try {
+    workspace = await options.workspaces.getWorkspace(request.subject, request.workspaceId, {
+      gracePeriodMs: resolveGracePeriodMs(options.config),
+    })
+  } catch (error) {
+    writeFailure(response, storeFailure(error))
+    return
+  }
+
+  if (workspace === undefined) {
+    writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
+    return
+  }
+  writeJson(response, 200, workspace)
+}
+
+/**
  * 게이트 → 라우트. 본문을 **`POST`일 때만** 읽는 것은 전송 평면과 같은 규율이다(GET 라우트는
  * 본문을 쓰지 않는다). 이 분기는 라우트 판별이 아니다 — 경로·메서드·문법의 판정은 그 아래
  * {@link verifyControlRequest}가 처음부터 다시 전부 한다.
@@ -1003,6 +1113,12 @@ async function handleRequest(
       return
     case 'revokeWorkspace':
       await handleRevokeWorkspace(options, gate.request, response)
+      return
+    case 'listWorkspaces':
+      await handleListWorkspaces(options, gate.request, response)
+      return
+    case 'getWorkspace':
+      await handleGetWorkspace(options, gate.request, response)
       return
     default: {
       // **도달 불가**다 — 위 case들이 `ControlRoute`를 망라한다. 이 분기를 두는 이유는
