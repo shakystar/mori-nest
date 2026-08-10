@@ -123,7 +123,6 @@ function withFailingForkAdvisory(real: WorkspaceStore): WorkspaceStore {
     closeWorkspace: real.closeWorkspace.bind(real),
     revokeWorkspace: real.revokeWorkspace.bind(real),
     listWorkspaces: real.listWorkspaces.bind(real),
-    close: real.close.bind(real),
     findForkAdvisory: () => Promise.reject(new Error('forkAdvisory boom (시험용)')),
   }
 }
@@ -145,7 +144,8 @@ const VERIFICATION_KEYS = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
 
 describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3·§4.4·§4.5·§4.6)', () => {
   let dir: string
-  /** 멱등 계층과 자격증명이 공유하는 제어 평면 DB (mori-nest #130). 닫는 것도 이쪽이다. */
+  /** 멱등 계층·자격증명·로그·작업공간 스토어가 공유하는 제어 평면 DB (mori-nest
+   * #130·#131·#132). 닫는 것도 이쪽이다 — 넷 다 `close()`를 갖지 않는다. */
   let database: ControlDatabase
   let store: ControlStore
   let idempotency: IdempotencyStore
@@ -235,9 +235,11 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     )
   }
 
-  /** 이 주체 앞으로 저장된 작업공간 수. 목록 라우트(#99)가 아직 없어 저장분을 직접 센다. */
+  /** 이 주체 앞으로 저장된 작업공간 수. 목록 라우트(#99)가 아직 없어 저장분을 직접 센다.
+   * `workspaces`는 이제 `control-plane.db`(제어 평면 단일 DB, mori-nest #130)의 테이블이다 —
+   * 별도 파일이 아니다. */
   function storedWorkspaceCount(subject: string): number {
-    const db = new DatabaseSync(join(dir, 'workspace.db'))
+    const db = new DatabaseSync(join(dir, 'control-plane.db'))
     try {
       const row = db.prepare('SELECT COUNT(*) AS n FROM workspaces WHERE subject = ?').get(subject)
       return Number(row?.['n'])
@@ -280,7 +282,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     store = await openControlStore(database)
     idempotency = await openIdempotencyStore(database)
     credentials = await openLauncherCredentialStore(database)
-    workspaces = await openWorkspaceStore(join(dir, 'workspace.db'))
+    workspaces = await openWorkspaceStore(database)
     tokenA = (await credentials.issue('subject-a')).token
     tokenB = (await credentials.issue('subject-b')).token
 
@@ -304,9 +306,9 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
       })
     }
     extraServers.length = 0
-    // `store`는 `database`의 연결 위에 선 리포지토리라 닫을 것이 없다 (mori-nest #131).
+    // `store`·`workspaces` 둘 다 `database`의 연결 위에 선 리포지토리라 닫을 것이 없다
+    // (mori-nest #131 · #132).
     await database.close()
-    await workspaces.close()
     rmSync(dir, { recursive: true, force: true })
   })
 

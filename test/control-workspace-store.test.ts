@@ -23,6 +23,8 @@ import {
   type WorkspaceStoreFailure,
 } from '../src/control/workspace-store.js'
 
+import { openTestControlDatabase } from './control-db.js'
+
 /** 개시 사이에 `vi.setSystemTime`으로 시각을 옮기며 여러 작업공간을 연다 — 파일 상단 doc
  * "목록 조회 테스트는 openedAt 순서를 검증해야 하는데" 참고. `store.openWorkspace`의
  * `openedAt`이 옮긴 시각 그대로가 되도록 매 반복 사이에 시계를 앞으로 옮긴다. */
@@ -47,7 +49,7 @@ async function openSequenced(
 
 describe('WorkspaceStore.openWorkspace + getWorkspace', () => {
   it('개시 직후 단건 조회는 active이고 lastHeartbeatAt === openedAt, logs가 요청 그대로이며 replicaId 미신고 시 그 필드가 없다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
 
     const { workspaceId } = await store.openWorkspace('alice', { logs: ['log-a', 'log-b'] })
     const record = await store.getWorkspace('alice', workspaceId, { gracePeriodMs: 60_000 })
@@ -61,7 +63,7 @@ describe('WorkspaceStore.openWorkspace + getWorkspace', () => {
   })
 
   it('lastHeartbeatAt + gracePeriod가 지난 now로 조회하면 abandoned이고, endedAt은 조회 시각과 무관하게 같다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 1_000
 
     const { workspaceId } = await store.openWorkspace('alice', { logs: ['log-a'] })
@@ -83,7 +85,7 @@ describe('WorkspaceStore.openWorkspace + getWorkspace', () => {
   })
 
   it('다른 주체가 같은 workspaceId를 조회하면 없는 것과 같은 실패다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
 
     const { workspaceId } = await store.openWorkspace('alice', { logs: ['log-a'] })
 
@@ -91,7 +93,7 @@ describe('WorkspaceStore.openWorkspace + getWorkspace', () => {
   })
 
   it('supersedes로 같은 주체의 이전 작업공간을 이으면 개시가 성공하고, 이전 작업공간의 조회에 supersededBy가 붙는다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
 
     const { workspaceId: first } = await store.openWorkspace('alice', { logs: ['log-a'] })
     const { workspaceId: second } = await store.openWorkspace('alice', { logs: ['log-a'], supersedes: first })
@@ -115,7 +117,7 @@ describe('WorkspaceStore.openWorkspace + getWorkspace', () => {
       return bytes
     }
 
-    const store = await openWorkspaceStore(':memory:', { randomBytes: sequencedRandomBytes })
+    const store = await openWorkspaceStore(await openTestControlDatabase(), { randomBytes: sequencedRandomBytes })
     const { workspaceId: aliceWorkspaceId } = await store.openWorkspace('alice', { logs: ['log-a'] })
 
     const mallorysAttemptedBytes = fixedIds[1]
@@ -151,7 +153,7 @@ async function openAt(store: WorkspaceStore, gracePeriodMs: number): Promise<{ w
 
 describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
   it('하트비트가 lastHeartbeatAt을 앞으로 옮기고 state는 active 그대로다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     const { workspaceId, openedAt } = await openAt(store, gracePeriodMs)
 
@@ -169,7 +171,7 @@ describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
   })
 
   it('유기 시각이 지난 뒤의 하트비트가 실패하고, 그 뒤 유기 시각 이전의 now로 조회해도 abandoned다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 1_000
     const { workspaceId, openedAt } = await openAt(store, gracePeriodMs)
     const deadline = openedAt + gracePeriodMs
@@ -195,7 +197,7 @@ describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
   })
 
   it("close('flushed') 뒤 조회가 closed_flushed이고 endedAt이 RFC 3339로 실린다", async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     const { workspaceId, openedAt } = await openAt(store, gracePeriodMs)
 
@@ -211,7 +213,7 @@ describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
   })
 
   it('같은 outcome의 재close는 같은 결과이고, 다른 outcome은 실패한다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     const { workspaceId, openedAt } = await openAt(store, gracePeriodMs)
 
@@ -234,7 +236,7 @@ describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
   })
 
   it('revokeWorkspace가 멱등이고, closed_*인 작업공간에 대한 폐기는 실패한다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     const { workspaceId, openedAt } = await openAt(store, gracePeriodMs)
 
@@ -254,7 +256,7 @@ describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
   })
 
   it('닫힌 작업공간에 대한 하트비트가 실패하고 state가 그대로다 — 없는/다른 주체의 것과는 다른 이유다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     const { workspaceId, openedAt } = await openAt(store, gracePeriodMs)
     const closedAt = new Date(openedAt + 1_000)
@@ -284,7 +286,7 @@ describe('WorkspaceStore 전이 — 하트비트·종료·폐기', () => {
 
 describe('WorkspaceStore.listWorkspaces', () => {
   it('필터 없이 나열하면 openedAt 오름차순이고, 다른 주체의 작업공간은 실리지 않는다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
 
     // 삽입 순서(2_000 → 3_000 → 1_000)와 openedAt 오름차순(1_000 → 2_000 → 3_000)이 다르게
@@ -300,7 +302,7 @@ describe('WorkspaceStore.listWorkspaces', () => {
   })
 
   it('§4.7 관찰 조건: 하트비트 뒤 방치된 작업공간이 state=abandoned 필터에 잡히고, endedAt이 lastHeartbeatAt + gracePeriod이며 logs가 개시 시 스코프 그대로다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 1_000
     const [workspaceId] = await openSequenced(store, 'alice', [0])
     const beatAt = new Date(100)
@@ -321,7 +323,7 @@ describe('WorkspaceStore.listWorkspaces', () => {
   })
 
   it('필터 → 정렬 → limit 순서: 유기 1건 + 그보다 나중에 열린 active 여러 건에서 state=abandoned + limit=1이 그 유기 1건을 돌려주고 hasMore가 false다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 1_000
 
     // ws1은 개시 후 하트비트 없이 방치된다 — 나머지 둘은 ws1의 유기 시각(1_000)이 지난
@@ -343,7 +345,7 @@ describe('WorkspaceStore.listWorkspaces', () => {
   })
 
   it('커서로 다음 페이지를 이어 받으면 앞 페이지 항목이 반복되지 않고 전량이 정확히 한 번씩 나온다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     const ids = await openSequenced(store, 'alice', [0, 1_000, 2_000, 3_000, 4_000])
 
@@ -369,7 +371,7 @@ describe('WorkspaceStore.listWorkspaces', () => {
   })
 
   it('mori-nest #109: 승계자가 둘 이상인 작업공간을 포함한 목록 조회에서 supersededBy가 getWorkspace와 같은 값(workspaceId 사전순 최소)이고, 승계되지 않은 행에는 그 필드가 없다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
 
     const [target] = await openSequenced(store, 'alice', [0])
@@ -388,7 +390,7 @@ describe('WorkspaceStore.listWorkspaces', () => {
   })
 
   it('state가 다섯 이름 밖이면 실패하고, 해석 불가 커서도 실패한다 (둘 다 «전부 반환»으로 떨어지지 않는다)', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     await openSequenced(store, 'alice', [0])
 
@@ -414,7 +416,7 @@ async function openReplicaAt(
 describe('WorkspaceStore.findForkAdvisory (§4.10 포크 판정, advisory 조각 1/2)', () => {
   it('겹치면 advisory가 나온다 — 같은 replicaId의 두 active, 그리고 abandoned(파생) ↔ active', async () => {
     // 모양 1: 같은 replicaId의 두 active 작업공간.
-    const store1 = await openWorkspaceStore(':memory:')
+    const store1 = await openWorkspaceStore(await openTestControlDatabase())
     vi.useFakeTimers()
     const a1 = await openReplicaAt(store1, 'alice', 'r1', 0)
     const b1 = await openReplicaAt(store1, 'alice', 'r1', 1_000)
@@ -428,7 +430,7 @@ describe('WorkspaceStore.findForkAdvisory (§4.10 포크 판정, advisory 조각
     // 모양 2: a2는 하트비트 없이 방치돼 조회 시각(1_400)엔 이미 파생 abandoned(deadline 1_000)다
     // — 그래도 b2가 열린 시각(500)엔 a2가 아직 안 닫혀 있었으므로 두 활성 구간이 겹친다.
     // a2 구간 [0, 1_000), b2 구간 [500, 1_400)(b2는 조회 시각에도 아직 active).
-    const store2 = await openWorkspaceStore(':memory:')
+    const store2 = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs2 = 1_000
     vi.useFakeTimers()
     const a2 = await openReplicaAt(store2, 'alice', 'r1', 0)
@@ -445,7 +447,7 @@ describe('WorkspaceStore.findForkAdvisory (§4.10 포크 판정, advisory 조각
     const gracePeriodMs = 60_000
 
     // close 뒤에 열린 경우: b의 openedAt(200)이 a의 endedAt(100)보다 뒤다.
-    const store1 = await openWorkspaceStore(':memory:')
+    const store1 = await openWorkspaceStore(await openTestControlDatabase())
     vi.useFakeTimers()
     const a1 = await openReplicaAt(store1, 'alice', 'r1', 0)
     vi.setSystemTime(100)
@@ -456,7 +458,7 @@ describe('WorkspaceStore.findForkAdvisory (§4.10 포크 판정, advisory 조각
     expect(await store1.findForkAdvisory('alice', b1, { gracePeriodMs, now: new Date(300) })).toBeUndefined()
 
     // 경계 접촉: c의 openedAt이 a2의 endedAt과 정확히 같다 — 반열린 구간이라 겹침이 아니다.
-    const store2 = await openWorkspaceStore(':memory:')
+    const store2 = await openWorkspaceStore(await openTestControlDatabase())
     vi.useFakeTimers()
     const a2 = await openReplicaAt(store2, 'alice', 'r1', 0)
     vi.setSystemTime(100)
@@ -468,7 +470,7 @@ describe('WorkspaceStore.findForkAdvisory (§4.10 포크 판정, advisory 조각
   })
 
   it('제외 규칙 — 자기 자신뿐인 경우, 다른 주체의 같은 replicaId, 상대의 replicaId 미신고는 모두 undefined다', async () => {
-    const store = await openWorkspaceStore(':memory:')
+    const store = await openWorkspaceStore(await openTestControlDatabase())
     const gracePeriodMs = 60_000
     vi.useFakeTimers()
     const self = await openReplicaAt(store, 'alice', 'r1', 0)
