@@ -11,6 +11,7 @@
 
 import { writeSync } from 'node:fs'
 
+import { openControlDatabase } from '../src/control/db.ts'
 import { openIdempotencyStore } from '../src/control/idempotency.ts'
 
 const [dbPath, subject, key, startAtMs, body] = process.argv.slice(2)
@@ -18,7 +19,8 @@ if (dbPath === undefined || subject === undefined || key === undefined || startA
   throw new Error('usage: idempotency-race-child.mjs <dbPath> <subject> <key> <startAtMs> <body>')
 }
 
-const store = await openIdempotencyStore(dbPath)
+const database = await openControlDatabase(dbPath)
+const store = await openIdempotencyStore(database)
 
 const startAt = Number(startAtMs)
 while (Date.now() < startAt) {
@@ -32,4 +34,4 @@ if (outcome.kind === 'reserved') {
   await store.complete(subject, key, { status: 201, body: '{"logId":"raced"}' })
 }
 writeSync(1, `${JSON.stringify({ kind: outcome.kind, created })}\n`)
-await store.close()
+await database.close()
