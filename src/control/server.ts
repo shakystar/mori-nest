@@ -4,7 +4,9 @@
  *
  * `POST /v1/logs`(`0003 §2.1`) · `GET /v1/logs`·`GET /v1/logs/{logId}`(`§2.4`) ·
  * `POST /v1/logs/{logId}/revoke`(`§2.6`) · `POST /v1/workspaces`(`§4.2`) ·
- * `POST /v1/workspaces/{workspaceId}/heartbeat`(`§4.3`) 여섯을 배선한다.
+ * `POST /v1/workspaces/{workspaceId}/heartbeat`(`§4.3`) ·
+ * `POST /v1/workspaces/{workspaceId}/close`(`§4.4`) ·
+ * `POST /v1/workspaces/{workspaceId}/revoke`(`§4.5`) 여덟을 배선한다.
  * **판정은 이 파일에 없다** — 자격 게이트·라우트 판별·본문/쿼리 검사는 `./request.js`의
  * {@link verifyControlRequest}가 이미 끝냈고(mori-nest #83 · #93 · #102), 여기서는 그 산출물을
  * 스토어 호출로 잇는다. 페이지네이션도 마찬가지다: 판정 → 정렬 → `limit` 적용과 `hasMore` 판정은
@@ -40,15 +42,19 @@
  * 저장분도 그것을 싣지 않는다(멱등 저장분이 무엇을 담는지는
  * {@link OpenWorkspaceReservation} doc).
  *
- * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 · #113 이슈 본문)
+ * 종료(`§4.4`)·폐기(`§4.5`, mori-nest #114)는 발급 경로에 얹지 않는다 — 종단 전이라 새 토큰이
+ * 나가지 않는다. 대신 **멱등을 새로 구현하지 않는다**: `WorkspaceStore.closeWorkspace`·
+ * `revokeWorkspace`가 이미 갖고 있는 성질(같은 `outcome`으로 다시 닫으면 첫 `endedAt`이 그대로
+ * 다시 나온다)을 {@link handleCloseWorkspace}·{@link handleRevokeWorkspace}가 응답으로 그대로
+ * 흘려보내고, 실패 매핑은 {@link handleHeartbeatWorkspace}가 세운 것과 같은 모양을 재사용한다
+ * ({@link writeWorkspaceTransitionFailure}).
  *
- * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간의 종료·폐기 **배선**과
- * 조회 라우트(`§4.6`) 전부, 폐기 사유(`reason`)의 저장, `§4.10` 포크 감지·재발급 지시
- * (하트비트 **응답**에 실리는 것이 맞지만 판정 규칙이 따로 있는 별도 작업이다 — 이 파일은 그
- * 필드를 만들지 않는다). 종료·폐기는 `./request.js`가 이미 판별하지만(#112), 이 파일의
- * `switch`는 그 둘을 아직 `503 unavailable`로 묶어 답한다({@link handleRequest} 안의 주석) —
- * 스토어 호출(`WorkspaceStore.closeWorkspace`·`revokeWorkspace`)을 여는 것은 각각 다음
- * 조각이다. 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
+ * ## 이 조각의 비범위 (mori-nest #84 · #93 · #103 · #112 · #113 · #114 이슈 본문)
+ *
+ * 유량 제한(`429`)·본문 크기 한도(`413`)·진단 훅·SSE, 그리고 작업공간 조회 라우트(`§4.6`)
+ * 전부, 폐기 사유(`reason`)의 저장, `§4.10` 포크 감지·재발급 지시 (하트비트 **응답**에 실리는
+ * 것이 맞지만 판정 규칙이 따로 있는 별도 작업이다 — 이 파일은 그 필드를 만들지 않는다).
+ * 특히 **본문 크기 한도가 없다는 것은 {@link readBody}가 상한 없이 읽는다는
  * 뜻이다** — 전송 평면의 `maxRequestBytes`(`0002 §1.3` L103)에 해당하는 자리가 이 평면에는
  * 아직 배선되지 않았다(`0003 §1.3` 표에 `413 request_too_large`가 있으므로 자리는 열려 있고,
  * 값을 정하는 것은 이 조각이 아니다). 그 라우트를 여는 다음 조각이 이 함수에 상한을 준다.
@@ -487,6 +493,16 @@ const TOKEN_AUDIENCE = 'transport'
 const MS_PER_SECOND = 1000
 
 /**
+ * `gracePeriodSeconds → ms` 환산 — 이 리포에서 **이 함수 하나뿐**이다 (`./index.js`의
+ * `gracePeriodSeconds` doc). 조회(`getWorkspace`)와 전이 셋(`heartbeat`·`closeWorkspace`·
+ * `revokeWorkspace`)이 같은 값을 봐야 유기 판정이 갈리지 않는다 — 호출마다 `× 1000`을 다시
+ * 적으면 그 값이 갈릴 여지가 생긴다.
+ */
+function resolveGracePeriodMs(config: ControlConfig): number {
+  return config.gracePeriodSeconds * MS_PER_SECOND
+}
+
+/**
  * `§3.2`의 고정 20바이트 `YYYY-MM-DDTHH:MM:SSZ`.
  *
  * 초 미만을 **버린다**. 발급자(`./token.js`)는 그 자리를 가진 문자열을 아예 거부하므로
@@ -568,8 +584,8 @@ function readReservation(body: string): OpenWorkspaceReservation {
  * 이 경로에서 성립하지 않는다.
  *
  * `abandoned`도 종단이고, 그것은 **저장된 값이 아니라 조회 시각에 계산되는 값**이다(#97) —
- * `gracePeriod`가 설정으로 오는 이유가 이것이다. 초→ms 환산은 이 리포에서 **이 한 줄뿐이다**
- * (`./index.js`의 `gracePeriodSeconds` doc).
+ * `gracePeriod`가 설정으로 오는 이유가 이것이다. 초→ms 환산은 {@link resolveGracePeriodMs}
+ * 하나로 모여 있다 (`./index.js`의 `gracePeriodSeconds` doc).
  *
  * 조회가 비면(`undefined`) `404 workspace_not_found`다 — 저장분이 가리키는 작업공간이 이
  * 주체에게 더는 보이지 않는다는 뜻이고, 다른 라우트가 같은 상황에 내는 코드가 그것이다.
@@ -585,7 +601,7 @@ async function replayOpenWorkspace(
   try {
     reservation = readReservation(record.body)
     workspace = await options.workspaces.getWorkspace(subject, reservation.workspaceId, {
-      gracePeriodMs: options.config.gracePeriodSeconds * MS_PER_SECOND,
+      gracePeriodMs: resolveGracePeriodMs(options.config),
     })
   } catch (error) {
     writeFailure(response, storeFailure(error))
@@ -779,7 +795,7 @@ async function handleHeartbeatWorkspace(
   response: ResponseWriter,
 ): Promise<void> {
   const { subject, workspaceId } = request
-  const gracePeriodMs = options.config.gracePeriodSeconds * MS_PER_SECOND
+  const gracePeriodMs = resolveGracePeriodMs(options.config)
 
   let workspace
   try {
@@ -864,6 +880,79 @@ async function handleHeartbeatWorkspace(
 }
 
 /**
+ * 종료·폐기 실패를 옮기는 공통 매핑 — `handleOpenWorkspace`·{@link handleHeartbeatWorkspace}가
+ * 세운 것과 같은 모양이다: `workspace_not_found` → `404`, `workspace_not_active` → `409`,
+ * 그 외는 {@link storeFailure}. `true`를 돌려주면 응답을 이미 썼다는 뜻이다.
+ */
+function writeWorkspaceTransitionFailure(response: ResponseWriter, error: unknown): void {
+  if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_found') {
+    writeJson(response, 404, errorResponse(ErrorCodes.workspace_not_found, 'workspace not found'))
+    return
+  }
+  if (error instanceof WorkspaceStoreError && error.reason === 'workspace_not_active') {
+    writeJson(response, 409, errorResponse(ErrorCodes.workspace_not_active, 'this workspace is no longer active'))
+    return
+  }
+  writeFailure(response, storeFailure(error))
+}
+
+/**
+ * `POST /v1/workspaces/{workspaceId}/close` (`§4.4`) — `WorkspaceStore.closeWorkspace`를 그대로
+ * 옮긴다. 본문이 거의 없는 이유는 이 조각의 성격이다: 멱등은 **스토어가 이미 갖고 있다**
+ * (`closeWorkspace`의 doc) — 같은 `outcome`으로 다시 닫으면 첫 `endedAt`이 그대로 다시 나온다.
+ * 이 핸들러는 그 성질을 새로 구현하지 않고 응답으로 그대로 흘려보낼 뿐이다.
+ *
+ * 실패 매핑은 {@link writeWorkspaceTransitionFailure}. `outcome`은 게이트(`./request.js`,
+ * mori-nest #112)가 이미 `'flushed' | 'discarded'`로 좁혀 왔다.
+ */
+async function handleCloseWorkspace(
+  options: ControlServerOptions,
+  request: Extract<ControlRequest, { route: 'closeWorkspace' }>,
+  response: ResponseWriter,
+): Promise<void> {
+  const { subject, workspaceId, outcome } = request
+
+  let result
+  try {
+    result = await options.workspaces.closeWorkspace(subject, workspaceId, outcome, {
+      gracePeriodMs: resolveGracePeriodMs(options.config),
+    })
+  } catch (error) {
+    writeWorkspaceTransitionFailure(response, error)
+    return
+  }
+
+  writeJson(response, 200, { workspaceId, state: result.state, endedAt: result.endedAt })
+}
+
+/**
+ * `POST /v1/workspaces/{workspaceId}/revoke` (`§4.5`) — `WorkspaceStore.revokeWorkspace`를
+ * 그대로 옮긴다. 멱등 관찰·실패 매핑은 {@link handleCloseWorkspace}와 같다.
+ *
+ * `reason`은 받지도 싣지도 않는다 (`§4.5` 완료 조건) — 게이트가 형식만 보고 이미 버렸고
+ * (`./request.js`), `revokeWorkspace`의 요청 모양에도 그 자리가 없다.
+ */
+async function handleRevokeWorkspace(
+  options: ControlServerOptions,
+  request: Extract<ControlRequest, { route: 'revokeWorkspace' }>,
+  response: ResponseWriter,
+): Promise<void> {
+  const { subject, workspaceId } = request
+
+  let result
+  try {
+    result = await options.workspaces.revokeWorkspace(subject, workspaceId, {
+      gracePeriodMs: resolveGracePeriodMs(options.config),
+    })
+  } catch (error) {
+    writeWorkspaceTransitionFailure(response, error)
+    return
+  }
+
+  writeJson(response, 200, { workspaceId, state: result.state, endedAt: result.endedAt })
+}
+
+/**
  * 게이트 → 라우트. 본문을 **`POST`일 때만** 읽는 것은 전송 평면과 같은 규율이다(GET 라우트는
  * 본문을 쓰지 않는다). 이 분기는 라우트 판별이 아니다 — 경로·메서드·문법의 판정은 그 아래
  * {@link verifyControlRequest}가 처음부터 다시 전부 한다.
@@ -910,12 +999,10 @@ async function handleRequest(
       await handleHeartbeatWorkspace(options, gate.request, response)
       return
     case 'closeWorkspace':
+      await handleCloseWorkspace(options, gate.request, response)
+      return
     case 'revokeWorkspace':
-      // 판별은 `./request.js`가 이미 끝냈다(mori-nest #112) — 이 둘의 스토어 배선
-      // (`WorkspaceStore.closeWorkspace`·`revokeWorkspace`)은 각각 다음 조각이 가져간다.
-      // 그때까지는 `503 unavailable`로 답한다: `§1.3`에 "아직 구현되지 않음"을 뜻하는
-      // code가 없고(`501`은 이 스펙에 없다), `503`이 "지금은 답할 수 없다"의 유일한 뜻이다.
-      writeJson(response, 503, errorResponse(ErrorCodes.unavailable, 'this route is not wired yet'), RETRY_AFTER)
+      await handleRevokeWorkspace(options, gate.request, response)
       return
     default: {
       // **도달 불가**다 — 위 case들이 `ControlRoute`를 망라한다. 이 분기를 두는 이유는

@@ -20,10 +20,12 @@ import { createVerificationKeySet, verifyWorkspaceToken } from '../src/transport
 import { KEY_ID, issuer } from './workspace-token.js'
 
 /**
- * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`·`§4.3`, mori-nest #84·#93·#103·#113).
+ * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`·`§4.3`·`§4.4`·`§4.5`,
+ * mori-nest #84·#93·#103·#113·#114).
  *
  * **동작 하나당 하나 — #84가 일곱 건, #93이 그 위에 세 건(`§2.6` revoke), #103이 다섯 건
- * (`§4.2` 개시), #113이 네 건(`§4.3` 하트비트)을 더한다** (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·
+ * (`§4.2` 개시), #113이 네 건(`§4.3` 하트비트), #114가 세 건(`§4.4`·`§4.5` 종료·폐기)을
+ * 더한다** (각 이슈 본문의 완료 조건). 게이트 판정(자격·메서드·본문 형태·
  * 커서 형식)의 케이스는 여기서 다시 세우지 않는다 — `#83`·`#93`·`#102`가
  * `test/control-request.test.ts`에 이미 세웠고, 이 파일이 보는 것은 **판정 결과가 스토어
  * 호출로 이어진 뒤의 관찰 가능한 응답**이다. 토큰 와이어 형식의 재검증도 하지 않는다
@@ -102,6 +104,9 @@ type OpenReply = {
 /** `§4.3` 응답 — 개시의 여섯에 `state`가 더해진 일곱 필드. */
 type HeartbeatReply = OpenReply & { state: string }
 
+/** `§4.4`·`§4.5` 응답의 세 필드 (`WorkspaceTerminalResult` + `workspaceId`). */
+type TerminalReply = { workspaceId: string; state: string; endedAt: string }
+
 /**
  * 시험용 발급 설정 — `§3.4`의 네 제약을 만족한다 (`parseControlConfig`가 강제하는 그것).
  * 검증 키 집합(`keys`)이 이 `keyId`의 공개키를 갖고 있어 아래 ⑪의 라운드트립이 성립한다.
@@ -117,7 +122,7 @@ const CONFIG: ControlConfig = {
 /** `issuer`의 공개키 하나만 주입된 집합 — 전송 평면이 받는 절반(`§3.3`)이다. */
 const VERIFICATION_KEYS = createVerificationKeySet([[KEY_ID, issuer.publicKey]])
 
-describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3)', () => {
+describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3·§4.4·§4.5)', () => {
   let dir: string
   let store: ControlStore
   let idempotency: IdempotencyStore
@@ -167,6 +172,37 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   function heartbeat(workspaceId: string, token: string, at: string = origin): Promise<Reply> {
     return send(
       `/v1/workspaces/${workspaceId}/heartbeat`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: '{}',
+      },
+      at,
+    )
+  }
+
+  /** `§4.4` 종료 선언. `reason`이 없다 — 개시·하트비트와 달리 이 라우트에 그 필드가 없다. */
+  function closeWorkspace(
+    workspaceId: string,
+    token: string,
+    outcome: 'flushed' | 'discarded',
+    at: string = origin,
+  ): Promise<Reply> {
+    return send(
+      `/v1/workspaces/${workspaceId}/close`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ outcome }),
+      },
+      at,
+    )
+  }
+
+  /** `§4.5` 폐기. `reason`은 받지도 싣지도 않으므로(`§4.5`) 시험에서 보내지 않는다. */
+  function revokeWorkspace(workspaceId: string, token: string, at: string = origin): Promise<Reply> {
+    return send(
+      `/v1/workspaces/${workspaceId}/revoke`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -666,5 +702,68 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
 
     expect(reply.status).toBe(404)
     expect(bodyOf(reply)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
+  })
+
+  it('⑳ 종료 선언 → 200 + 세 필드, 같은 outcome 재시도는 같은 본문, 다른 outcome은 409 (§4.4 MUST)', async () => {
+    const logs = [await mintedLogId(tokenA, 'close-log-1')]
+    const opened = bodyOf(await openWorkspace(tokenA, 'close-key-1', JSON.stringify({ logs }))) as OpenReply
+
+    const first = await closeWorkspace(opened.workspaceId, tokenA, 'flushed')
+    expect(first.status).toBe(200)
+    const firstBody = bodyOf(first) as TerminalReply
+    expect(Object.keys(firstBody).sort()).toEqual(['endedAt', 'state', 'workspaceId'].sort())
+    expect(firstBody.workspaceId).toBe(opened.workspaceId)
+    expect(firstBody.state).toBe('closed_flushed')
+
+    // 멱등성 키 없이 멱등이다 (§4.4 MUST) — 첫 endedAt이 그대로 다시 나온다. 새로 구현하지
+    // 않는다: 스토어가 이미 갖고 있는 성질을 응답으로 그대로 흘려보낼 뿐이다.
+    const retry = await closeWorkspace(opened.workspaceId, tokenA, 'flushed')
+    expect(retry.status).toBe(200)
+    expect(bodyOf(retry)).toEqual(firstBody)
+
+    // 다른 outcome으로 다시 닫으려 하면 409 workspace_not_active다.
+    const conflicting = await closeWorkspace(opened.workspaceId, tokenA, 'discarded')
+    expect(conflicting.status).toBe(409)
+    expect(bodyOf(conflicting)).toEqual({ error: { code: 'workspace_not_active', message: expect.any(String) } })
+  })
+
+  it('㉑ 폐기 → 200 + state: "revoked", 재시도가 같은 본문, 닫힌 작업공간의 폐기는 409 (§4.5 MUST)', async () => {
+    const logs = [await mintedLogId(tokenA, 'revoke-log-1')]
+    const opened = bodyOf(await openWorkspace(tokenA, 'revoke-key-1', JSON.stringify({ logs }))) as OpenReply
+
+    const first = await revokeWorkspace(opened.workspaceId, tokenA)
+    expect(first.status).toBe(200)
+    const firstBody = bodyOf(first) as TerminalReply
+    expect(firstBody.workspaceId).toBe(opened.workspaceId)
+    expect(firstBody.state).toBe('revoked')
+
+    const retry = await revokeWorkspace(opened.workspaceId, tokenA)
+    expect(retry.status).toBe(200)
+    expect(bodyOf(retry)).toEqual(firstBody)
+
+    const closedLogs = [await mintedLogId(tokenA, 'revoke-log-closed')]
+    const closedOpened = bodyOf(
+      await openWorkspace(tokenA, 'revoke-key-closed', JSON.stringify({ logs: closedLogs })),
+    ) as OpenReply
+    expect((await closeWorkspace(closedOpened.workspaceId, tokenA, 'flushed')).status).toBe(200)
+
+    const onClosed = await revokeWorkspace(closedOpened.workspaceId, tokenA)
+    expect(onClosed.status).toBe(409)
+    expect(bodyOf(onClosed)).toEqual({ error: { code: 'workspace_not_active', message: expect.any(String) } })
+  })
+
+  it('㉒ 다른 주체의 workspaceId면 종료·폐기 둘 다 404 workspace_not_found다 (§4.4·§4.5)', async () => {
+    const othersLogs = [await mintedLogId(tokenB, 'terminal-others-log')]
+    const others = bodyOf(
+      await openWorkspace(tokenB, 'terminal-key-others', JSON.stringify({ logs: othersLogs })),
+    ) as OpenReply
+
+    const closeReply = await closeWorkspace(others.workspaceId, tokenA, 'flushed')
+    expect(closeReply.status).toBe(404)
+    expect(bodyOf(closeReply)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
+
+    const revokeReply = await revokeWorkspace(others.workspaceId, tokenA)
+    expect(revokeReply.status).toBe(404)
+    expect(bodyOf(revokeReply)).toEqual({ error: { code: 'workspace_not_found', message: expect.any(String) } })
   })
 })
