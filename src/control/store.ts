@@ -30,10 +30,12 @@
  *
  * 그 대가는 `./db.ts` 상단 doc의 «중첩 금지»가 여기에도 그대로 걸린다는 것이다: 자기
  * 트랜잭션을 여는 {@link ControlStore.createLog}는 바깥 `withTransaction` 안에서 부를 수 없다
- * (`nested_transaction`). 로그 mint를 더 큰 쓰기와 한 커밋으로 묶어야 하는 자리(**조각 4/4**의
- * 라우트 배선)는 이 메서드가 아니라 그것이 쓰는 기본 연산(mint · `logs` 삽입 · 관계 행 삽입)을
- * 그 트랜잭션 안에서 조합한다 — `credential.ts`의 `rotate()`가 남긴 선례와 같다. 오늘 그
- * 조합을 할 수 있는 표면은 아직 없다(그 표면을 여는 것도 조각 4/4의 일이다).
+ * (`nested_transaction`). 로그 mint를 더 큰 쓰기와 한 커밋으로 묶어야 하는 자리(mori-nest #133,
+ * **조각 4/4**의 라우트 배선)는 이 메서드가 아니라 {@link ControlStore.insertMintedLog}를
+ * 그 트랜잭션 안에서 **동기로** 부른다 — `credential.ts`의 `rotate()`가 남긴 선례와 같다.
+ * `insertMintedLog`는 `Promise`를 돌려주지 않는다 — 콜백 안에서 `await`가 필요 없어야
+ * `withTransaction`의 «콜백은 동기다» 전제(`./db.ts` 상단 doc)가 깨지지 않는다. `createLog`
+ * 자신도 이제 이 메서드를 재사용한다(아래 구현).
  *
  * ## SQLite 고유 API는 이 파일 밖으로 새지 않는다 (이식성)
  *
@@ -225,6 +227,10 @@ export type ControlStoreFailure =
   | 'log_not_found'
   /** mint 재시도가 {@link MAX_MINT_ATTEMPTS}를 넘었다 — 난수원이 고장났다고 본다 */
   | 'mint_exhausted'
+  /** {@link ControlStore.insertMintedLog}에 건넨 `logId`가 이미 존재한다 — 호출자가 새
+   *  트랜잭션에서 새 id로 재시도한다 (mori-nest #133, UoW 조각 4/4). `createLog`의 재시도
+   *  루프도 이 표식을 그대로 받는다. */
+  | 'log_id_collision'
   /** `limit`이 양의 안전 정수가 아니다 */
   | 'invalid_page_limit'
   /** DB가 돌려준 행의 모양이 스키마와 다르다 */
@@ -270,15 +276,46 @@ export type ControlStore = {
    *
    * **자기 트랜잭션을 연다.** 중첩이 금지되어 있으므로(`./db.ts` 상단 doc) 바깥
    * `withTransaction` 안에서 부르면 `nested_transaction`을 받는다 — 로그 mint를 멱등 키 기록과
-   * 한 커밋으로 묶는 것(`0003 §1.4`)은 **조각 4/4**의 일이고, 그 배선은 이 메서드를 그대로
-   * 부르는 대신 mint와 관계 행 삽입을 바깥 트랜잭션 안에서 조합하는 표면을 먼저 열어야 한다
-   * (`credential.ts`의 `rotate()`가 남긴 것과 같은 선택지다).
+   * 한 커밋으로 묶는 것(`0003 §1.4`)은 라우트 배선(mori-nest #133, **조각 4/4**)의 일이고,
+   * 그 배선은 이 메서드를 그대로 부르는 대신 {@link ControlStore.insertMintedLog}를 자기
+   * 트랜잭션 안에서 조합한다.
    *
    * @throws {ControlStoreError} `subject`가 빈 문자열이면 (`blank_subject`, 그 시도의 로그도
    *   함께 롤백된다) mint가 {@link MAX_MINT_ATTEMPTS}번 전부 기존 id와 충돌하면
    *   (`mint_exhausted`).
    */
   createLog(subject: string): Promise<{ readonly logId: string }>
+
+  /**
+   * 새 `logId`를 mint한다 — {@link insertMintedLog}에 건넬 값을 만드는 자리다 (mori-nest #133,
+   * UoW 조각 4/4). 모듈 함수 {@link mintLogId}를 **이 스토어에 주입된 난수원으로** 부른 것뿐이다:
+   * 라우트가 모듈 함수를 직접 부르면 `openControlStore`의 `randomBytes` 옵션이 조용히 무시되어
+   * 난수원이 둘로 갈린다.
+   *
+   * 트랜잭션 **밖**에서 부른다(파일 상단 doc "mint 재시도와 dedup") — 그래서 `Promise`를
+   * 돌려주지 않는다. I/O가 아니라 난수 읽기 하나다.
+   *
+   * @throws {ControlStoreError} 난수원이 요구한 바이트를 못 주면 (`random_source_too_short`);
+   *   mint 결과가 `0002 §1.1` 정규식을 벗어나면 (`minted_id_invalid`).
+   */
+  mintLogId(): string
+
+  /**
+   * mint된 `logId`로 `logs` 행과 (주체, 로그) 관계 행을 만든다 — {@link createLog}가 여는
+   * 두 문장의 조합이다 (mori-nest #133, UoW 조각 4/4). **자기 트랜잭션을 열지 않고,
+   * `Promise`도 돌려주지 않는다** — 호출자가 이미 연 `ControlDatabase.withTransaction`
+   * 콜백 **안에서, 동기로** 불러야 한다. 이 메서드가 `async`가 아닌 것 자체가 그 계약이다:
+   * 호출 자리에 `await`를 쓸 수 없으므로 콜백이 thenable이 되는 실수(`./db.ts` 상단 doc)가
+   * 타입 수준에서부터 막힌다.
+   *
+   * mint 재시도는 **호출자의 몫**이다 — `logId` 충돌은 새 트랜잭션에서 새 id로 다시 시도해야
+   * 하므로(파일 상단 doc "mint 재시도와 dedup"), 이 메서드 하나가 재시도까지 지면 트랜잭션
+   * 경계를 스스로 여닫아야 해서 "자기 트랜잭션을 열지 않는다"는 계약과 부딪힌다.
+   *
+   * @throws {ControlStoreError} mint된 `logId`가 이미 존재하면 (`log_id_collision` — 호출자가
+   *   새 트랜잭션에서 새 id로 재시도한다); `subject`가 빈 문자열이면 (`blank_subject`).
+   */
+  insertMintedLog(logId: string, subject: string): void
 
   /**
    * (주체, 로그) 관계 행을 추가한다. **오늘 이 함수를 부르는 유일한 경로는
@@ -385,20 +422,10 @@ function resolveLimit(limit: number | undefined): number {
   return limit
 }
 
-/**
- * mint 충돌을 {@link ControlDatabase.withTransaction} 콜백 **밖으로** 실어 나르는 표식.
- *
- * 콜백이 던지면 트랜잭션이 롤백되고 그 예외가 그대로 올라온다 — 재mint 판정은 그 위에서
- * 한다. 그때 원래의 `SQLITE_CONSTRAINT_PRIMARYKEY`를 그대로 보고 판정하면 «`logs` 삽입이
- * 충돌했다»와 «`log_subjects` 삽입이 충돌했다»가 한 값으로 뭉개진다. 어느 문장이 던졌는지는
- * 그 문장 자리에서만 알 수 있으므로, 그 자리에서 이 표식으로 바꿔 올린다. 이 파일 밖으로
- * 나가지 않는다.
- */
-class MintCollision extends Error {}
-
 /** `node:sqlite` 위의 {@link ControlStore} 구현 — 연결을 소유하지 않는 리포지토리다(파일 상단
- * doc). 트랜잭션 구간을 `await`가 가로지르지 않는다 — 넣으면 이벤트 루프가 다른 호출에 제어를
- * 넘겨 그 호출의 쓰기가 이 트랜잭션에 든다 (`./db.ts`의 «트랜잭션은 직렬이다»). */
+ * doc). «트랜잭션 콜백에 `await`를 넣지 않는다» 불변식을 이 파일은 더 이상 진술하지 않는다 —
+ * 진술하는 자리는 `./db.ts` 상단 doc(«한 연결이라 트랜잭션은 직렬이다») 하나다(mori-nest #133,
+ * PR mori-nest#138 교차 리뷰가 남긴 정리). */
 class SqliteControlStore implements ControlStore {
   readonly #database: ControlDatabase
   readonly #randomBytes: RandomBytesFn
@@ -450,28 +477,39 @@ class SqliteControlStore implements ControlStore {
         // 방금 넣은 로그 행도 롤백으로 함께 사라진다: 로그만 있고 쌍이 없는 고아 로그를
         // 만들지 않는다 (파일 상단 doc «원자성»).
         await this.#database.withTransaction(() => {
-          try {
-            this.#insertLog.run(logId)
-          } catch (error) {
-            // §2.1 MUST NOT: 이미 존재하는 id가 나오면 그 로그를 돌려주지 않는다 — 아래에서
-            // 다시 mint한다.
-            throw isPrimaryKeyViolation(error) ? new MintCollision() : error
-          }
-          this.#insertSubject.run(logId, subject)
+          this.insertMintedLog(logId, subject)
         })
       } catch (error) {
-        if (error instanceof MintCollision) {
+        if (error instanceof ControlStoreError && error.reason === 'log_id_collision') {
           // 이 트랜잭션은 아무것도 커밋하지 않았으므로 다음 시도는 깨끗한 상태에서 시작한다.
           continue
-        }
-        if (isCheckViolation(error)) {
-          throw new ControlStoreError('blank_subject')
         }
         throw error
       }
       return { logId }
     }
     throw new ControlStoreError('mint_exhausted')
+  }
+
+  // 같은 이름의 모듈 함수를 주입된 난수원으로 부른다 — 클래스 메서드는 `this.`로만 닿으므로
+  // 아래 이름은 모듈 함수를 가리킨다 (재귀가 아니다).
+  mintLogId(): string {
+    return mintLogId(this.#randomBytes)
+  }
+
+  insertMintedLog(logId: string, subject: string): void {
+    try {
+      this.#insertLog.run(logId)
+    } catch (error) {
+      // §2.1 MUST NOT: 이미 존재하는 id가 나오면 그 로그를 돌려주지 않는다 — 호출자가 새
+      // 트랜잭션에서 다시 mint한다 (`ControlStore.insertMintedLog` doc).
+      throw isPrimaryKeyViolation(error) ? new ControlStoreError('log_id_collision') : error
+    }
+    try {
+      this.#insertSubject.run(logId, subject)
+    } catch (error) {
+      throw isCheckViolation(error) ? new ControlStoreError('blank_subject') : error
+    }
   }
 
   async grant(subject: string, logId: string): Promise<void> {

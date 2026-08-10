@@ -73,7 +73,7 @@ const config = {
   gracePeriodSeconds: 600,
 }
 
-const server = createControlServer({ store, idempotency, credentials, workspaces, config })
+const server = createControlServer({ database, store, idempotency, credentials, workspaces, config })
 server.listen(0, '127.0.0.1')
 await once(server, 'listening')
 const { port } = server.address()

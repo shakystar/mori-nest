@@ -20,7 +20,10 @@
  * ## 원자성을 세우는 자리
  *
  * `§1.4`의 MUST — *"키 기록과 자원 생성은 원자적이다"* — 를 이 파일이 통째로 못 지킨다: 자원을
- * **만드는** 코드(로그·작업공간 생성)는 다음 조각(라우트 배선)에 있고 이 파일에는 없다. 대신
+ * **만드는** 코드(로그·작업공간 생성)는 라우트 배선(mori-nest #133, UoW 조각 4/4)에 있고 이
+ * 파일에는 없다. 그 조각이 `complete`를 자원 생성과 한 트랜잭션으로 묶을 수 있도록
+ * {@link IdempotencyStore.completeSync}(동기 버전)를 낸다 — `complete`는 그것을 감싼 것뿐이다.
+ * 대신
  * 이 파일이 지는 것은 그보다 좁고 정확한 절반이다 — **`reserve`가 `'reserved'`를 돌려주는
  * 호출은 동시에 최대 하나다.** 그 보장은 `(subject, key)`에 건 `PRIMARY KEY` 제약이 한다
  * (`store.ts`의 `UNIQUE (log_id, event_id)`와 같은 자리 — 판정하는 것은 제약이고 코드는 그
@@ -142,6 +145,18 @@ export type IdempotencyStore = {
    *   `reserve` 없이 부른 것이라 부르는 쪽의 결함이다.
    */
   complete(subject: string, key: string, record: IdempotencyRecord): Promise<void>
+
+  /**
+   * `complete`와 판정이 같은 **동기** 버전 (mori-nest #133, UoW 조각 4/4 — mori-nest #130
+   * 코멘트가 남긴 설계 숙제 1번). 라우트가 자원 생성과 완료를 한 트랜잭션으로 묶을 때, 이미
+   * 연 `ControlDatabase.withTransaction` 콜백 **안에서** 이것을 부른다 — `complete`(을
+   * `await`)를 그 콜백 안에서 쓰면 콜백이 thenable이 되어 `BEGIN`~`COMMIT` 사이가 이벤트
+   * 루프에 열린다(`./db.ts` 상단 doc). `complete`는 이 메서드를 그대로 감싼 것뿐이다 — 문장도
+   * 판정도 하나로 공유한다.
+   *
+   * @throws {IdempotencyStoreError} 가리키는 예약이 없으면 (`reservation_not_found`).
+   */
+  completeSync(subject: string, key: string, record: IdempotencyRecord): void
 }
 
 /**
@@ -304,6 +319,10 @@ class SqliteIdempotencyStore implements IdempotencyStore {
   }
 
   async complete(subject: string, key: string, record: IdempotencyRecord): Promise<void> {
+    this.completeSync(subject, key, record)
+  }
+
+  completeSync(subject: string, key: string, record: IdempotencyRecord): void {
     const changes = this.#complete.run(record.status, record.body, subject, key)
     if (Number(changes.changes) !== 1) {
       throw new IdempotencyStoreError('reservation_not_found')

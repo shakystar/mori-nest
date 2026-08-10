@@ -63,6 +63,31 @@
  * (아래 {@link isThenable}) — 리포지토리 메서드 본문에 `await`를 두지 않는 기존 규율
  * (`src/control/store.ts` 상단 doc)과 같은 자리, 같은 이유다. 요청 하나를 한 트랜잭션으로
  * 묶는 라우트 배선(**조각 4/4**)은 이 성질 위에서 설계해야 한다.
+ *
+ * ### 조각 4/4가 고른 답 — "동기 body를 강제한다" (mori-nest #133, mori-nest #130 코멘트의 설계 숙제 1번)
+ *
+ * 라우트가 `logId`/`workspaceId` mint를 멱등 완료(`./idempotency.ts`)와 한 커밋으로 묶어야
+ * 하는데, 스토어 인터페이스는 이식성 하드 룰 1(`CLAUDE.md`)에 따라 여전히 `Promise`를
+ * 돌려준다 — 그래서 라우트가 순진하게 `await store.method(...)`를 콜백 안에 두면 위 성질이
+ * 조용히 깨진다. 고른 답은 세 선택지((a) body를 동기로 강제, (b) DB 단위 직렬화 큐,
+ * (c) thenable body 자체를 거부) 중 **(a)** — `ControlStore.insertMintedLog`·
+ * `WorkspaceStore.insertMintedWorkspace`·`IdempotencyStore.completeSync`처럼 `Promise`를
+ * 돌려주지 **않는** 동기 전용 메서드를 리포지토리 경계마다 새로 낸다. 라우트는 이 동기
+ * 메서드들만 `withTransaction` 콜백 안에서 조합하고, 콜백 자체에 `async` 키워드를 쓰지
+ * 않는다 — 타입이 `Promise`를 돌려주지 않으므로 `await`를 쓸 문법적 자리가 애초에 없다.
+ * (b)·(c)를 고르지 않은 이유: 이 리포는 이미 모든 기존 트랜잭션 본문이 동기라는 불변식
+ * 위에 서 있고((`store.ts`·`workspace-store.ts`·`credential.ts`가 이미 그렇다), 그 불변식을
+ * 새 리포지토리 경계에도 그대로 넓히는 것이 DB 단위 큐(b)나 런타임 거부(c)를 새로 들이는
+ * 것보다 이 모듈의 기존 설계와 더 가깝다.
+ *
+ * 이 선택의 결과: **`nested_transaction`은 이제 동시 요청이 아니라 코드 결함의 신호다.**
+ * 모든 트랜잭션 콜백이 동기인 한, 한 콜백의 `BEGIN`~`COMMIT`은 한 자바스크립트 실행틱
+ * 안에서 끝나므로(중간에 이벤트 루프로 제어가 넘어갈 지점이 없다) 서로 다른 요청의
+ * `withTransaction` 호출이 실제로 겹칠 수 없다 — 겹쳐 보이면 그것은 어딘가(주로 새 코드)가
+ * 콜백 안에 `await`를 흘려 넣었다는 뜻이다. 그래서 `src/control/server.ts`의 `storeFailure`는
+ * `nested_transaction`을 재시도 유도(`503`)로 옮기지 **않는다** — 재시도해도 같은 결함이
+ * 같은 이유로 다시 던진다. 반대로 `database_closed`는 셧다운이라는 정상 운영 상태의
+ * 신호이므로 `503 unavailable`로 옮긴다(그 결정도 `storeFailure` 옆에 적혀 있다).
  */
 
 import { DatabaseSync } from 'node:sqlite'

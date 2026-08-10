@@ -111,6 +111,21 @@ type HeartbeatReply = OpenReply & { state: string }
 /** `§4.4`·`§4.5` 응답의 세 필드 (`WorkspaceTerminalResult` + `workspaceId`). */
 type TerminalReply = { workspaceId: string; state: string; endedAt: string }
 
+/** ㉚·㉛·㉜가 **실패 창**을 재현하기 위한 래퍼 (mori-nest #133, UoW 조각 4/4). 라우트가 자원
+ * 생성과 같은 트랜잭션 안에서 부르는 {@link IdempotencyStore.completeSync}만 던지게 하고
+ * 나머지는 실제 스토어로 위임한다 — 예약(`reserve`)은 살아 있어야 «자원은 만들어졌는데 완료
+ * 기록만 실패한» 바로 그 창이 재현된다. `withFailingForkAdvisory`와 같은 이유로 `Proxy`가
+ * 아니라 `bind` 위임이다(프라이빗 필드). */
+function withFailingComplete(real: IdempotencyStore): IdempotencyStore {
+  return {
+    reserve: real.reserve.bind(real),
+    complete: real.complete.bind(real),
+    completeSync: () => {
+      throw new Error('completeSync boom (시험용)')
+    },
+  }
+}
+
 /** ㉘가 던지는 판정을 시험하기 위한 래퍼 — 나머지 메서드는 실제 스토어로 위임하고
  * `findForkAdvisory`만 거부한다. `SqliteWorkspaceStore`는 프라이빗 필드를 쓰므로 `Proxy`로
  * 감싸면 위임 호출의 `this`가 프록시가 되어 프라이빗 필드 접근이 깨진다 — 그래서 메서드마다
@@ -118,6 +133,8 @@ type TerminalReply = { workspaceId: string; state: string; endedAt: string }
 function withFailingForkAdvisory(real: WorkspaceStore): WorkspaceStore {
   return {
     openWorkspace: real.openWorkspace.bind(real),
+    mintWorkspaceId: real.mintWorkspaceId.bind(real),
+    insertMintedWorkspace: real.insertMintedWorkspace.bind(real),
     getWorkspace: real.getWorkspace.bind(real),
     heartbeat: real.heartbeat.bind(real),
     closeWorkspace: real.closeWorkspace.bind(real),
@@ -166,6 +183,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   /** 설정만 갈아 끼운 서버 하나를 더 띄운다 — 스토어(= DB 파일)는 그대로 공유한다. */
   async function startServer(overrides: Partial<ControlConfig>): Promise<string> {
     const extra = createControlServer({
+      database,
       store,
       idempotency,
       credentials,
@@ -248,12 +266,66 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     }
   }
 
-  function createLog(token: string, key: string, body = '{}'): Promise<Reply> {
-    return send('/v1/logs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'Idempotency-Key': key },
-      body,
+  /** `logs`·`log_subjects` 두 테이블의 행 수 (mori-nest #133 ㉚·㉜). 실패 창을 재현한 뒤
+   * **자원이 남지 않았음**을 보는 자리라 라우트(`GET /v1/logs`)가 아니라 저장분을 직접 센다 —
+   * 라우트는 주체로 걸러 보여주므로 «관계 행 없이 남은 고아 로그»를 못 본다.
+   * `storedWorkspaceCount`와 같은 DB 파일이다(제어 평면 단일 DB, mori-nest #130). */
+  function storedLogCounts(): { readonly logs: number; readonly subjects: number } {
+    const db = new DatabaseSync(join(dir, 'control-plane.db'))
+    try {
+      return {
+        logs: Number(db.prepare('SELECT COUNT(*) AS n FROM logs').get()?.['n']),
+        subjects: Number(db.prepare('SELECT COUNT(*) AS n FROM log_subjects').get()?.['n']),
+      }
+    } finally {
+      db.close()
+    }
+  }
+
+  /** 예약 행을 보관 창(`§1.4`의 24시간) 밖으로 밀어 낸다 — ㉜가 `claimExpired` 경로를 타게
+   * 하는 자리다. `reserve`의 `now`는 라우트가 주지 않으므로(실시간이다) 시계를 앞으로 돌리는
+   * 대신 행의 `created_at`을 뒤로 돌린다. */
+  function ageReservation(subject: string, key: string): void {
+    const db = new DatabaseSync(join(dir, 'control-plane.db'))
+    try {
+      const aged = Date.now() - 25 * 60 * 60 * 1000
+      const changes = db
+        .prepare('UPDATE idempotency_keys SET created_at = ? WHERE subject = ? AND key = ?')
+        .run(aged, subject, key)
+      expect(Number(changes.changes)).toBe(1)
+    } finally {
+      db.close()
+    }
+  }
+
+  /** `completeSync`만 던지는 서버를 하나 더 띄운다 — 스토어(= DB 파일)는 그대로 공유한다
+   * (㉘의 패턴 그대로). */
+  async function startFailingCompleteServer(): Promise<string> {
+    const failing = createControlServer({
+      database,
+      store,
+      idempotency: withFailingComplete(idempotency),
+      credentials,
+      workspaces,
+      config: CONFIG,
     })
+    await new Promise<void>((resolve) => {
+      failing.listen(0, '127.0.0.1', resolve)
+    })
+    extraServers.push(failing)
+    return `http://127.0.0.1:${String((failing.address() as AddressInfo).port)}`
+  }
+
+  function createLog(token: string, key: string, body = '{}', at: string = origin): Promise<Reply> {
+    return send(
+      '/v1/logs',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'Idempotency-Key': key },
+        body,
+      },
+      at,
+    )
   }
 
   function read(path: string, token: string, at: string = origin): Promise<Reply> {
@@ -286,7 +358,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     tokenA = (await credentials.issue('subject-a')).token
     tokenB = (await credentials.issue('subject-b')).token
 
-    server = createControlServer({ store, idempotency, credentials, workspaces, config: CONFIG })
+    server = createControlServer({ database, store, idempotency, credentials, workspaces, config: CONFIG })
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', resolve)
     })
@@ -951,6 +1023,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
   it('㉘ findForkAdvisory가 던져도 하트비트는 200이고 forkAdvisory 키만 빠진다 (§4.10 MUST NOT)', async () => {
     const diagnostics: ControlDiagnostic[] = []
     const failing = createControlServer({
+      database,
       store,
       idempotency,
       credentials,
@@ -983,6 +1056,7 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
 
   it('㉙ onDiagnostic 훅 자신이 던져도 하트비트는 200이다 (전송 평면 diagnosticSink 규율)', async () => {
     const throwing = createControlServer({
+      database,
       store,
       idempotency,
       credentials,
@@ -1009,5 +1083,67 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     const body = bodyOf(reply) as HeartbeatReply
     expect('forkAdvisory' in body).toBe(false)
     expect(body.state).toBe('active')
+  })
+
+  it('㉚ complete가 실패하면 방금 만든 로그가 남지 않는다 (§1.4 원자성, mori-nest #133)', async () => {
+    const at = await startFailingCompleteServer()
+
+    const reply = await createLog(tokenA, 'atomic-log-key', '{}', at)
+
+    // 완료 기록이 실패했으므로 `201`을 쓰지 않는다 (핸들러 doc) — 그 자체는 이전과 같다.
+    expect(reply.status).toBe(500)
+    // 달라진 것은 여기다: 예전에는 로그가 **만들어진 채로** 남았다(자원은 있는데 완료 기록이
+    // 없는 상태 = 이 이슈가 닫는 실패 창). 이제 같은 트랜잭션이라 함께 롤백된다.
+    expect(storedLogCounts()).toEqual({ logs: 0, subjects: 0 })
+  })
+
+  it('㉛ complete가 실패하면 방금 개시한 작업공간이 남지 않는다 (§1.4 원자성, mori-nest #133)', async () => {
+    const logs = [await mintedLogId(tokenA, 'atomic-ws-log')]
+    const at = await startFailingCompleteServer()
+
+    const reply = await openWorkspace(tokenA, 'atomic-ws-key', JSON.stringify({ logs }), at)
+
+    expect(reply.status).toBe(500)
+    // 로그 라우트와 같은 성질임을 작업공간 쪽에서 다시 못박는다 — 두 라우트의 멱등 계약이
+    // 갈리지 않았다는 것이 이 시험이 지키는 것이다 (이슈 본문 「테스트」).
+    expect(storedWorkspaceCount('subject-a')).toBe(0)
+    // 스코프로 쓴 로그는 그대로다 — 롤백 범위가 이 요청이 만든 것에만 걸린다.
+    expect(storedLogCounts()).toEqual({ logs: 1, subjects: 1 })
+  })
+
+  it('㉜ 보관 창이 지나 예약이 되찾아져도 로그는 하나뿐이다 (§1.4 회귀, mori-nest #133)', async () => {
+    // 1) 실패 창을 재현한다 — 예약은 `in_progress`로 남고, 로그는 (이제) 남지 않는다.
+    const at = await startFailingCompleteServer()
+    expect((await createLog(tokenA, 'expired-key', '{}', at)).status).toBe(500)
+
+    // 2) 보관 창(24시간)을 넘긴다 — 재시도가 `claimExpired`로 **새 예약**을 잡는 경로다
+    //    (`src/control/idempotency.ts`의 `reserve`).
+    ageReservation('subject-a', 'expired-key')
+
+    // 3) 같은 키·같은 본문으로 다시 온다. 이번엔 정상 서버라 완료까지 간다.
+    const retry = await createLog(tokenA, 'expired-key')
+    expect(retry.status).toBe(201)
+
+    // 예전 결함: 1)이 남긴 로그 + 3)이 만든 로그 = **둘**이었다. 이제 1)이 아무것도 남기지
+    // 않으므로 정확히 하나다.
+    expect(storedLogCounts()).toEqual({ logs: 1, subjects: 1 })
+    const listed = bodyOf(await read('/v1/logs', tokenA)) as { logs: { logId: string }[] }
+    expect(listed.logs).toHaveLength(1)
+    expect(listed.logs[0]?.logId).toBe((bodyOf(retry) as { logId: string }).logId)
+  })
+
+  it('㉝ 같은 프로세스 안에서 인터리빙된 두 요청이 둘 다 정상 응답을 받는다 (nested_transaction 없음)', async () => {
+    // mori-nest #130 코멘트의 설계 숙제 2번을 못박는 자리다. `withTransaction` 콜백이 전부
+    // 동기라(그것이 `db.ts` 상단 doc "조각 4/4가 고른 답") 서로 다른 요청의 트랜잭션이 겹칠
+    // 자리가 없다 — 겹치면 한쪽이 `nested_transaction`을 받아 `500`으로 샜을 것이다.
+    // ⑦(별도 프로세스 경합)과 다른 것을 잰다: 이것은 **한 프로세스 안의** 인터리빙이다.
+    const [first, second] = await Promise.all([
+      createLog(tokenA, 'interleave-key-1'),
+      createLog(tokenA, 'interleave-key-2'),
+    ])
+
+    expect([first?.status, second?.status]).toEqual([201, 201])
+    // 다른 키라 재생이 아니다 — 로그가 실제로 둘 생겼다.
+    expect(storedLogCounts()).toEqual({ logs: 2, subjects: 2 })
   })
 })
