@@ -132,7 +132,6 @@ function withFailingComplete(real: IdempotencyStore): IdempotencyStore {
  * `bind`로 실제 인스턴스에 묶어 위임한다. */
 function withFailingForkAdvisory(real: WorkspaceStore): WorkspaceStore {
   return {
-    openWorkspace: real.openWorkspace.bind(real),
     mintWorkspaceId: real.mintWorkspaceId.bind(real),
     insertMintedWorkspace: real.insertMintedWorkspace.bind(real),
     getWorkspace: real.getWorkspace.bind(real),
