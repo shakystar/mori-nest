@@ -133,6 +133,7 @@ function withFailingComplete(real: IdempotencyStore): IdempotencyStore {
 function withFailingForkAdvisory(real: WorkspaceStore): WorkspaceStore {
   return {
     openWorkspace: real.openWorkspace.bind(real),
+    mintWorkspaceId: real.mintWorkspaceId.bind(real),
     insertMintedWorkspace: real.insertMintedWorkspace.bind(real),
     getWorkspace: real.getWorkspace.bind(real),
     heartbeat: real.heartbeat.bind(real),

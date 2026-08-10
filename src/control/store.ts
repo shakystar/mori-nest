@@ -287,6 +287,20 @@ export type ControlStore = {
   createLog(subject: string): Promise<{ readonly logId: string }>
 
   /**
+   * 새 `logId`를 mint한다 — {@link insertMintedLog}에 건넬 값을 만드는 자리다 (mori-nest #133,
+   * UoW 조각 4/4). 모듈 함수 {@link mintLogId}를 **이 스토어에 주입된 난수원으로** 부른 것뿐이다:
+   * 라우트가 모듈 함수를 직접 부르면 `openControlStore`의 `randomBytes` 옵션이 조용히 무시되어
+   * 난수원이 둘로 갈린다.
+   *
+   * 트랜잭션 **밖**에서 부른다(파일 상단 doc "mint 재시도와 dedup") — 그래서 `Promise`를
+   * 돌려주지 않는다. I/O가 아니라 난수 읽기 하나다.
+   *
+   * @throws {ControlStoreError} 난수원이 요구한 바이트를 못 주면 (`random_source_too_short`);
+   *   mint 결과가 `0002 §1.1` 정규식을 벗어나면 (`minted_id_invalid`).
+   */
+  mintLogId(): string
+
+  /**
    * mint된 `logId`로 `logs` 행과 (주체, 로그) 관계 행을 만든다 — {@link createLog}가 여는
    * 두 문장의 조합이다 (mori-nest #133, UoW 조각 4/4). **자기 트랜잭션을 열지 않고,
    * `Promise`도 돌려주지 않는다** — 호출자가 이미 연 `ControlDatabase.withTransaction`
@@ -475,6 +489,12 @@ class SqliteControlStore implements ControlStore {
       return { logId }
     }
     throw new ControlStoreError('mint_exhausted')
+  }
+
+  // 같은 이름의 모듈 함수를 주입된 난수원으로 부른다 — 클래스 메서드는 `this.`로만 닿으므로
+  // 아래 이름은 모듈 함수를 가리킨다 (재귀가 아니다).
+  mintLogId(): string {
+    return mintLogId(this.#randomBytes)
   }
 
   insertMintedLog(logId: string, subject: string): void {

@@ -98,9 +98,9 @@ import type { IdempotencyStore } from './idempotency.js'
 // 여기에 다시 적는 대신 이름으로 가리킨다.
 import type { ControlConfig } from './index.js'
 import { verifyControlRequest, type ControlRequest, type RawRequest } from './request.js'
-import { ControlStoreError, DEFAULT_PAGE_LIMIT, mintLogId, type ControlStore } from './store.js'
+import { ControlStoreError, DEFAULT_PAGE_LIMIT, type ControlStore } from './store.js'
 import { issueWorkspaceToken, mintTokenId } from './token.js'
-import { mintWorkspaceId, WorkspaceStoreError, type ForkOverlap, type WorkspaceStore } from './workspace-store.js'
+import { WorkspaceStoreError, type ForkOverlap, type WorkspaceStore } from './workspace-store.js'
 
 /**
  * `GET /v1/logs`의 `limit` 천장 ({@link handleListLogs} doc). 스토어가 `limit` 없이 쓰는
@@ -475,7 +475,8 @@ async function handleCreateLog(
   let record: { readonly status: number; readonly body: string } | undefined
   try {
     for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt += 1) {
-      const logId = mintLogId()
+      // mint는 트랜잭션 **밖**이고, 난수원은 스토어의 것이다 (`ControlStore.mintLogId` doc).
+      const logId = options.store.mintLogId()
       const candidate = { status: 201, body: JSON.stringify({ logId }) }
       try {
         await options.database.withTransaction(() => {
@@ -882,7 +883,7 @@ async function handleOpenWorkspace(
   let stored: OpenWorkspaceReservation | undefined
   try {
     for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt += 1) {
-      const workspaceId = mintWorkspaceId()
+      const workspaceId = options.workspaces.mintWorkspaceId()
       // `scope`는 요청한 `logs` 그대로다 — 서버가 넓히지도 조용히 좁히지도 않는다 (`§3.6` MUST).
       const candidate: OpenWorkspaceReservation = { workspaceId, scope: logs }
       try {

@@ -382,6 +382,18 @@ export type WorkspaceStore = {
   openWorkspace(subject: string, request: OpenWorkspaceRequest): Promise<{ readonly workspaceId: string }>
 
   /**
+   * 새 `workspaceId`를 mint한다 — {@link insertMintedWorkspace}에 건넬 값을 만드는 자리다
+   * (mori-nest #133, UoW 조각 4/4). `ControlStore.mintLogId`와 같은 이유로 스토어가 낸다:
+   * 모듈 함수 {@link mintWorkspaceId}를 라우트가 직접 부르면 `openWorkspaceStore`의
+   * `randomBytes` 옵션이 조용히 무시된다. 트랜잭션 **밖**에서 부르므로 `Promise`를 돌려주지
+   * 않는다.
+   *
+   * @throws {WorkspaceStoreError} 난수원이 요구한 바이트를 못 주면 (`random_source_too_short`);
+   *   mint 결과가 형식을 벗어나면 (`minted_id_invalid`).
+   */
+  mintWorkspaceId(): string
+
+  /**
    * mint된 `workspaceId`로 개시 행을 만든다 — {@link openWorkspace}가 여는 조합이다
    * (mori-nest #133, UoW 조각 4/4). **자기 트랜잭션을 열지 않고, `Promise`도 돌려주지
    * 않는다** — 호출자가 이미 연 `ControlDatabase.withTransaction` 콜백 **안에서, 동기로**
@@ -830,6 +842,11 @@ class SqliteWorkspaceStore implements WorkspaceStore {
       }
     }
     throw new WorkspaceStoreError('mint_exhausted')
+  }
+
+  // `SqliteControlStore.mintLogId`와 같은 자리 — 아래 이름은 모듈 함수를 가리킨다.
+  mintWorkspaceId(): string {
+    return mintWorkspaceId(this.#randomBytes)
   }
 
   insertMintedWorkspace(workspaceId: string, subject: string, request: OpenWorkspaceRequest): void {
