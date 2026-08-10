@@ -486,5 +486,18 @@ describe('WorkspaceStore.findForkAdvisory (§4.10 포크 판정, advisory 조각
     await openReplicaAt(store, 'alice', undefined, 600)
     vi.useRealTimers()
     expect(await store.findForkAdvisory('alice', self, { gracePeriodMs, now: new Date(1_000) })).toBeUndefined()
+
+    // self가 replicaId를 신고하지 않았으면 판정하지 않는다 (§4.9 — 미신고를 전량 일치로
+    // 떨어뜨리지 않는다). 상대가 같은 시간대에 replicaId를 신고하고 있어도 undefined다.
+    vi.useFakeTimers()
+    const silent = await openReplicaAt(store, 'alice', undefined, 700)
+    vi.useRealTimers()
+    expect(await store.findForkAdvisory('alice', silent, { gracePeriodMs, now: new Date(1_000) })).toBeUndefined()
+
+    // 상대가 replicaId를 신고했지만 **다른 값**이면 비교 대상이 아니다.
+    vi.useFakeTimers()
+    await openReplicaAt(store, 'alice', 'r2', 800)
+    vi.useRealTimers()
+    expect(await store.findForkAdvisory('alice', self, { gracePeriodMs, now: new Date(1_000) })).toBeUndefined()
   })
 })

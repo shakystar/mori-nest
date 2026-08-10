@@ -301,8 +301,9 @@ export type WorkspaceTerminalResult = {
 }
 
 /** {@link findForkOverlap}·{@link WorkspaceStore.findForkAdvisory}가 돌려주는 판정 결과
- * (`0003 §4.10`, mori-nest #117 조각 1/2). 이 값을 `HeartbeatResponse`에 싣는 배선은 조각
- * 2/2의 몫이다 — 이 파일에서는 아무도 이 판정을 부르지 않는다(파일 상단 doc 비범위). */
+ * (`0003 §4.10`, mori-nest #117 조각 1/2). 이 값을 `HeartbeatResponse`에 싣는 배선은
+ * `src/control/server.ts`의 `handleHeartbeatWorkspace`가 한다(조각 2/2, mori-nest #118) —
+ * 이 파일 자신은 그 배선을 갖지 않는다(파일 상단 doc 비범위, 두 평면 경계). */
 export type ForkOverlap = {
   readonly replicaId: string
   readonly overlappingWorkspaceId: string

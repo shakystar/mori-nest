@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { openLauncherCredentialStore, type LauncherCredentialStore } from '../src/control/credential.js'
 import { openIdempotencyStore, type IdempotencyStore } from '../src/control/idempotency.js'
@@ -20,12 +20,15 @@ import { createVerificationKeySet, verifyWorkspaceToken } from '../src/transport
 import { KEY_ID, issuer } from './workspace-token.js'
 
 /**
- * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`·`§4.3`·`§4.4`·`§4.5`·`§4.6`,
- * mori-nest #84·#93·#103·#113·#114·#115).
+ * 제어 평면 라우트 (`0003 §2.1`·`§2.4`·`§1.4`·`§2.6`·`§4.2`·`§4.3`·`§4.4`·`§4.5`·`§4.6`·`§4.10`,
+ * mori-nest #84·#93·#103·#113·#114·#115·#118).
  *
  * **동작 하나당 하나 — #84가 일곱 건, #93이 그 위에 세 건(`§2.6` revoke), #103이 다섯 건
  * (`§4.2` 개시), #113이 네 건(`§4.3` 하트비트), #114가 세 건(`§4.4`·`§4.5` 종료·폐기),
- * #115가 네 건(`§4.6` 목록·단건 조회)을 더한다** (각 이슈 본문의 완료 조건). 게이트 판정
+ * #115가 네 건(`§4.6` 목록·단건 조회), #118이 두 건(`§4.10` 하트비트 응답의 `forkAdvisory`
+ * 배선, advisory 조각 2/2)을 더한다** (각 이슈 본문의 완료 조건). 겹침이 없을 때 키가 없다는
+ * 것은 새 `it`을 만들지 않고 #113의 ⑯에 단언 한 줄을 더했다(이슈 #118 「테스트」 절 지시).
+ * 게이트 판정
  * (자격·메서드·본문 형태·커서 형식)의 케이스는 여기서 다시 세우지 않는다 — `#83`·`#93`·`#102`가
  * `test/control-request.test.ts`에 이미 세웠고, 이 파일이 보는 것은 **판정 결과가 스토어
  * 호출로 이어진 뒤의 관찰 가능한 응답**이다. 토큰 와이어 형식의 재검증도 하지 않는다
@@ -106,6 +109,23 @@ type HeartbeatReply = OpenReply & { state: string }
 
 /** `§4.4`·`§4.5` 응답의 세 필드 (`WorkspaceTerminalResult` + `workspaceId`). */
 type TerminalReply = { workspaceId: string; state: string; endedAt: string }
+
+/** ㉘가 던지는 판정을 시험하기 위한 래퍼 — 나머지 메서드는 실제 스토어로 위임하고
+ * `findForkAdvisory`만 거부한다. `SqliteWorkspaceStore`는 프라이빗 필드를 쓰므로 `Proxy`로
+ * 감싸면 위임 호출의 `this`가 프록시가 되어 프라이빗 필드 접근이 깨진다 — 그래서 메서드마다
+ * `bind`로 실제 인스턴스에 묶어 위임한다. */
+function withFailingForkAdvisory(real: WorkspaceStore): WorkspaceStore {
+  return {
+    openWorkspace: real.openWorkspace.bind(real),
+    getWorkspace: real.getWorkspace.bind(real),
+    heartbeat: real.heartbeat.bind(real),
+    closeWorkspace: real.closeWorkspace.bind(real),
+    revokeWorkspace: real.revokeWorkspace.bind(real),
+    listWorkspaces: real.listWorkspaces.bind(real),
+    close: real.close.bind(real),
+    findForkAdvisory: () => Promise.reject(new Error('forkAdvisory boom (시험용)')),
+  }
+}
 
 /**
  * 시험용 발급 설정 — `§3.4`의 네 제약을 만족한다 (`parseControlConfig`가 강제하는 그것).
@@ -615,6 +635,8 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     expect(body.state).toBe('active')
     expect(body.scope).toEqual(logs)
     expect(body.heartbeatIntervalSeconds).toBe(CONFIG.heartbeatIntervalSeconds)
+    // 겹침이 없으면 `forkAdvisory` 키 자체가 없다 (§4.10, exactOptionalPropertyTypes).
+    expect('forkAdvisory' in body).toBe(false)
     // 갱신은 **새 발급**이다 (§3.4) — 저장된 토큰의 재생이 아니다. `expiresAt`이 앞으로 가지
     // 않으면 하트비트를 아무리 보내도 수명이 늘지 않아 §3.5의 수렴이 성립하지 않는다.
     expect(body.tokenId).not.toBe(opened.tokenId)
@@ -892,4 +914,61 @@ describe('제어 평면 라우트 (0003 §2.1·§2.4·§1.4·§2.6·§4.2·§4.3
     },
     20_000,
   )
+
+  it('㉗ 같은 replicaId로 겹치는 두 작업공간 중 하나에 하트비트를 치면 200 + forkAdvisory, token은 정상 갱신된다 (§4.10)', async () => {
+    const logsA = [await mintedLogId(tokenA, 'fork-log-a')]
+    const openedA = bodyOf(
+      await openWorkspace(tokenA, 'fork-key-a', JSON.stringify({ logs: logsA, replicaId: 'r1' })),
+    ) as OpenReply
+    const logsB = [await mintedLogId(tokenA, 'fork-log-b')]
+    const openedB = bodyOf(
+      await openWorkspace(tokenA, 'fork-key-b', JSON.stringify({ logs: logsB, replicaId: 'r1' })),
+    ) as OpenReply
+
+    const reply = await heartbeat(openedA.workspaceId, tokenA)
+
+    expect(reply.status).toBe(200)
+    const body = bodyOf(reply) as HeartbeatReply & {
+      forkAdvisory?: { replicaId: string; overlappingWorkspaceId: string }
+    }
+    expect(body.forkAdvisory).toEqual({ replicaId: 'r1', overlappingWorkspaceId: openedB.workspaceId })
+    // advisory가 실려도 성패·다른 필드는 바뀌지 않는다 — 갱신은 정상이다 (§4.10 MUST).
+    expect(body.state).toBe('active')
+    expect(body.scope).toEqual(logsA)
+    expect(body.tokenId).not.toBe(openedA.tokenId)
+    expect(body.token).not.toBe(openedA.token)
+  })
+
+  it('㉘ findForkAdvisory가 던져도 하트비트는 200이고 forkAdvisory 키만 빠진다 (§4.10 MUST NOT)', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const failing = createControlServer({
+        store,
+        idempotency,
+        credentials,
+        workspaces: withFailingForkAdvisory(workspaces),
+        config: CONFIG,
+      })
+      await new Promise<void>((resolve) => {
+        failing.listen(0, '127.0.0.1', resolve)
+      })
+      extraServers.push(failing)
+      const at = `http://127.0.0.1:${String((failing.address() as AddressInfo).port)}`
+
+      const logs = [await mintedLogId(tokenA, 'fork-fail-log')]
+      const opened = bodyOf(await openWorkspace(tokenA, 'fork-fail-key', JSON.stringify({ logs }), at)) as OpenReply
+
+      const reply = await heartbeat(opened.workspaceId, tokenA, at)
+
+      expect(reply.status).toBe(200)
+      const body = bodyOf(reply) as HeartbeatReply
+      expect('forkAdvisory' in body).toBe(false)
+      // 나머지 필드는 판정 실패와 무관하게 정상 갱신된다.
+      expect(body.state).toBe('active')
+      expect(body.scope).toEqual(logs)
+      expect(consoleError).toHaveBeenCalledTimes(1)
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
 })
