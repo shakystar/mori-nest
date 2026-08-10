@@ -11,12 +11,27 @@
  * 파일을 열어 준다(`:memory:`는 내구성 PRAGMA를 걸 수 없어 거부된다). 명제는 그대로다.
  * 거기에 시험 하나가 더해졌다 — 구 스키마 보정(`addMissingRevocationColumn`)이 UoW 아래에서도
  * 도는지는 이 전환으로 실제로 깨질 수 있는 자리인데 덮는 시험이 없었다.
+ *
+ * `ControlStore.createLog`는 라우트가 안 쓰게 된 자기 트랜잭션 재시도 경로라 걷혔다
+ * (mori-nest #140, PR #139 교차 지적 회수) — 이 파일의 로그 픽스처는 이제 {@link createTestLog}
+ * 하나로 `mintLogId` + `insertMintedLog`를 라우트와 같은 순서로 조합한다.
  */
 
 import { describe, expect, it } from 'vitest'
 
-import { ControlStoreError, mintLogId, openControlStore, type RandomBytesFn } from '../src/control/store.js'
+import type { ControlDatabase } from '../src/control/db.js'
+import { ControlStoreError, mintLogId, openControlStore, type ControlStore, type RandomBytesFn } from '../src/control/store.js'
 import { openTestControlDatabase } from './control-db.js'
+
+/** 라우트가 하는 mint + insert 조합을 시험에서 재현한다 — `ControlStore.createLog`가 걷힌 뒤
+ * (mori-nest #140) 로그 픽스처를 만드는 유일한 경로다. */
+async function createTestLog(database: ControlDatabase, store: ControlStore, subject: string): Promise<{ readonly logId: string }> {
+  const logId = store.mintLogId()
+  await database.withTransaction(() => {
+    store.insertMintedLog(logId, subject)
+  })
+  return { logId }
+}
 
 describe('mintLogId', () => {
   it('mint된 logId가 0002 §1.1 정규식을 만족한다', () => {
@@ -35,49 +50,56 @@ describe('openControlStore — 구 스키마 보정', () => {
     const store = await openControlStore(database)
 
     // 보정이 돌지 않았다면 `revoked_at`이 없어 `revoke`의 `UPDATE`가 여기서 던진다.
-    const { logId } = await store.createLog('owner')
+    const { logId } = await createTestLog(database, store, 'owner')
     const { revokedAt } = await store.revoke('owner', logId)
     expect(revokedAt).toEqual(expect.any(String))
     expect(await store.isGranted('owner', logId)).toBe(false)
   })
 })
 
-describe('ControlStore.createLog', () => {
+describe('ControlStore.insertMintedLog', () => {
   it('고정 난수원이 이미 존재하는 id를 다시 뽑으면 그 로그를 다른 주체에게 돌려주지 않는다 (§2.1 MUST NOT)', async () => {
     const fixedRandomBytes: RandomBytesFn = () => Buffer.from('0123456789abcdef', 'utf8')
-    const store = await openControlStore(await openTestControlDatabase(), { randomBytes: fixedRandomBytes })
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database, { randomBytes: fixedRandomBytes })
 
-    const first = await store.createLog('subject-a')
-    await expect(store.createLog('subject-b')).rejects.toThrow(ControlStoreError)
+    const { logId } = await createTestLog(database, store, 'subject-a')
+
+    // 같은 고정 난수원이 같은 id를 다시 뽑는다 — subject-b의 시도는 PRIMARY KEY 충돌이다.
+    await expect(database.withTransaction(() => store.insertMintedLog(store.mintLogId(), 'subject-b'))).rejects.toThrow(
+      ControlStoreError,
+    )
 
     // subject-b의 실패한 시도가 subject-a의 로그를 가로채지 않았다.
-    expect(await store.isGranted('subject-b', first.logId)).toBe(false)
-    expect(await store.isGranted('subject-a', first.logId)).toBe(true)
+    expect(await store.isGranted('subject-b', logId)).toBe(false)
+    expect(await store.isGranted('subject-a', logId)).toBe(true)
   })
 
   it('관계 행 추가가 실패하면 방금 mint된 로그도 남지 않는다 — 원자성', async () => {
-    const fixedRandomBytes: RandomBytesFn = () => Buffer.from('atomicity-fixed!', 'utf8')
-    const store = await openControlStore(await openTestControlDatabase(), { randomBytes: fixedRandomBytes })
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
+    const logId = store.mintLogId()
 
     // 빈 주체는 관계 행 삽입 단계(로그 삽입 *다음*)에서 거부된다 — 로그 삽입 자체는
     // 이 시도에서 이미 통과했었다는 뜻이다.
-    await expect(store.createLog('')).rejects.toThrow(ControlStoreError)
+    await expect(database.withTransaction(() => store.insertMintedLog(logId, ''))).rejects.toThrow(ControlStoreError)
 
-    // 실패한 시도가 로그 행을 남겼다면, 같은 고정 난수원은 같은 id를 다시 뽑고 그 id는
-    // 이미 있는 것이므로 mint 재시도가 전부 소진되어 이 호출도 실패한다. 성공한다는 것
-    // 자체가 첫 시도의 로그·관계가 롤백으로 함께 사라졌다는 증거다.
-    const retry = await store.createLog('valid-subject')
-    expect(await store.isGranted('valid-subject', retry.logId)).toBe(true)
+    // 실패한 시도가 로그 행을 남겼다면, 같은 id로 다시 삽입할 때 PRIMARY KEY 충돌
+    // (log_id_collision)이 난다. 통과한다는 것 자체가 첫 시도의 로그·관계가 롤백으로
+    // 함께 사라졌다는 증거다.
+    await database.withTransaction(() => store.insertMintedLog(logId, 'valid-subject'))
+    expect(await store.isGranted('valid-subject', logId)).toBe(true)
   })
 })
 
 describe('ControlStore — (주체, 로그) 다대다', () => {
   it('로그 하나에 주체 둘, 주체 하나에 로그 둘이 각 방향 조회에서 모두 보인다', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
 
-    const { logId: logA } = await store.createLog('x')
+    const { logId: logA } = await createTestLog(database, store, 'x')
     await store.grant('y', logA)
-    const { logId: logB } = await store.createLog('x')
+    const { logId: logB } = await createTestLog(database, store, 'x')
 
     // 로그 하나(logA)에 주체 둘(x, y).
     expect(await store.isGranted('x', logA)).toBe(true)
@@ -95,8 +117,9 @@ describe('ControlStore — (주체, 로그) 다대다', () => {
 
 describe('ControlStore.isGranted', () => {
   it('관계에 없는 (주체, 로그)의 grant 판정은 불통과다 — fail-closed', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
-    const { logId } = await store.createLog('owner')
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
+    const { logId } = await createTestLog(database, store, 'owner')
 
     expect(await store.isGranted('stranger', logId)).toBe(false)
   })
@@ -104,14 +127,15 @@ describe('ControlStore.isGranted', () => {
 
 describe('ControlStore.listLogsForSubject', () => {
   it('다른 주체의 로그를 포함하지 않고, logId 사전순이며, limit이 grant 판정 뒤에 걸린다', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
 
     const xLogIds = [
-      (await store.createLog('x')).logId,
-      (await store.createLog('x')).logId,
-      (await store.createLog('x')).logId,
+      (await createTestLog(database, store, 'x')).logId,
+      (await createTestLog(database, store, 'x')).logId,
+      (await createTestLog(database, store, 'x')).logId,
     ]
-    const { logId: yLogId } = await store.createLog('y')
+    const { logId: yLogId } = await createTestLog(database, store, 'y')
     const sortedX = [...xLogIds].sort()
 
     const page1 = await store.listLogsForSubject('x', { limit: 2 })
@@ -133,8 +157,9 @@ describe('ControlStore.listLogsForSubject', () => {
 
 describe('ControlStore.revoke', () => {
   it('revoke 후 isGranted가 false다', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
-    const { logId } = await store.createLog('owner')
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
+    const { logId } = await createTestLog(database, store, 'owner')
 
     await store.revoke('owner', logId)
 
@@ -142,10 +167,11 @@ describe('ControlStore.revoke', () => {
   })
 
   it('revoke 후 listLogsForSubject에서 그 로그가 빠지고, 남은 건수·hasMore가 폐기분을 제외한 값이다', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
-    const { logId: kept } = await store.createLog('subject')
-    const { logId: revokedA } = await store.createLog('subject')
-    const { logId: revokedB } = await store.createLog('subject')
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
+    const { logId: kept } = await createTestLog(database, store, 'subject')
+    const { logId: revokedA } = await createTestLog(database, store, 'subject')
+    const { logId: revokedB } = await createTestLog(database, store, 'subject')
 
     // 3건 중 2건을 폐기해 적격을 1건으로 만든다. 거르는 자리가 WHERE면 이 질의가 읽어 오는
     // 행이 1건뿐이라 hasMore가 false다. 읽어 온 뒤(= LIMIT+1행을 받은 뒤) 밖에서 거르는
@@ -159,8 +185,9 @@ describe('ControlStore.revoke', () => {
   })
 
   it('같은 (주체, 로그) revoke 2회가 같은 revokedAt을 돌려준다 — 멱등', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
-    const { logId } = await store.createLog('owner')
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
+    const { logId } = await createTestLog(database, store, 'owner')
 
     const first = await store.revoke('owner', logId)
     const second = await store.revoke('owner', logId)
@@ -169,8 +196,9 @@ describe('ControlStore.revoke', () => {
   })
 
   it('폐기된 로그에 대한 revoke가 여전히 성공한다 — 폐기가 자기 판정의 입력이 아니다', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
-    const { logId } = await store.createLog('owner')
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
+    const { logId } = await createTestLog(database, store, 'owner')
     await store.revoke('owner', logId)
 
     // isGranted는 폐기를 입력으로 삼아 이미 false다(§2.4·§3.6, 위 첫 테스트와 같은 사실).
@@ -181,8 +209,9 @@ describe('ControlStore.revoke', () => {
   })
 
   it('관계 행이 없는 (주체, 로그)의 revoke가 404로 옮길 수 있는 형태로 실패한다', async () => {
-    const store = await openControlStore(await openTestControlDatabase())
-    const { logId } = await store.createLog('owner')
+    const database = await openTestControlDatabase()
+    const store = await openControlStore(database)
+    const { logId } = await createTestLog(database, store, 'owner')
 
     const attempt = store.revoke('stranger', logId)
 

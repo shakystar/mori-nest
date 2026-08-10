@@ -229,7 +229,7 @@ class SqliteLauncherCredentialStore implements LauncherCredentialStore {
   }
 
   async rotate(credentialId: string): Promise<IssuedCredential> {
-    // mint를 BEGIN IMMEDIATE 이전에 한다 — issue()·store.ts의 createLog와 같은 이유:
+    // mint를 BEGIN IMMEDIATE 이전에 한다 — issue()·store.ts의 insertMintedLog 호출자와 같은 이유:
     // mintCredentialToken은 던질 수 있고(readEntropy가 짧은 난수원을 거부), 트랜잭션
     // 안에서 던지면 그 예외를 잡는 catch가 없어 예약 락이 커밋도 롤백도 되지 않은 채
     // 커넥션에 남는다.

@@ -118,9 +118,10 @@ const MAX_WORKSPACE_PAGE_LIMIT = DEFAULT_PAGE_LIMIT
 /**
  * mint 재시도 상한 — `handleCreateLog`·`handleOpenWorkspace`가 쓴다 (mori-nest #133, UoW
  * 조각 4/4: mint 재시도가 이제 라우트 배선의 몫이다, `ControlStore.insertMintedLog`·
- * `WorkspaceStore.insertMintedWorkspace` doc 참고). 값은 `ControlStore`·`WorkspaceStore`
- * 내부의 같은 이름 상수와 맞춘다 — 근거도 같다: 128비트 난수의 충돌 확률은 무시할 수 있고,
- * 이 상한에 실제로 닿는 것은 난수원이 고장 났을 때뿐이다.
+ * `WorkspaceStore.insertMintedWorkspace` doc 참고). 정의는 이 파일 하나뿐이다 — `ControlStore`·
+ * `WorkspaceStore`는 더 이상 자기 재시도 루프를 열지 않으므로 맞출 상대가 없다 (mori-nest
+ * #140, PR #139 교차 지적 회수). 근거: 128비트 난수의 충돌 확률은 무시할 수 있고, 이 상한에
+ * 실제로 닿는 것은 난수원이 고장 났을 때뿐이다.
  */
 const MAX_MINT_ATTEMPTS = 5
 
@@ -497,8 +498,7 @@ async function handleCreateLog(
     return
   }
   if (record === undefined) {
-    // mint 재시도가 store.ts의 MAX_MINT_ATTEMPTS와 같은 상한을 넘었다 — 난수원이 고장났다고
-    // 본다(`ControlStore.createLog`와 같은 판단).
+    // mint 재시도가 위 MAX_MINT_ATTEMPTS 상한을 넘었다 — 난수원이 고장났다고 본다.
     writeFailure(response, storeFailure(new ControlStoreError('mint_exhausted')))
     return
   }
@@ -915,8 +915,7 @@ async function handleOpenWorkspace(
     return
   }
   if (stored === undefined) {
-    // mint 재시도가 workspace-store.ts의 MAX_MINT_ATTEMPTS와 같은 상한을 넘었다 — 난수원이
-    // 고장났다고 본다(`WorkspaceStore.openWorkspace`와 같은 판단).
+    // mint 재시도가 위 MAX_MINT_ATTEMPTS 상한을 넘었다 — 난수원이 고장났다고 본다.
     writeFailure(response, storeFailure(new WorkspaceStoreError('mint_exhausted')))
     return
   }

@@ -4,7 +4,7 @@
  *
  * ## 이 조각이 서는 것, 아직 서지 않는 것
  *
- * 이 파일이 세우는 것은 **개시**(`openWorkspace`) · **단건 조회**(`getWorkspace`) · **하트비트**
+ * 이 파일이 세우는 것은 **개시**(`insertMintedWorkspace`) · **단건 조회**(`getWorkspace`) · **하트비트**
  * (`heartbeat`, `§4.3`) · **종료 선언**(`closeWorkspace`, `§4.4`) · **폐기**(`revokeWorkspace`,
  * `§4.5`) · `state`·`after`·`limit`로 거르는 **목록 조회**(`listWorkspaces`, `§4.6`, 조각 3/3)다.
  * HTTP 라우트·상태코드·토큰 갱신은 어느 조각에도 아직 없다 — 이 스토어는 토큰을 모른다.
@@ -26,8 +26,8 @@
  * #98 본문은 이 전이를 `close(subject, workspaceId, outcome, { now })`로 적었지만, 당시 이
  * 인터페이스에는 이미 **연결을 닫는** `close()`가 있었다(조각 1/3). 같은 이름에 두 뜻을 겹치면
  * `store.close()`가 "커넥션을 닫는다"인지 "작업공간을 닫는다"인지 호출 자리에서 갈리지
- * 않는다 — 오버로드로 둘 다 받으면 인자를 빠뜨린 오타가 커넥션을 닫아 버린다. `openWorkspace`·
- * `getWorkspace`·`revokeWorkspace`(이슈가 이 이름은 그렇게 적었다)와 같은 접미사를 써서
+ * 않는다 — 오버로드로 둘 다 받으면 인자를 빠뜨린 오타가 커넥션을 닫아 버린다. `getWorkspace`·
+ * `revokeWorkspace`(이슈가 이 이름은 그렇게 적었다)와 같은 접미사를 써서
  * `closeWorkspace`로 둔다. 스펙 `§4.4`의 라우트 이름(`POST .../close`)과 요청 필드는 그대로다.
  * 그 뒤 이 인터페이스 자신의 `close()`는 사라졌지만(mori-nest #130 — 연결은 리포지토리가 아니라
  * `ControlDatabase`가 닫는다) `closeWorkspace`라는 이름은 그대로 둔다 — 이제는 다른 세 메서드와
@@ -134,9 +134,6 @@ const SQLITE_CONSTRAINT_PRIMARYKEY = 1555
 /** `SQLITE_CONSTRAINT_CHECK`. `workspaces.subject <> ''` 위반. */
 const SQLITE_CONSTRAINT_CHECK = 275
 
-/** mint 재시도 상한. 근거는 `src/control/store.ts`의 `MAX_MINT_ATTEMPTS`와 같다. */
-const MAX_MINT_ATTEMPTS = 5
-
 /** `mintLogId`(`src/control/store.ts`)와 같은 128비트 하한 — `§2.1`의 예측 불가능성
  * 요구를 그대로 옮긴다(`§4.2`가 `workspaceId`에 "§2.1·§2.2의 규칙이 그대로 적용된다"고
  * 못박았다). */
@@ -231,11 +228,10 @@ export type WorkspaceStoreFailure =
    * workspace_not_active`로 옮기는 자리다. 멱등이 성립하는 재시도(같은 `outcome`의 재종료,
    * 재폐기)는 여기에 들지 않는다 — 그 둘은 성공이다 (`§4.4`·`§4.5` MUST). */
   | 'workspace_not_active'
-  /** mint 재시도가 {@link MAX_MINT_ATTEMPTS}를 넘었다 */
+  /** 호출자(라우트)의 재시도가 상한을 넘었다 */
   | 'mint_exhausted'
   /** {@link WorkspaceStore.insertMintedWorkspace}에 건넨 `workspaceId`가 이미 존재한다 —
-   *  호출자가 새 트랜잭션에서 새 id로 재시도한다 (mori-nest #133, UoW 조각 4/4).
-   *  `openWorkspace`의 재시도 루프도 이 표식을 그대로 받는다. */
+   *  호출자(라우트)가 새 트랜잭션에서 새 id로 재시도한다 (mori-nest #133, UoW 조각 4/4). */
   | 'workspace_id_collision'
   /** `listWorkspaces`의 `state`가 `§4.1`의 다섯 이름 중 하나가 아니다 — 호출자가 `400
    * invalid_state_filter`로 옮기는 자리다. 빈 문자열·알 수 없는 값도 "필터 없음"으로
@@ -278,7 +274,7 @@ export type WorkspaceRecord = {
   readonly replicaId?: string
 }
 
-/** {@link WorkspaceStore.openWorkspace}의 요청 모양 (`§4.2`의 `OpenWorkspaceRequest`에서
+/** {@link WorkspaceStore.insertMintedWorkspace}의 요청 모양 (`§4.2`의 `OpenWorkspaceRequest`에서
  * HTTP 유효성 검증이 걸러야 할 것 — 정규식·빈 배열 — 은 이 스토어의 몫이 아니다, 파일
  * 상단 doc 비범위 참고). */
 export type OpenWorkspaceRequest = {
@@ -367,21 +363,6 @@ export type ListWorkspacesPage = {
 
 export type WorkspaceStore = {
   /**
-   * 작업공간을 개시한다 (`§4.2`). `lastHeartbeatAt`은 `openedAt`으로 초기화된다 (MUST).
-   *
-   * **자기 트랜잭션을 연다.** 중첩이 금지되어 있으므로(`./db.ts` 상단 doc) 바깥
-   * `withTransaction` 안에서 부르면 `nested_transaction`을 받는다 — 작업공간 개시를 멱등 키
-   * 기록과 한 커밋으로 묶는 것(`0003 §1.4`)은 라우트 배선(mori-nest #133, UoW 조각 4/4)의
-   * 일이고, 그 배선은 이 메서드를 그대로 부르는 대신 {@link WorkspaceStore.insertMintedWorkspace}를
-   * 자기 트랜잭션 안에서 조합한다.
-   *
-   * @throws {WorkspaceStoreError} `subject`가 빈 문자열이면 (`blank_subject`); `supersedes`가
-   *   있는데 없는 id이거나 다른 주체의 것이면 (`workspace_not_found`, **작업공간은 만들어지지
-   *   않는다**); mint가 {@link MAX_MINT_ATTEMPTS}번 전부 기존 id와 충돌하면 (`mint_exhausted`).
-   */
-  openWorkspace(subject: string, request: OpenWorkspaceRequest): Promise<{ readonly workspaceId: string }>
-
-  /**
    * 새 `workspaceId`를 mint한다 — {@link insertMintedWorkspace}에 건넬 값을 만드는 자리다
    * (mori-nest #133, UoW 조각 4/4). `ControlStore.mintLogId`와 같은 이유로 스토어가 낸다:
    * 모듈 함수 {@link mintWorkspaceId}를 라우트가 직접 부르면 `openWorkspaceStore`의
@@ -394,14 +375,14 @@ export type WorkspaceStore = {
   mintWorkspaceId(): string
 
   /**
-   * mint된 `workspaceId`로 개시 행을 만든다 — {@link openWorkspace}가 여는 조합이다
+   * mint된 `workspaceId`로 개시 행을 만든다 — 라우트가 여는 조합이다
    * (mori-nest #133, UoW 조각 4/4). **자기 트랜잭션을 열지 않고, `Promise`도 돌려주지
    * 않는다** — 호출자가 이미 연 `ControlDatabase.withTransaction` 콜백 **안에서, 동기로**
    * 불러야 한다. `async`가 아닌 것 자체가 그 계약이다 — 호출 자리에 `await`를 쓸 수 없으므로
    * 콜백이 thenable이 되는 실수(`./db.ts` 상단 doc)가 타입 수준에서부터 막힌다.
    *
-   * `supersedes` 소유권 검증도 이 메서드 안, 삽입과 **같은** 트랜잭션에서 한다 — `openWorkspace`와
-   * 같은 이유다(파일 상단 doc "원자성": 검증이 통과한 뒤 삽입이 실패하면 롤백이 검증 결과까지
+   * `supersedes` 소유권 검증도 이 메서드 안, 삽입과 **같은** 트랜잭션에서 한다 — 파일 상단
+   * doc "원자성"과 같은 이유다(검증이 통과한 뒤 삽입이 실패하면 롤백이 검증 결과까지
    * 함께 되돌려야 한다).
    *
    * mint 재시도는 **호출자의 몫**이다(`ControlStore.insertMintedLog`와 같은 이유 — 이 메서드가
@@ -820,28 +801,6 @@ class SqliteWorkspaceStore implements WorkspaceStore {
       `SELECT workspace_id, opened_at, last_heartbeat_at, logs, supersedes, replica_id, terminal_state, ended_at
        FROM workspaces WHERE subject = ? AND replica_id = ? AND workspace_id <> ?`,
     )
-  }
-
-  async openWorkspace(subject: string, request: OpenWorkspaceRequest): Promise<{ readonly workspaceId: string }> {
-    for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt += 1) {
-      // mint는 `withTransaction` 이전이다 — 파일 상단 doc "원자성".
-      const workspaceId = mintWorkspaceId(this.#randomBytes)
-
-      try {
-        await this.#database.withTransaction(() => {
-          this.insertMintedWorkspace(workspaceId, subject, request)
-        })
-        return { workspaceId }
-      } catch (error) {
-        if (error instanceof WorkspaceStoreError && error.reason === 'workspace_id_collision') {
-          // 이미 존재하는 workspaceId가 나왔다 — 다시 mint한다 (`mintLogId`와 같은 규율).
-          continue
-        }
-        // `workspace_not_found`·`blank_subject`는 id 충돌이 아니므로 재시도해도 소용없다.
-        throw error
-      }
-    }
-    throw new WorkspaceStoreError('mint_exhausted')
   }
 
   // `SqliteControlStore.mintLogId`와 같은 자리 — 아래 이름은 모듈 함수를 가리킨다.

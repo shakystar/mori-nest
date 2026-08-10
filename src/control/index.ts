@@ -41,7 +41,7 @@
  * 함께 안다. 넷의 **관계**를 강제하는 자리도 여기다 (`§3.4` — 아래 파서 doc).
  *
  * 같은 이유로 작업공간 생애 추적의 스토어(`./workspace-store.js` · #97 조각 1/3, #98 조각
- * 2/3, #99 조각 3/3)도 라우트 없이 먼저 섰다 — 개시(`openWorkspace`)·단건 조회(`getWorkspace`)·
+ * 2/3, #99 조각 3/3)도 라우트 없이 먼저 섰다 — 개시(`insertMintedWorkspace`)·단건 조회(`getWorkspace`)·
  * 세 전이(`heartbeat`·`closeWorkspace`·`revokeWorkspace`)·목록 조회(`listWorkspaces`)까지다.
  * `gracePeriod`·조회 시각·전이 시각은 여전히 그 스토어의 메서드 **인자**다 — 값을 정하는
  * 것은 설정이고(`gracePeriodSeconds`), 그것을 ms로 환산하는 자리는 `./server.js`의
