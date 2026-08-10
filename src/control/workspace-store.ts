@@ -23,23 +23,28 @@
  *
  * ## `closeWorkspace`라는 이름 — 이슈가 적은 `close`가 아닌 이유
  *
- * #98 본문은 이 전이를 `close(subject, workspaceId, outcome, { now })`로 적었지만, 이
- * 인터페이스에는 이미 **연결을 닫는** `close()`가 있다(조각 1/3). 같은 이름에 두 뜻을 겹치면
+ * #98 본문은 이 전이를 `close(subject, workspaceId, outcome, { now })`로 적었지만, 당시 이
+ * 인터페이스에는 이미 **연결을 닫는** `close()`가 있었다(조각 1/3). 같은 이름에 두 뜻을 겹치면
  * `store.close()`가 "커넥션을 닫는다"인지 "작업공간을 닫는다"인지 호출 자리에서 갈리지
  * 않는다 — 오버로드로 둘 다 받으면 인자를 빠뜨린 오타가 커넥션을 닫아 버린다. `openWorkspace`·
  * `getWorkspace`·`revokeWorkspace`(이슈가 이 이름은 그렇게 적었다)와 같은 접미사를 써서
  * `closeWorkspace`로 둔다. 스펙 `§4.4`의 라우트 이름(`POST .../close`)과 요청 필드는 그대로다.
+ * 그 뒤 이 인터페이스 자신의 `close()`는 사라졌지만(mori-nest #130 — 연결은 리포지토리가 아니라
+ * `ControlDatabase`가 닫는다) `closeWorkspace`라는 이름은 그대로 둔다 — 이제는 다른 세 메서드와
+ * 접미사를 맞추는 것 자체가 이유다.
  *
- * ## 별도 모듈, 별도 DB — 근거
+ * ## 별도 모듈 — 근거 (연결은 이제 공유한다, mori-nest #132, UoW 조각 3/4)
  *
- * `src/control/store.ts`(로그·`(주체, 로그)` 관계)에 테이블을 얹지 않고 새 모듈·새 DB 파일로
- * 세운 이유 둘:
- *
- * 1. 이 조각이 열릴 때 `src/control/store.ts`를 고치는 PR #95가 열려 있었다 — 같은 파일을
- *    고치면 병합 충돌이 난다. 새 모듈은 그 위험이 없다.
- * 2. 이 스토어는 `isGranted`(grant 판정)를 부르지 않는다 — `logs`는 개시 시 스코프로
- *    **기록만** 한다(비범위: grant 판정·토큰 발급은 발급 라우트의 몫). 로그 스토어와 같은
- *    커넥션이어야 할 이유가 코드 어디에도 없으므로 갈라 둔다.
+ * `src/control/store.ts`(로그·`(주체, 로그)` 관계)에 테이블을 얹지 않고 별도 모듈로 세운 이유는
+ * 처음 이 조각이 열릴 때와 지금이 다르다. 원래는 새 DB **파일**이기도 했다 — 당시 `store.ts`를
+ * 고치던 PR #95와의 병합 충돌을 피하려는 것과, 이 스토어가 `isGranted`(grant 판정)를 부르지
+ * 않아 로그 스토어와 커넥션을 공유할 이유가 없다는 것이 그 근거였다. **연결 소유권 자체가
+ * `src/control/db.ts`(#130)로 옮겨가면서 첫 번째 이유는 사라졌다** — 오늘은 하나의
+ * {@link ControlDatabase} 위에서 `workspaces` 테이블 하나만 이 파일이 다룬다. 그래도 별도
+ * **모듈**로 남기는 이유는 두 번째가 여전히 유효하기 때문이다: 이 스토어는 `logs`·`log_subjects`
+ * 스키마도, `isGranted`도 모른다 — 개시 시 스코프를 배열로 **기록만** 한다(비범위: grant
+ * 판정·토큰 발급은 발급 라우트의 몫). 같은 커넥션을 공유하는 것과 같은 모듈에 합치는 것은
+ * 다른 결정이다.
  *
  * ## `workspaceId`에 접두사(`ws_`)를 둔다
  *
@@ -79,23 +84,37 @@
  * 몇 번을 다시 계산해도 같은 `abandoned`·같은 `endedAt`이다. 필요 없는 쓰기를 실패 경로에
  * 넣지 않는다.
  *
- * ## 원자성 — 읽기·판정·쓰기를 한 `BEGIN IMMEDIATE`에 넣고, 판정에 쓴 값을 `WHERE`에 다시 싣는다
+ * ## 연결을 소유하지 않는다 (mori-nest #132, UoW 조각 3/4)
  *
- * `mintWorkspaceId`는 `BEGIN IMMEDIATE` **이전**에 부른다 — `src/control/credential.ts`의
+ * 이 파일은 더 이상 연결을 만들지 않는다. 연결은 `./db.ts`의 {@link ControlDatabase}가 소유하고
+ * 이 스토어는 그 위에 문장을 준비하는 **리포지토리**다 — `close()`도 갖지 않는다(닫는 것은
+ * 연결의 소유자다). 자체 트랜잭션 헬퍼(`BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`을 직접 실행하던
+ * `#inTransaction`)도 사라졌다 — 대신 {@link ControlDatabase.withTransaction}을 부른다.
+ *
+ * ## 원자성 — 읽기·판정·쓰기를 한 `withTransaction`에 넣고, 판정에 쓴 값을 `WHERE`에 다시 싣는다
+ *
+ * 아래 성질들은 소유권이 바뀌기 전과 **그대로**다 — 바뀐 것은 트랜잭션을 여닫는 코드가
+ * 이 파일에 있었다가 `./db.ts` 하나로 옮겨간 것뿐이다. **"트랜잭션 콜백에 `await`를 넣지
+ * 않는다"는 불변식의 진술 자리도 함께 옮겼다** — 이 파일은 더 이상 그것을 진술하지 않고
+ * `./db.ts` 상단 doc(«한 연결이라 트랜잭션은 직렬이다»)을 참조한다.
+ *
+ * `mintWorkspaceId`는 `withTransaction` **이전**에 부른다 — `src/control/credential.ts`의
  * `rotate()`와 같은 이유다: 난수원이 짧은 버퍼를 돌려주면 {@link readEntropy}가 던지는데,
- * 트랜잭션 안에서 던지면 그 예외를 잡는 코드가 없어 예약 락이 커밋도 롤백도 되지 않은 채
- * 커넥션에 남는다. `supersedes` 소유권 검증은 삽입과 **같은** `BEGIN IMMEDIATE` 안에 있다 —
- * 검증이 통과한 뒤 삽입이 실패하면(예: id 충돌) 롤백이 검증 결과까지 함께 되돌린다.
+ * 트랜잭션 콜백 안에서 던지면 그 예외가 커밋도 롤백도 되지 않은 채 커넥션에 남는 예약 락을
+ * 만들 수 있다(`./db.ts`의 `withTransaction`은 던진 예외를 그대로 다시 던지고 `ROLLBACK`을
+ * 보장하지만, mint 자체는 재시도 루프의 일부이므로 트랜잭션 밖에서 미리 뽑아 둔다).
+ * `supersedes` 소유권 검증은 삽입과 **같은** `withTransaction` 콜백 안에 있다 — 검증이 통과한
+ * 뒤 삽입이 실패하면(예: id 충돌) 롤백이 검증 결과까지 함께 되돌린다.
  *
  * 세 전이(`§4.3`~`§4.5`)에도 같은 규율이 그대로 적용되고, `§4.1`이 그것을 MUST로 요구한다 —
  * *"같은 작업공간에 대한 `close`와 하트비트가 동시에 도착해도 결과는 둘 중 하나이지, 「닫힌 뒤
  * 하트비트가 `active`로 되돌리는」 것이 아니다."* 두 겹으로 지킨다:
  *
- * 1. **`BEGIN IMMEDIATE`가 1차 보장이다.** 「종단인가·유기인가」를 읽는 `SELECT`와 「종단으로
- *    만든다」를 쓰는 `UPDATE`가 한 트랜잭션 안에 있고, `IMMEDIATE`가 그 시작에서 쓰기 락을
- *    잡으므로 두 전이가 겹쳐 읽을 수 없다. 락 밖에서 읽은 상태를 근거로 락 안에서 쓰는 스팬이
- *    없다. 전이 메서드 본문에 `await`가 없는 것이 이 보장의 전제다 (아래 {@link
- *    SqliteWorkspaceStore} doc).
+ * 1. **`withTransaction`이 1차 보장이다.** 「종단인가·유기인가」를 읽는 `SELECT`와 「종단으로
+ *    만든다」를 쓰는 `UPDATE`가 한 콜백 안에 있고, `BEGIN IMMEDIATE`가 그 시작에서 쓰기 락을
+ *    잡으므로(`./db.ts`) 두 전이가 겹쳐 읽을 수 없다. 락 밖에서 읽은 상태를 근거로 락 안에서
+ *    쓰는 스팬이 없다. 전이 콜백이 동기인 것이 이 보장의 전제이고, `./db.ts`가 그 전제를
+ *    강제한다(콜백이 thenable을 돌려주지 않는 한 `await`가 끼어들 자리가 없다).
  * 2. **조건부 `UPDATE`가 2차 보장이다.** 판정에 쓴 두 값 — `terminal_state IS NULL`과 읽은
  *    `last_heartbeat_at` — 을 `WHERE`에 다시 싣는다. 1이 성립하는 한 0행 갱신은 나오지
  *    않지만, 나오면 그 전이는 **진 것**이므로 조용히 덮는 대신 `workspace_not_active`로
@@ -104,8 +123,9 @@
  */
 
 import { randomBytes as nodeRandomBytes } from 'node:crypto'
-import { DatabaseSync, type SQLOutputValue, type StatementSync } from 'node:sqlite'
+import { type SQLOutputValue, type StatementSync } from 'node:sqlite'
 
+import type { ControlDatabase } from './db.js'
 import { DEFAULT_PAGE_LIMIT, readEntropy, type RandomBytesFn } from './store.js'
 
 /** `SQLITE_CONSTRAINT_PRIMARYKEY`. `workspaces.workspace_id` 충돌 — mint가 이미 있는 id를 뽑았다. */
@@ -113,9 +133,6 @@ const SQLITE_CONSTRAINT_PRIMARYKEY = 1555
 
 /** `SQLITE_CONSTRAINT_CHECK`. `workspaces.subject <> ''` 위반. */
 const SQLITE_CONSTRAINT_CHECK = 275
-
-/** 잠금 대기 상한. 근거는 `src/control/store.ts`의 같은 값과 같다. */
-const BUSY_TIMEOUT_MS = 5000
 
 /** mint 재시도 상한. 근거는 `src/control/store.ts`의 `MAX_MINT_ATTEMPTS`와 같다. */
 const MAX_MINT_ATTEMPTS = 5
@@ -442,10 +459,6 @@ export type WorkspaceStore = {
    * {@link findForkOverlap}이다.
    */
   findForkAdvisory(subject: string, workspaceId: string, options: FindForkAdvisoryOptions): Promise<ForkOverlap | undefined>
-
-  /** 연결을 닫는다. 두 번 불러도 안전하다. 작업공간을 닫는 것은 {@link
-   * WorkspaceStore.closeWorkspace}다 (파일 상단 doc). */
-  close(): Promise<void>
 }
 
 function isPrimaryKeyViolation(error: unknown): boolean {
@@ -681,19 +694,11 @@ function decodeCursor(raw: string): { readonly openedAt: string; readonly worksp
   return { openedAt: parsed[0], workspaceId: parsed[1] }
 }
 
-function applyPragmas(db: DatabaseSync): void {
-  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`)
-  db.exec('PRAGMA journal_mode = WAL')
-  // `§4.1`: "active·closed_*·revoked로의 전이는 응답 전에 내구화된다" (MUST) — 이미
-  // `openControlStore`가 거는 것과 같은 층위, 새 PRAGMA를 만들지 않는다(이슈 본문).
-  db.exec('PRAGMA synchronous = FULL')
-}
-
-/** `node:sqlite` 위의 {@link WorkspaceStore} 구현. 메서드 본문에 `await`가 없다 —
- * `src/control/store.ts` 파일 상단 doc과 같은 규율(트랜잭션 구간에 `await`를 넣으면
- * 이벤트 루프가 다른 호출에 제어를 넘겨 트랜잭션이 겹칠 수 있다). */
+/** `node:sqlite` 위의 {@link WorkspaceStore} 구현 — 연결을 소유하지 않는 리포지토리다(파일
+ * 상단 doc). 트랜잭션 콜백에 `await`가 끼지 않는다 — 그 불변식의 진술 자리는 `./db.ts` 상단
+ * doc이고, 이 파일은 다시 진술하지 않는다(파일 상단 doc "원자성"). */
 class SqliteWorkspaceStore implements WorkspaceStore {
-  readonly #db: DatabaseSync
+  readonly #database: ControlDatabase
   readonly #randomBytes: RandomBytesFn
   readonly #insert: StatementSync
   readonly #selectByWorkspaceId: StatementSync
@@ -703,10 +708,10 @@ class SqliteWorkspaceStore implements WorkspaceStore {
   readonly #writeTerminal: StatementSync
   readonly #selectPage: StatementSync
   readonly #selectByReplicaId: StatementSync
-  #closed = false
 
-  constructor(db: DatabaseSync, randomBytes: RandomBytesFn) {
-    this.#db = db
+  constructor(database: ControlDatabase, randomBytes: RandomBytesFn) {
+    const db = database.connection
+    this.#database = database
     this.#randomBytes = randomBytes
     this.#insert = db.prepare(
       `INSERT INTO workspaces (workspace_id, subject, opened_at, last_heartbeat_at, logs, supersedes, replica_id)
@@ -778,33 +783,32 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     const logsJson = JSON.stringify(request.logs)
 
     for (let attempt = 0; attempt < MAX_MINT_ATTEMPTS; attempt += 1) {
-      // mint는 `BEGIN IMMEDIATE` 이전이다 — 파일 상단 doc "원자성".
+      // mint는 `withTransaction` 이전이다 — 파일 상단 doc "원자성".
       const workspaceId = mintWorkspaceId(this.#randomBytes)
       const openedAt = new Date().toISOString()
 
-      this.#db.exec('BEGIN IMMEDIATE')
       try {
-        if (request.supersedes !== undefined) {
-          const supersedesRow = this.#selectByWorkspaceId.get(request.supersedes)
-          if (supersedesRow === undefined || columnAsString(supersedesRow['subject']) !== subject) {
-            // `§4.2` MUST: "쓰는 사람이 그 기록의 주인인가"는 검증할 수 있고, 해야 한다.
-            throw new WorkspaceStoreError('workspace_not_found')
+        await this.#database.withTransaction(() => {
+          if (request.supersedes !== undefined) {
+            const supersedesRow = this.#selectByWorkspaceId.get(request.supersedes)
+            if (supersedesRow === undefined || columnAsString(supersedesRow['subject']) !== subject) {
+              // `§4.2` MUST: "쓰는 사람이 그 기록의 주인인가"는 검증할 수 있고, 해야 한다.
+              throw new WorkspaceStoreError('workspace_not_found')
+            }
           }
-        }
 
-        this.#insert.run(
-          workspaceId,
-          subject,
-          openedAt,
-          openedAt,
-          logsJson,
-          request.supersedes ?? null,
-          request.replicaId ?? null,
-        )
-        this.#db.exec('COMMIT')
+          this.#insert.run(
+            workspaceId,
+            subject,
+            openedAt,
+            openedAt,
+            logsJson,
+            request.supersedes ?? null,
+            request.replicaId ?? null,
+          )
+        })
         return { workspaceId }
       } catch (error) {
-        this.#rollbackQuietly()
         if (error instanceof WorkspaceStoreError) {
           // `workspace_not_found`다 — id 충돌이 아니므로 재시도해도 소용없다.
           throw error
@@ -858,7 +862,7 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     // (파일 상단 doc "원자성"). 확정은 **커밋되어야** 하므로 — 롤백되면 `§4.1`이 요구한
     // 확정이 사라지고 다음 하트비트가 다시 부활을 시도한다 — 실패 통보는 트랜잭션이 닫힌
     // 뒤에 던진다.
-    const confirmedAbandonment = this.#inTransaction(() => {
+    const confirmedAbandonment = await this.#database.withTransaction(() => {
       const current = this.#loadOwned(subject, workspaceId)
       if (current.terminal !== undefined) {
         throw new WorkspaceStoreError('workspace_not_active')
@@ -995,11 +999,11 @@ class SqliteWorkspaceStore implements WorkspaceStore {
     workspaceId: string,
     terminalState: WorkspaceTerminalResult['state'],
     options: WorkspaceTransitionOptions,
-  ): WorkspaceTerminalResult {
+  ): Promise<WorkspaceTerminalResult> {
     const now = options.now ?? new Date()
     const endedAt = now.toISOString()
 
-    return this.#inTransaction(() => {
+    return this.#database.withTransaction(() => {
       const current = this.#loadOwned(subject, workspaceId)
 
       if (current.terminal !== undefined) {
@@ -1059,43 +1063,13 @@ class SqliteWorkspaceStore implements WorkspaceStore {
   }
 
   /**
-   * 조건부 `UPDATE`의 결과를 판정한다 — 파일 상단 doc "원자성"의 2차 보장. `BEGIN
-   * IMMEDIATE` 안에서 판정 직후에 쓰므로 0행은 나오지 않지만, 나온다면 그 사이에 다른 전이가
-   * 확정된 것이므로 조용히 덮는 대신 진 쪽이 실패한다.
+   * 조건부 `UPDATE`의 결과를 판정한다 — 파일 상단 doc "원자성"의 2차 보장. `withTransaction`의
+   * `BEGIN IMMEDIATE` 안에서 판정 직후에 쓰므로 0행은 나오지 않지만, 나온다면 그 사이에 다른
+   * 전이가 확정된 것이므로 조용히 덮는 대신 진 쪽이 실패한다.
    */
   #applyTransition(result: { readonly changes: number | bigint }): void {
     if (Number(result.changes) !== 1) {
       throw new WorkspaceStoreError('workspace_not_active')
-    }
-  }
-
-  /** `BEGIN IMMEDIATE` … `COMMIT`으로 감싼다. `body`에 `await`를 넣지 않는다 — 아래 클래스
-   * doc의 규율이 이 경계 안에서 깨지면 트랜잭션이 겹친다. */
-  #inTransaction<T>(body: () => T): T {
-    this.#db.exec('BEGIN IMMEDIATE')
-    try {
-      const result = body()
-      this.#db.exec('COMMIT')
-      return result
-    } catch (error) {
-      this.#rollbackQuietly()
-      throw error
-    }
-  }
-
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return
-    }
-    this.#closed = true
-    this.#db.close()
-  }
-
-  #rollbackQuietly(): void {
-    try {
-      this.#db.exec('ROLLBACK')
-    } catch {
-      // 트랜잭션이 이미 열려 있지 않다 (제약 위반이 트랜잭션을 자동으로 접은 경우).
     }
   }
 }
@@ -1106,19 +1080,15 @@ export type WorkspaceStoreOptions = {
 }
 
 /**
- * 스토어를 연다. `path`의 DB가 없으면 만들고, 있으면 그대로 연다.
+ * 리포지토리를 연다 — 제어 평면 DB에 이 계층의 테이블이 없으면 만든다.
  *
- * @param path DB 파일 경로. `:memory:`도 받는다 — `src/control/store.ts`의 로그 스토어와
- *   같은 이유로(라우트가 아직 없다) WAL 강제 확인까지는 하지 않는다.
+ * @param database 연결의 소유자 (`./db.ts`). **경로를 받지 않는다** — DB를 여는 자리는
+ *   `openControlDatabase` 하나다 (mori-nest #130).
  */
-export async function openWorkspaceStore(path: string, options: WorkspaceStoreOptions = {}): Promise<WorkspaceStore> {
-  const db = new DatabaseSync(path)
-  try {
-    applyPragmas(db)
-    db.exec(SCHEMA)
-  } catch (error) {
-    db.close()
-    throw error
-  }
-  return new SqliteWorkspaceStore(db, options.randomBytes ?? nodeRandomBytes)
+export async function openWorkspaceStore(
+  database: ControlDatabase,
+  options: WorkspaceStoreOptions = {},
+): Promise<WorkspaceStore> {
+  database.connection.exec(SCHEMA)
+  return new SqliteWorkspaceStore(database, options.randomBytes ?? nodeRandomBytes)
 }
