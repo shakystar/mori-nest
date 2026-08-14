@@ -31,7 +31,7 @@
 
 | # | `파일:심볼` | 오늘 무엇이 지키는가 | 단일 라이터가 없을 때 열리는 인터리브 | 판정 | 근거 |
 |---|---|---|---|---|---|
-| S1 | `credential.ts:rotate` (`:242-249`) | **단일 라이터라는 사실뿐** — `SELECT`는 락을 잡지 않고, 뒤따르는 `INSERT`·`DELETE`가 읽은 값을 `WHERE`에 싣지 않는다 | A·B가 같은 `credentialId`를 동시에 회전: 둘 다 `:243`에서 같은 행을 읽고, 둘 다 `:247`에서 서로 다른 새 자격증명을 삽입하고, `:248`의 `DELETE`는 하나만 1행·다른 하나는 **0행(결과를 보지 않는다)**. 커밋 후 **자격증명이 1개에서 2개로 늘어난다** | **제약으로 옮긴다** | mori#189의 모양 그대로다 — 옛 자격증명의 소멸이 회전의 **결과**여야 하는데 오늘은 별개의 무조건 `DELETE`다. §3의 C1 |
+| S1 | `credential.ts:rotate` (mori-nest #146 반영 후) | **조건부 쓰기(CAS)** — `#rotateDelete`(`DELETE … RETURNING subject`)가 존재 판정과 삭제를 한 문장으로 묶는다. 진 쪽은 0행을 받아 `credential_not_found`로 실패한다 | **열리지 않는다** — S5·S8·S9와 같은 이유. 같은 `credentialId`를 겨눈 두 `rotate`가 겹쳐도 그 삭제 문장을 통과하는 것은 하나뿐이다 | 현행 유지 | §3의 C1이 (b)로 반영됐다(mori-nest #146). 반영 전 판정·근거는 이 변경 이전 커밋에서 확인 가능하다 |
 | S2 | `store.ts:addMissingRevocationColumn` (`:138-154`) | **트랜잭션 경계** — `PRAGMA table_info` 읽기와 `ALTER TABLE`이 한 `withTransaction`(`:142`) 안이고 `BEGIN IMMEDIATE`가 쓰기 락을 먼저 잡는다 | 두 프로세스가 같은 구 DB를 동시에 부팅: 둘 다 「컬럼 없음」을 관측하고 둘 다 `ALTER TABLE` → 진 쪽이 중복 컬럼 오류로 **부팅 실패** | 현행 유지 | 제약으로 표현할 수 있는 불변식이 아니다(DDL이다). 실패가 부팅 시점의 예외라 **조용히 새지 않고** 데이터도 손상시키지 않는다. 이관 시 `ADD COLUMN IF NOT EXISTS`가 읽기 자체를 없앤다 — §4의 M1 |
 | S3 | 네 스토어의 `exec(SCHEMA)` (`store.ts:531`·`workspace-store.ts:1106`·`idempotency.ts:350`·`credential.ts:269`) | **엔진** — `CREATE TABLE IF NOT EXISTS`의 존재 판정이 SQLite 안에서 원자적이다 | 동시 부팅 시 PostgreSQL의 `CREATE TABLE IF NOT EXISTS`가 카탈로그 유니크 위반을 낼 수 있다 → 진 쪽 **부팅 실패** | 현행 유지 | S2와 같은 이유·같은 성격(부팅 경로, 시끄러운 실패). 스키마 관리 방식 자체가 이관의 항목이지 이 조각이 걸 제약이 아니다 — §4의 M2 |
 | S4 | `workspace-store.ts:insertMintedWorkspace`의 `supersedes` 소유권 검증 (`:814-820` → `:823`) | **트랜잭션 경계 + 읽는 값의 불변성** — 검증과 삽입이 같은 콜백 안이다(`:106-107`, `server.ts:890-897`) | **열리지 않는다.** 판정이 읽는 것은 `workspaces.subject` 하나인데, 이 열을 갱신하는 문장이 없고(전수 A1: `UPDATE workspaces …`는 `last_heartbeat_at`·`terminal_state`·`ended_at`만 건드린다) `workspaces`에 `DELETE` 경로가 0건이다 → 읽은 사실이 커밋 시점까지 유효하다 | 현행 유지 | 근거가 **전수 조사의 부산물**이다(§1.2의 A1 목록). `workspaces`에 삭제·주체 변경 경로가 생기는 날 이 근거는 무효가 된다 — §5의 R1 |
@@ -313,6 +313,10 @@ S10은 이 조사에서 **판정이 가장 미끄러운 자리**여서 따로 �
 | **제약의 형태 (대안)** | **(a) 선언적 제약.** `launcher_credentials`에 `rotated_from TEXT`를 더하고 `CREATE UNIQUE INDEX IF NOT EXISTS launcher_credentials_rotated_from ON launcher_credentials (rotated_from) WHERE rotated_from IS NOT NULL` — 「한 자격증명에서 나온 회전 결과는 최대 하나」를 선언으로 못박는다 |
 | **대안의 기존 DB 보정** | **필요.** `ALTER TABLE launcher_credentials ADD COLUMN rotated_from TEXT` — `NULL` 허용이라 `STRICT` 테이블에도 붙는다. **`store.ts:138-154`의 `addMissingRevocationColumn` 선례를 그대로 따를 수 있다**(같은 이유로 `NOT NULL`을 걸지 않는 것까지 같다, `:98-102`) |
 | **권고** | **(b)를 먼저 한다.** 스키마 변경 0·DB 보정 0으로 같은 결함을 닫고, 이 리포가 이미 세 자리에서 쓰는 규율(S5·S9·S8)과 같은 모양이라 새 관례를 늘리지 않는다. (a)는 (b)로 닫히지 않는 요구 — 회전 계보의 **감사** — 가 생길 때 얹는다. 다만 (a)는 자격증명 해시의 계보를 영구 보관하게 되므로, 착수 전에 `0003 §1.3`·`§3.8`의 「자격증명 관련 값을 남기지 않는다」 규율과의 정합을 먼저 판정해야 한다 (`rotated_from`은 원문이 아니라 해시이지만 **관계**가 새로 남는다) |
+
+**반영.** mori-nest #146에서 (b)로 반영했다 — `rotate()`가 `#rotateDelete`
+(`DELETE … RETURNING subject`)로 존재 판정을 낸다. 반영 후 S1의 판정은 **현행 유지**로
+옮긴다: 배타성이 이제 조건부 쓰기(그 삭제 문장 자체)에 있고, S5·S8·S9와 같은 모양이 됐다.
 
 **시험이 재야 할 것** (다음 조각의 몫): 같은 `credentialId`에 대한 두 `rotate`가 겹칠 때
 성공하는 것이 하나뿐이고, 진 쪽이 `credential_not_found`를 받으며, 커밋 후 `launcher_credentials`에
