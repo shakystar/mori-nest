@@ -192,6 +192,7 @@ class SqliteLauncherCredentialStore implements LauncherCredentialStore {
   readonly #insert: StatementSync
   readonly #selectSubject: StatementSync
   readonly #delete: StatementSync
+  readonly #rotateDelete: StatementSync
 
   constructor(database: ControlDatabase, randomBytes: RandomBytesFn) {
     const connection = database.connection
@@ -200,6 +201,11 @@ class SqliteLauncherCredentialStore implements LauncherCredentialStore {
     this.#insert = connection.prepare('INSERT INTO launcher_credentials (credential_hash, subject) VALUES (?, ?)')
     this.#selectSubject = connection.prepare('SELECT subject FROM launcher_credentials WHERE credential_hash = ?')
     this.#delete = connection.prepare('DELETE FROM launcher_credentials WHERE credential_hash = ?')
+    // rotate() 전용. 존재 판정을 SELECT가 아니라 이 DELETE의 영향 행으로 낸다 — 아래
+    // rotate() 본문 doc 참고 (mori-nest #144 §3 C1).
+    this.#rotateDelete = connection.prepare(
+      'DELETE FROM launcher_credentials WHERE credential_hash = ? RETURNING subject',
+    )
   }
 
   async issue(subject: string): Promise<IssuedCredential> {
@@ -235,17 +241,21 @@ class SqliteLauncherCredentialStore implements LauncherCredentialStore {
     // 커넥션에 남는다.
     const token = mintCredentialToken(this.#randomBytes)
     const newCredentialId = hashCredential(token)
-    // 콜백이 동기이므로 `BEGIN`과 `COMMIT` 사이에 `await`가 끼지 않는다 (`./db.ts`의
-    // «트랜잭션은 직렬이다»). 커밋이 돌아온 시점에 새 자격증명이 있고 옛 것은 없다 —
-    // 회전이 한 번의 호출로 표현된다(§1.1). 삽입이 실패하면 옛 자격증명은 롤백으로 그대로
-    // 남는다: 회전 시도 실패가 기존 접근을 조용히 잃게 만들지 않는다.
+    // 배타성은 락이 아니라 `#rotateDelete`(`DELETE … RETURNING`) 문장 자체가 진다 — 존재
+    // 판정을 별도 SELECT로 먼저 내지 않고, 이 삭제가 지운 행 수(RETURNING이 낸 행의 유무)로
+    // 곧바로 낸다. 같은 credentialId를 겨눈 두 rotate가 겹치면 이 문장은 원자적으로 하나만
+    // 지우므로 진 쪽은 0행을 받아 `credential_not_found`로 실패한다 — 단일 라이터를 전제하지
+    // 않는다 (mori-nest #144 §3 C1, 이식성 하드 룰 4). 콜백이 동기이므로 `BEGIN`과 `COMMIT`
+    // 사이에 `await`가 끼지 않는다 (`./db.ts`의 «트랜잭션은 직렬이다»). 커밋이 돌아온 시점에
+    // 새 자격증명이 있고 옛 것은 없다 — 회전이 한 번의 호출로 표현된다(§1.1). 삽입이
+    // 실패하면 옛 자격증명은 롤백으로 그대로 남는다: 회전 시도 실패가 기존 접근을 조용히
+    // 잃게 만들지 않는다.
     await this.#database.withTransaction(() => {
-      const row = this.#selectSubject.get(credentialId)
+      const row = this.#rotateDelete.get(credentialId)
       if (row === undefined) {
         throw new LauncherCredentialError('credential_not_found')
       }
       this.#insert.run(newCredentialId, columnAsSubject(row['subject']))
-      this.#delete.run(credentialId)
     })
     return { credentialId: newCredentialId, token }
   }
