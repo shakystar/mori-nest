@@ -13,9 +13,11 @@ import type { CursorStart } from '../src/transport/request.js'
 import { EventStoreError, openEventStore, type EventProvenance, type EventStore } from '../src/transport/store.js'
 
 /**
- * 이 파일의 테스트는 **동작 하나당 하나**이고 아홉 개다 (mori-nest #27의 «테스트» 절 여섯 +
- * #46의 출처 축 셋). 커버리지 숫자용·스냅샷·구현 세부 결합 테스트를 여기에 더하지 않는다 —
- * 스토어의 계약은 `0002`의 MUST 줄들이고, 그 줄들이 여기 하나씩 대응한다.
+ * 이 파일의 테스트는 **동작 하나당 하나**이고 열 개다 (mori-nest #27의 «테스트» 절 여섯 +
+ * #46의 출처 축 셋 + #150의 버전 경쟁 하나). 커버리지 숫자용·스냅샷·구현 세부 결합 테스트를
+ * 여기에 더하지 않는다 — 스토어의 계약은 `0002`의 MUST 줄들이고, 그 줄들이 여기 하나씩
+ * 대응한다. ⑩만 예외다 — 그 대응은 `0002`가 아니라 mori-nest #148 §3 C1의 판정이다
+ * (`docs/transport-unique-constraint-adjudication.md`).
  */
 
 /** `§1.6`의 출처 값. 재는 대상이 출처가 아닌 시험들은 이것 하나를 그대로 쓴다. */
@@ -23,6 +25,7 @@ const PROVENANCE: EventProvenance = { workspaceId: 'ws_test', tokenId: 'tok_test
 
 const DURABILITY_CHILD = fileURLToPath(new URL('./store-durability-child.mjs', import.meta.url))
 const RACE_CHILD = fileURLToPath(new URL('./store-race-child.mjs', import.meta.url))
+const SCHEMA_LOCK_CHILD = fileURLToPath(new URL('./store-schema-lock-child.mjs', import.meta.url))
 
 /**
  * `--experimental-strip-types`를 명시한다. Node 22.18+는 기본으로 켜지만, 명시해 두면 이
@@ -480,4 +483,55 @@ describe('이벤트 스토어 (0002 §1.3·§1.4·§2.1·§2.2·§3.1·§3.2)', 
     expect(freshRow['workspace_id']).toBe(PROVENANCE.workspaceId)
     expect(freshRow['token_id']).toBe(PROVENANCE.tokenId)
   })
+
+  it(
+    '⑩ 다른 연결이 더 높은 버전을 적어 둔 뒤 커밋해도, 그 사이 시작된 열기가 그 표시를 내리지 않는다 (#148 §3 C1)',
+    async () => {
+      // v2 스키마를 먼저 만들어 둔다 — 재는 대상은 버전 경쟁이지 첫 열기가 아니다.
+      const seed = await openEventStore(dbPath)
+      await seed.close()
+
+      // 자식이 쓰기 락을 쥔 채 `user_version = 3`을 적는다 — 아직 커밋 전이다.
+      const holdMs = 500
+      const child = spawn(process.execPath, [SCHEMA_LOCK_CHILD, dbPath, '3', String(holdMs)], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr.setEncoding('utf8')
+      child.stderr.on('data', (chunk: string) => {
+        stderr += chunk
+      })
+
+      await new Promise<void>((resolve, reject) => {
+        let pending = ''
+        child.stdout.setEncoding('utf8')
+        child.stdout.on('data', (chunk: string) => {
+          pending += chunk
+          if (pending.includes('locked')) {
+            resolve()
+          }
+        })
+        child.on('error', reject)
+      })
+
+      // 이 시점에 자식은 커밋 전이므로 이 열기의 읽기는 아직 옛 버전을 본다. 자식은 `holdMs`
+      // 뒤 커밋한다 — 이 열기가 자식의 락을 기다리는 동안 그 커밋이 끼어든다. 표시가 내려가지
+      // 않는다면 이 열기는 `schema_version_too_new`로 실패하고 파일에는 아무것도 새로 쓰이지
+      // 않는다.
+      await expect(openEventStore(dbPath)).rejects.toMatchObject({ reason: 'schema_version_too_new' })
+
+      await new Promise((resolve) => child.on('close', resolve))
+      const crash = crashSignal(stderr)
+      if (crash !== '') {
+        throw new Error(`자식이 예외로 죽었다\n${crash}`)
+      }
+
+      const check = new DatabaseSync(dbPath)
+      const version = check.prepare('PRAGMA user_version').get()?.['user_version']
+      check.close()
+      // 자식이 적은 값(3)이 그대로다 — 이 열기가 자기 버전(2)으로 덮어쓰지 않았다.
+      expect(Number(version)).toBe(3)
+    },
+    15_000,
+  )
 })
