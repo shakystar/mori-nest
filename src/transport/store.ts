@@ -540,51 +540,36 @@ function applyDurabilityPragmas(db: DatabaseSync): void {
   }
 }
 
-function applySchema(db: DatabaseSync): void {
-  const version = db.prepare('PRAGMA user_version').get()?.['user_version']
-  if (typeof version !== 'number' && typeof version !== 'bigint') {
-    throw new EventStoreError('unexpected_row_shape')
-  }
-  if (Number(version) > SCHEMA_VERSION) {
-    throw new EventStoreError('schema_version_too_new')
-  }
-  db.exec(SCHEMA)
-  addMissingProvenanceColumns(db)
-  // 값 바인딩이 불가능한 자리(PRAGMA)라 문자열을 잇는다. 상수이고 클라이언트 입력이 아니다.
-  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
-}
-
 /**
- * v1로 만들어진 `events`에 출처 컬럼을 붙인다 ({@link SCHEMA}의 「v1 → v2 이주」). 새로 만든
- * DB에서는 `CREATE TABLE`이 이미 두 컬럼을 세웠으므로 아무것도 하지 않는다.
+ * 버전 읽기 · 게이트 판정(`schema_version_too_new`) · `SCHEMA` 적용 · 컬럼 이주
+ * ({@link addMissingProvenanceColumns}) · 버전 쓰기를 **하나의 `BEGIN IMMEDIATE`~`COMMIT`**
+ * 안에서 한다 (mori-nest #150 — #148 §3 C1의 유일한 「제약으로 옮긴다」 판정).
  *
- * 판정을 `user_version`이 아니라 **테이블의 실제 모양**으로 하는 이유: v1 코드의 `applySchema`는
- * `CREATE TABLE` 다음 구문에서 `user_version`을 적었고 그 둘은 한 트랜잭션이 아니었다. 그
- * 사이에서 죽은 DB는 «`events`는 있는데 `user_version`은 `0`» 이고, 버전만 보고 이주를 건너뛰면
- * 그런 DB는 컬럼 없는 채로 v2로 표시된 뒤 첫 `INSERT`에서 터진다. 모양을 보면 그 경로가 없다.
+ * 예전에는 버전 읽기와 버전 쓰기가 트랜잭션 밖에 있어서 읽은 값이 쓰기 조건에 실리지 않았다 —
+ * 그 사이 다른 연결이 더 높은 버전으로 이주를 끝내고 커밋하면, 이쪽이 그 표시를 자기 버전으로
+ * **덮어써** `schema_version_too_new` 게이트가 다음 열기부터 발화하지 않았다. 지금은 읽은 값이
+ * 곧 쓰는 시점의 값이므로 그 창이 없다 — 겹쳐 연 쪽은 `busy_timeout`(`:94`) 안에서 기다렸다가
+ * **이미 끝난 상태**를 읽는다.
  *
- * **읽고-쓰기가 한 트랜잭션 안이다.** `CREATE TABLE IF NOT EXISTS`와 달리 `ALTER TABLE ADD
- * COLUMN`에는 멱등한 형태가 없어서, 같은 v1 파일을 두 프로세스가 동시에 열면 둘 다 «컬럼이
- * 없다»를 보고 둘 다 붙이려 들 수 있다 — 뒤엣것은 `duplicate column name`으로 열기에 실패한다.
- * 파일 상단 doc의 단일 프로세스 전제에서는 일어나지 않지만, 이 창은 **열 때**의 것이라 그
- * 전제를 지키는 배포에서도 배포 교체·백업 도구가 겹치는 순간에 닿을 수 있다. `BEGIN
- * IMMEDIATE`가 그 창을 없앤다 (`busy_timeout` 안에서 뒤엣것이 기다렸다가 컬럼이 이미 있는
- * 것을 본다).
+ * 버전 쓰기는 **올리는 방향으로만** 한다 — 트랜잭션 안에서 읽은 값이 `SCHEMA_VERSION`보다
+ * 작을 때만 쓴다. 이 창을 닫는 것은 트랜잭션 경계 자체이지 이 조건이 아니지만, 조건을 걸어
+ * 두면 **경계가 다시 좁혀지는 미래의 변경에도** 표시가 내려가지 않는다.
  */
-function addMissingProvenanceColumns(db: DatabaseSync): void {
+function applySchema(db: DatabaseSync): void {
   db.exec('BEGIN IMMEDIATE')
   try {
-    const existing = new Set(
-      db
-        .prepare('PRAGMA table_info(events)')
-        .all()
-        .map((row) => row['name']),
-    )
-    for (const column of PROVENANCE_COLUMNS) {
-      if (!existing.has(column.name)) {
-        // 상수 문자열이고 클라이언트 입력이 아니다 (`ALTER TABLE`은 식별자를 바인딩할 수 없다).
-        db.exec(`ALTER TABLE events ADD COLUMN ${column.declaration}`)
-      }
+    const version = db.prepare('PRAGMA user_version').get()?.['user_version']
+    if (typeof version !== 'number' && typeof version !== 'bigint') {
+      throw new EventStoreError('unexpected_row_shape')
+    }
+    if (Number(version) > SCHEMA_VERSION) {
+      throw new EventStoreError('schema_version_too_new')
+    }
+    db.exec(SCHEMA)
+    addMissingProvenanceColumns(db)
+    if (Number(version) < SCHEMA_VERSION) {
+      // 값 바인딩이 불가능한 자리(PRAGMA)라 문자열을 잇는다. 상수이고 클라이언트 입력이 아니다.
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
     }
     db.exec('COMMIT')
   } catch (error) {
@@ -597,6 +582,37 @@ function addMissingProvenanceColumns(db: DatabaseSync): void {
       // 트랜잭션이 이미 열려 있지 않다.
     }
     throw error
+  }
+}
+
+/**
+ * v1로 만들어진 `events`에 출처 컬럼을 붙인다 ({@link SCHEMA}의 「v1 → v2 이주」). 새로 만든
+ * DB에서는 `CREATE TABLE`이 이미 두 컬럼을 세웠으므로 아무것도 하지 않는다.
+ *
+ * 판정을 `user_version`이 아니라 **테이블의 실제 모양**으로 하는 이유: v1 코드의 `applySchema`는
+ * `CREATE TABLE` 다음 구문에서 `user_version`을 적었고 그 둘은 한 트랜잭션이 아니었다. 그
+ * 사이에서 죽은 DB는 «`events`는 있는데 `user_version`은 `0`» 이고, 버전만 보고 이주를 건너뛰면
+ * 그런 DB는 컬럼 없는 채로 v2로 표시된 뒤 첫 `INSERT`에서 터진다. 모양을 보면 그 경로가 없다.
+ *
+ * **자기 트랜잭션을 열지 않는다.** SQLite는 중첩 트랜잭션을 지원하지 않으므로, 이 함수는
+ * {@link applySchema}가 이미 연 `BEGIN IMMEDIATE` **안에서** 돈다(mori-nest #150) — 읽고-쓰기
+ * 창을 닫는 것은 이제 그 바깥 트랜잭션이고, 예외 시 롤백 책임도 그 한 곳으로 모인다. `ALTER
+ * TABLE ADD COLUMN`에는 멱등한 형태가 없어서, 같은 v1 파일을 두 연결이 동시에 열면 둘 다
+ * «컬럼이 없다»를 보고 둘 다 붙이려 들 수 있는데, 뒤엣것은 바깥 트랜잭션의 `BEGIN IMMEDIATE`가
+ * 잡는 잠금에서 `busy_timeout`(`:94`) 안에 기다렸다가 컬럼이 이미 있는 것을 본다.
+ */
+function addMissingProvenanceColumns(db: DatabaseSync): void {
+  const existing = new Set(
+    db
+      .prepare('PRAGMA table_info(events)')
+      .all()
+      .map((row) => row['name']),
+  )
+  for (const column of PROVENANCE_COLUMNS) {
+    if (!existing.has(column.name)) {
+      // 상수 문자열이고 클라이언트 입력이 아니다 (`ALTER TABLE`은 식별자를 바인딩할 수 없다).
+      db.exec(`ALTER TABLE events ADD COLUMN ${column.declaration}`)
+    }
   }
 }
 
