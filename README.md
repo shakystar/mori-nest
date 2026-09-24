@@ -1,96 +1,88 @@
 # mori-nest
 
-mori 하네스의 공유 기억 서버. [`memorize_hub`](https://github.com/shakystar/memorize_hub)의
-후신이며, 코드를 잇지 않고 **프로토콜부터 다시 정의한다.**
+[`mori`](https://github.com/shakystar/mori)를 위한 공유 기억 서버.
+이벤트 전송 프로토콜과 로그·작업공간의 권한 및 생명주기를 다룬다.
 
-## 왜 새 리포인가
+## 프로젝트 상태
 
-`memorize_hub`은 지금 `https://memorize-hub-shakystar.fly.dev`에 **실서비스로 떠 있다.**
-플릿(owner·developer)이 자기 기억을 거기 맡기고 있으므로, 에이전트가 그 리포에 잘못된
-변경을 머지하면 플릿 자신의 기억 경로가 끊긴다. 그래서 구 리포는 운영 상태 그대로 두고
-건드리지 않으며, 새 설계는 여기서 한다.
+군 복무 중 개인 프로젝트로 개발했다. 모델 API 사용과 반복 평가에 드는 비용, 복무 중 확보할 수 있는 개발 시간, 관련 도구의 등장을 함께 고려해 추가 개발을 종료했다. 구현한 코드와 검증 기록을 보존하며, 신규 기능 개발과 정기 유지보수는 계획하지 않는다.
 
-## 지금 상태
+라이선스는 [MIT](LICENSE)다. [최종 구현·검증 상태](docs/final-status.md)와
+[전체 프로젝트 사례](https://github.com/shakystar/mori/blob/main/docs/case-study.md)를 함께 참고한다.
+기준 버전에는 전송 평면과 제어 평면의 HTTP 서버·라우트가 구현되어 있다.
+과거 README의 ‘제어 평면 라우트 0건’ 설명은 초기 단계의 기록이다.
 
-**기준 커밋 `1317429`**(이 절을 고친 PR의 베이스 `main`) **+ 그 위의 mori-nest #71.**
-이 절의 `파일:줄` 인용은 **#71이 파일을 옮긴 뒤의 자리**에서 직접 열어 확인한 것이다 —
-베이스 커밋에는 옛 경로(`src/server.ts` 등)로 있다. 이동 표는 이 절 끝에 있다. 커밋이
-움직이면 재확인이 필요하다.
+## 구조와 설계
 
-`src/`는 셋으로 갈려 있다 — **경계는 배포 단위에 긋고, 코드에서 그것을 표현하는 최소
-단위는 엔트리포인트다**(#68 사람 결정 ① 정정, #71):
+| 영역      | 역할                                    | 주요 코드                                       |
+| --------- | --------------------------------------- | ----------------------------------------------- |
+| 전송 평면 | 토큰 검증, 이벤트 append/pull/subscribe | `src/transport/`                                |
+| 제어 평면 | 로그·작업공간 생성·조회·폐기, 토큰 발급 | `src/control/`                                  |
+| 공유 부분 | 요청 본문·오류 봉투·메서드 판정         | `src/body.ts`, `src/errors.ts`, `src/method.ts` |
 
-| 자리 | 무엇 | 자기 설정 스키마 |
-|---|---|---|
-| `src/transport/` | 전송 평면 엔트리 | `parseTransportConfig` — `keyId → 공개키` 집합 |
-| `src/control/` | 제어 평면 엔트리 | `parseControlConfig` — private key |
-| `src/` | 양쪽이 import하는 것 | 없음 |
+- 전송 평면에는 Ed25519 **공개키**만, 제어 평면에는 **개인키**를 설정한다.
+- 제어 평면의 자원 생성과 멱등 완료는 공유 DB 트랜잭션으로 묶는다.
+- 이벤트 로그는 SQLite에 기록하며, 중복 이벤트·커서·출처 및 스키마 이주를 처리한다.
+- subscribe는 SSE를 사용한다. 서버 구현을 mori의 자동 동기화·운영 서비스 완성으로 읽지 않는다.
 
-전송 평면 3 라우트(append `0002 §2` · pull `§3` · subscribe `§4`)는 **구현·배선돼 있다.**
-`src/transport/server.ts:5-6`이 `POST /v1/logs/{logId}/events` · `GET /v1/logs/{logId}/events` ·
-`GET /v1/logs/{logId}/subscribe` 셋을 배선한다고 적고, `src/transport/server.ts:347`의
-`handleAppend`가 그중 append 핸들러다. `src/transport/store.ts`(이벤트 스토어, #27) ·
-`src/transport/pull.ts` · `src/transport/sse.ts` · `src/transport/token.ts`(작업공간 토큰 검증,
-#11) · `src/transport/event.ts` · `src/transport/request.ts`도 전부 전송 평면 구현이다.
-두 평면이 공유하는 것은 에러 봉투와 `code` 상수(`src/errors.ts`, `0002 §1.5` · `0003 §1.3`) ·
-최상위 필드 검증(`src/body.ts`) · `405` 판정(`src/method.ts`)뿐이고, `src/index.ts`가 그
-셋만 낸다.
-
-제어 평면 6 라우트는 **0건**이다 — `0003 §8-2`(런처 자격증명의 형태)와 `0003 §8-3`(grant
-판정 규칙)이 이 커밋 시점에도 열려 있어 착수할 수 없다. `src/control/index.ts`는 그래서
-**설정 스키마와 모듈 경계까지**다.
-
-**전송 엔트리는 서명자에 닿지 않는다.** 이 성질을 만드는 것은 코드 배치가 아니라
-**키 배포**다 — Ed25519는 서명과 검증이 `node:crypto`라는 같은 빌트인에 있으므로
-디렉터리로는 능력을 뺏을 수 없고, 전송 평면에 오는 것은 공개키뿐이다(`0003 §3.3` MUST).
-private key가 나타나는 설정 스키마는 리포 전체에서 `src/control/index.ts` 하나이고,
-전송 설정 파서는 정의되지 않은 최상위 필드와 private `KeyObject`가 섞인 키 목록을 둘 다
-거부한다(`test/entry-boundary.test.ts`). 같은 파일의 **트립와이어**는 전송 엔트리의 import
-그래프에 서명 심볼이 없음을 보지만, 그것은 불변식의 증명이 아니라 사고 결합을 잡는
-장치다. 유효 키쌍 생성과 서명은 발급자 흉내(`test/workspace-token.ts:1-30`) 안에만 있다.
-
-#71의 파일 이동 표 (`src/` 안, 내용 변경은 import 경로 갱신뿐 — 줄 번호는 밀리지 않았다):
-
-| 옛 경로 | 새 경로 |
-|---|---|
-| `src/token.ts` · `src/request.ts` · `src/event.ts` | `src/transport/` 아래 같은 이름 |
-| `src/sse.ts` · `src/pull.ts` · `src/store.ts` · `src/server.ts` | `src/transport/` 아래 같은 이름 |
-| `src/errors.ts` · `src/body.ts` · `src/method.ts` | 그대로 (`src/`) |
-
-mori는 개발자만이 아니라 **사람들이 협업에 쓰는 하네스**다. 그 전제가 서버 요구사항을
-바꾼다 — hub가 백업이 아니라 **유일한 공유 지점**이 되므로, 동료의 기억이 몇 분 뒤에
-보이면 협업이 성립하지 않는다. 구 relay의 폴링 전용 계약으로는 이 요구를 못 덮는다.
-
-읽는 순서:
-
-| 문서 | 내용 |
-|---|---|
-| `docs/design/0001-protocol-requirements.md` | 새 프로토콜이 만족해야 하는 것. **먼저 읽을 것** |
-| `docs/design/0002-transport-spec.md` | 전송 평면(dumb) 와이어 스펙 — append / pull / subscribe |
-| `docs/design/0003-control-plane-spec.md` | 제어 평면(smart) 스펙 — 식별자 발급 / 작업공간 토큰 / 생애 추적 |
-| `docs/inherited/` | 전신(`memorize`·`memorize_hub`)의 기록. **규격이 아니라 맥락** |
-
-## 빌드·테스트
-
-Node 22 · TypeScript · pnpm · vitest. **런타임 의존성(`dependencies`)은 0개다** —
-전송 평면을 `node:http` 수준으로 유지한다는 `0002 §4.1-3`의 방향이다. **유효 기간**: 상업
-배포 시점의 PostgreSQL 이관([2026-08-10 결정](https://github.com/shakystar/mori-nest/issues/68#issuecomment-5236925659))에서
-이 규칙은 폐기될 수 있다 — 자세한 근거·이식성 하드 룰은 `CLAUDE.md`. 오늘은 유효하다.
-
-```bash
-pnpm install
-pnpm typecheck   # tsc --noEmit (src + test)
-pnpm build       # tsc -> dist/
-pnpm test        # vitest run
+```mermaid
+flowchart TD
+  A["런처 자격증명"] --> B["제어 평면"]
+  B --> C["로그 · 작업공간 · 멱등 DB"]
+  B --> D["서명된 작업공간 토큰"]
+  D --> E["전송 평면 · 공개키 검증"]
+  E --> F["이벤트 로그"]
+  E --> G["pull · SSE"]
 ```
 
-CI는 `.github/workflows/ci.yml`의 `build-and-test` job이 위 셋을 그대로 돌린다.
+## 구현된 HTTP 표면
 
-## 관련 리포
+| 평면 | 메서드·경로                                                                           | 동작                    |
+| ---- | ------------------------------------------------------------------------------------- | ----------------------- |
+| 전송 | `POST /v1/logs/{logId}/events`                                                        | append                  |
+| 전송 | `GET /v1/logs/{logId}/events`                                                         | cursor 기반 pull        |
+| 전송 | `GET /v1/logs/{logId}/subscribe`                                                      | SSE subscribe           |
+| 제어 | `POST /v1/logs`                                                                       | 로그 생성               |
+| 제어 | `GET /v1/logs`, `GET /v1/logs/{logId}`                                                | 로그 목록·단건 조회     |
+| 제어 | `POST /v1/logs/{logId}/revoke`                                                        | 로그 폐기               |
+| 제어 | `POST /v1/workspaces`                                                                 | 작업공간 개시·토큰 발급 |
+| 제어 | `POST /v1/workspaces/{workspaceId}/heartbeat`                                         | 생명주기·토큰 갱신      |
+| 제어 | `POST /v1/workspaces/{workspaceId}/close`, `POST /v1/workspaces/{workspaceId}/revoke` | 종료·폐기               |
+| 제어 | `GET /v1/workspaces`, `GET /v1/workspaces/{workspaceId}`                              | 작업공간 목록·단건 조회 |
 
-| 리포 | 역할 |
-|---|---|
-| [`mori`](https://github.com/shakystar/mori) | 클라이언트 하네스 |
-| [`memorize_hub`](https://github.com/shakystar/memorize_hub) | 전신 서버. 운영 중, 읽기 참조만 |
-| [`memorize`](https://github.com/shakystar/memorize) | 전신 클라이언트 |
-| [`autopilot-agents`](https://github.com/shakystar/autopilot-agents) | 이 리포를 다루는 에이전트들 |
+런처 자격증명 발급 HTTP API, 완성된 계정·멤버십 제품, PostgreSQL 이관은 포함하지 않는다.
+
+## 빌드·검증
+
+확인한 도구체인은 **Node 22.23.1 · pnpm 10.30.3**이다.
+런타임 dependencies는 없으며 개발 의존성은 lockfile로 고정한다.
+
+```bash
+git clone https://github.com/shakystar/mori-nest.git
+cd mori-nest
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm build
+pnpm test
+```
+
+서버는 `createControlServer`와 `createTransportServer`로 조립하는 라이브러리다.
+설정·키·DB를 주입하는 호출자가 필요하며 `pnpm start` 서비스는 제공하지 않는다.
+API 키와 외부 모델 호출 없이 실제 로컬 HTTP·SQLite 동작을 확인하려면 기존 통합 테스트를 실행한다.
+
+```bash
+pnpm exec vitest run test/control-server.test.ts test/server.test.ts test/server-pull.test.ts test/server-subscribe.test.ts
+```
+
+이번 확인에서는 타입 검사·빌드와 테스트 214개가 통과했다.
+실행 환경의 경고 처리 조건과 과거 CI 근거는 [최종 상태](docs/final-status.md#재현-결과)에 남겼다.
+
+## 문서
+
+- [요구사항](docs/design/0001-protocol-requirements.md)
+- [전송 평면 스펙](docs/design/0002-transport-spec.md)
+- [제어 평면 스펙](docs/design/0003-control-plane-spec.md)
+- [전송 스토어 동시성 판정](docs/transport-unique-constraint-adjudication.md)
+- [전신 기록 읽는 법](docs/inherited/_INHERITED.md)
+
+`memorize_hub`는 전신 서버다. 이 저장소의 종료는 전신 서버의 운영 상태를 변경하지 않는다.
